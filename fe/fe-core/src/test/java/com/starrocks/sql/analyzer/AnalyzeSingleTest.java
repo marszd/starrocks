@@ -67,6 +67,28 @@ public class AnalyzeSingleTest {
                 "(\"broker.name\" = \"my_broker\"," +
                 "\"broker.hadoop.security.authentication\" = \"kerberos\"," +
                 "\"line_delimiter\" = \"\n\", \"max_file_size\" = \"100MB\");");
+<<<<<<< HEAD
+=======
+
+        analyzeSuccess("SELECT v1,v2,v3 FROM t0  INTO OUTFILE \"hdfs://path/to/result_\" FORMAT AS CSV");
+
+        analyzeSuccess("select v1 as location from t0");
+    }
+
+    @Test
+    public void testIdentifierStartWithDigit() {
+        StatementBase statementBase = com.starrocks.sql.parser.SqlParser.parse("select * from a.11b", 0).get(0);
+        Assert.assertEquals("SELECT * FROM a.11b", AstToStringBuilder.toString(statementBase));
+
+        statementBase = com.starrocks.sql.parser.SqlParser.parse("select a.11b.22c, * from a.11b", 0).get(0);
+        Assert.assertEquals("SELECT a.11b.22c, * FROM a.11b", AstToStringBuilder.toString(statementBase));
+
+        statementBase = com.starrocks.sql.parser.SqlParser.parse("select 00a.11b.22c, * from 00a.11b", 0).get(0);
+        Assert.assertEquals("SELECT 00a.11b.22c, * FROM 00a.11b", AstToStringBuilder.toString(statementBase));
+
+        statementBase = com.starrocks.sql.parser.SqlParser.parse("select 11b.* from 11b", 0).get(0);
+        Assert.assertEquals("SELECT 11b.* FROM 11b", AstToStringBuilder.toString(statementBase));
+>>>>>>> b625167bd (Fix location as reserved keyword bug (#17417))
     }
 
     @Test
