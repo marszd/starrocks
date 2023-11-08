@@ -14,6 +14,7 @@
 
 #include "exec/pipeline/olap_table_sink_operator.h"
 
+#include "exec/pipeline/pipeline_driver_executor.h"
 #include "exec/tablet_sink.h"
 #include "exprs/expr.h"
 #include "runtime/buffer_control_block.h"
@@ -23,9 +24,12 @@
 
 namespace starrocks::pipeline {
 Status OlapTableSinkOperator::prepare(RuntimeState* state) {
-    Operator::prepare(state);
+    RETURN_IF_ERROR(Operator::prepare(state));
 
     state->set_per_fragment_instance_idx(_sender_id);
+
+    _sink->set_nonblocking_send_chunk(true);
+    _automatic_partition_chunk.reset();
 
     RETURN_IF_ERROR(_sink->prepare(state));
 
@@ -64,6 +68,20 @@ bool OlapTableSinkOperator::pending_finish() const {
         }
     }
 
+    // last chunk trigger automatic partition creation
+    // we need handle it before close sink
+    if (!_is_cancelled && _automatic_partition_chunk) {
+        if (_sink->is_full()) {
+            return true;
+        }
+        auto st = _sink->send_chunk(_fragment_ctx->runtime_state(), _automatic_partition_chunk.get());
+        _automatic_partition_chunk.reset();
+        if (!st.ok()) {
+            _fragment_ctx->cancel(st);
+            return false;
+        }
+    }
+
     if (!_sink->is_close_done()) {
         auto st = _sink->try_close(_fragment_ctx->runtime_state());
         if (!st.ok()) {
@@ -87,7 +105,7 @@ bool OlapTableSinkOperator::is_epoch_finishing() const {
 
 Status OlapTableSinkOperator::set_epoch_finishing(RuntimeState* state) {
     _is_epoch_finished = true;
-    if (_is_open_done) {
+    if (_is_open_done && !_automatic_partition_chunk) {
         // sink's open already finish, we can try_close
         return _sink->try_close(state);
     } else {
@@ -113,17 +131,21 @@ Status OlapTableSinkOperator::reset_epoch(RuntimeState* state) {
 }
 
 Status OlapTableSinkOperator::set_cancelled(RuntimeState* state) {
+    _is_cancelled = true;
     return _sink->close(state, Status::Cancelled("Cancelled by pipeline engine"));
 }
 
 Status OlapTableSinkOperator::set_finishing(RuntimeState* state) {
     _is_finished = true;
 
-    if (_is_open_done) {
+    if (_num_sinkers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        state->exec_env()->wg_driver_executor()->report_audit_statistics(state->query_ctx(), state->fragment_ctx());
+    }
+    if (_is_open_done && !_automatic_partition_chunk) {
         // sink's open already finish, we can try_close
         return _sink->try_close(state);
     } else {
-        // sink's open not finish, we need check in pending_finish() before close
+        // sink's open not finish or automatic partition in processing, we need check in pending_finish() before close
         return Status::OK();
     }
 }
@@ -148,22 +170,40 @@ Status OlapTableSinkOperator::push_chunk(RuntimeState* state, const ChunkPtr& ch
         RETURN_IF_ERROR(_sink->open_wait());
     }
 
+    // previous push_chunk() trigger automatic partition creation
+    if (_automatic_partition_chunk) {
+        // resend previous chunk before send new chunk
+        auto st = _sink->send_chunk(state, _automatic_partition_chunk.get());
+        _automatic_partition_chunk.reset();
+        if (!st.ok()) {
+            return st;
+        }
+    }
+
     uint16_t num_rows = chunk->num_rows();
     if (num_rows == 0) {
         return Status::OK();
     }
 
-    // send_chunk() use internal queue, we check is_full() before call send_chunk(), so it will not block
-    return _sink->send_chunk(state, chunk.get());
+    // send_chunk() will return EAGAIN to avoid block
+    auto st = _sink->send_chunk(state, chunk.get());
+    if (st.is_eagain()) {
+        // temporarily save the chunk, wait for the partition to be created and send again
+        _automatic_partition_chunk = chunk;
+        return Status::OK();
+    } else {
+        return st;
+    }
 }
 
 OperatorPtr OlapTableSinkOperatorFactory::create(int32_t degree_of_parallelism, int32_t driver_sequence) {
+    _increment_num_sinkers_no_barrier();
     if (driver_sequence == 0) {
         return std::make_shared<OlapTableSinkOperator>(this, _id, _plan_node_id, driver_sequence, _cur_sender_id++,
-                                                       _sink0, _fragment_ctx);
+                                                       _sink0, _fragment_ctx, _num_sinkers);
     } else {
         return std::make_shared<OlapTableSinkOperator>(this, _id, _plan_node_id, driver_sequence, _cur_sender_id++,
-                                                       _sinks[driver_sequence - 1].get(), _fragment_ctx);
+                                                       _sinks[driver_sequence - 1].get(), _fragment_ctx, _num_sinkers);
     }
 }
 

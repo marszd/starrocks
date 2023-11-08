@@ -14,13 +14,14 @@
 
 package com.starrocks.planner;
 
-import com.clearspring.analytics.util.Lists;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.google.common.collect.Sets;
 import com.starrocks.analysis.BetweenPredicate;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
@@ -38,11 +39,13 @@ import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.IdGenerator;
 import com.starrocks.common.Pair;
+import com.starrocks.common.util.UnionFind;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.thrift.TCacheParam;
-import com.starrocks.thrift.TNormalPlanNode;
 import com.starrocks.thrift.TExpr;
+import com.starrocks.thrift.TGlobalDict;
+import com.starrocks.thrift.TNormalPlanNode;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
 import org.apache.thrift.protocol.TCompactProtocol;
@@ -54,6 +57,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -102,6 +106,7 @@ public class FragmentNormalizer {
 
     private Set<Integer> cachedPlanNodeIds = Sets.newHashSet();
     private boolean assignScanRangesAcrossDrivers = false;
+
     public FragmentNormalizer(ExecPlan execPlan, PlanFragment fragment) {
         this.execPlan = execPlan;
         this.fragment = fragment;
@@ -305,9 +310,13 @@ public class FragmentNormalizer {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
 
             for (TNormalPlanNode node : normalizedPlanNodes) {
-                byte[] data = serializer.serialize(node);
-                digest.update(data);
+                digest.update(serializer.serialize(node));
             }
+            List<TGlobalDict> dicts = normalizeDicts(getAllOffspringFragments(fragment));
+            for (TGlobalDict dict : dicts) {
+                digest.update(serializer.serialize(dict));
+            }
+
             List<SlotId> slotIds = cachePointNode.getOutputSlotIds(execPlan.getDescTbl());
             List<Integer> remappedSlotIds = remapSlotIds(slotIds);
             Map<Integer, Integer> outputSlotIdRemapping = Maps.newHashMap();
@@ -404,7 +413,7 @@ public class FragmentNormalizer {
             return !((BetweenPredicate) expr).isNotBetween();
         }
         if (expr instanceof BinaryPredicate) {
-            return ((BinaryPredicate) expr).getOp() != BinaryPredicate.Operator.EQ_FOR_NULL;
+            return ((BinaryPredicate) expr).getOp() != BinaryType.EQ_FOR_NULL;
         }
         return true;
     }
@@ -431,7 +440,7 @@ public class FragmentNormalizer {
         Preconditions.checkArgument(minKey != null && maxKey != null);
         if (expr instanceof BinaryPredicate) {
             BinaryPredicate predicate = (BinaryPredicate) expr;
-            if (predicate.getOp() == BinaryPredicate.Operator.EQ_FOR_NULL) {
+            if (predicate.getOp() == BinaryType.EQ_FOR_NULL) {
                 return result;
             }
             LiteralExpr rhs = (LiteralExpr) predicate.getChild(1);
@@ -704,7 +713,7 @@ public class FragmentNormalizer {
         // Get leftmost path
         List<PlanNode> leftNodesTopDown = Lists.newArrayList();
         for (PlanNode currNode = root; currNode != null && currNode.getFragment() == fragment;
-                currNode = currNode.getChild(0)) {
+             currNode = currNode.getChild(0)) {
             leftNodesTopDown.add(currNode);
         }
 
@@ -793,61 +802,40 @@ public class FragmentNormalizer {
         normalizeSubTree(leftNodeIds, topMostDigestNode, Sets.newHashSet());
         List<PlanNode> cachedPlanNodes = leftNodesTopDown.stream().skip(firstAggNodeIdx).collect(Collectors.toList());
         fragment.setAssignScanRangesPerDriverSeq(canAssignScanRangesAcrossDrivers(cachedPlanNodes));
-        cachedPlanNodeIds = cachedPlanNodes.stream().map(node->node.getId().asInt()).collect(Collectors.toSet());
+        cachedPlanNodeIds = cachedPlanNodes.stream().map(node -> node.getId().asInt()).collect(Collectors.toSet());
         return computeDigest(firstAggNode);
     }
 
-    public static class SlotEquivRelation {
-        private Map<SlotId, Integer> slotId2Group = Maps.newHashMap();
-        private Map<Integer, Set<SlotId>> eqGroupMap = Maps.newHashMap();
-
-        public Map<SlotId, Set<SlotId>> getEquivGroups(Set<SlotId> slotIds) {
-            Map<SlotId, Set<SlotId>> slotId2EqSlots = Maps.newHashMap();
-            for (SlotId slotId : slotIds) {
-                if (!slotId2Group.containsKey(slotId)) {
-                    continue;
-                }
-                Set<SlotId> eqSlots = eqGroupMap.get(slotId2Group.get(slotId));
-                if (eqSlots.size() > 1) {
-                    slotId2EqSlots.put(slotId, eqSlots);
-                }
-            }
-            return slotId2EqSlots;
-        }
-
-        public void add(List<SlotId> slotIds) {
-            slotIds.forEach(s -> {
-                if (!find(s)) {
-                    slotId2Group.put(s, s.asInt());
-                    eqGroupMap.put(s.asInt(), Sets.newHashSet(s));
-                }
-            });
-        }
-
-        public void union(SlotId lhs, SlotId rhs) {
-            add(Arrays.asList(lhs, rhs));
-            Integer lhsGroupId = slotId2Group.get(lhs);
-            Integer rhsGroupId = slotId2Group.get(rhs);
-            if (!lhsGroupId.equals(rhsGroupId)) {
-                Set<SlotId> lhsGroup = eqGroupMap.get(lhsGroupId);
-                Set<SlotId> rhsGroup = eqGroupMap.get(rhsGroupId);
-                Set<SlotId> newGroup = Sets.union(lhsGroup, rhsGroup);
-                rhsGroup.forEach(s -> {
-                    slotId2Group.put(s, lhsGroupId);
-                });
-                eqGroupMap.put(lhsGroupId, newGroup);
-                eqGroupMap.remove(rhsGroupId);
-            }
-        }
-
-        private boolean find(SlotId slotId) {
-            return slotId2Group.containsKey(slotId);
-        }
+    // get All of offspring fragments of the current fragment, the current fragment
+    // is also included. fragments containing MulticastSink are counted once.
+    private List<PlanFragment> getAllOffspringFragments(PlanFragment fragment) {
+        List<ExchangeNode> exchangeNodes = Lists.newArrayList();
+        fragment.getPlanRoot().collect(ExchangeNode.class, exchangeNodes);
+        List<PlanFragment> fragments = exchangeNodes.stream()
+                .flatMap(ex -> ex.getChildren().stream().map(PlanNode::getFragment))
+                .sorted(Comparator.comparingInt(frag -> frag.getFragmentId().asInt()))
+                .distinct().collect(Collectors.toList());
+        fragments.add(fragment);
+        return fragments;
     }
 
-    private SlotEquivRelation equivRelation = new SlotEquivRelation();
+    // Normalize global dicts of the given fragments
+    private List<TGlobalDict> normalizeDicts(List<PlanFragment> fragments) {
+        List<TGlobalDict> dicts = Lists.newArrayList();
+        for (PlanFragment fragment : fragments) {
+            if (fragment.getQueryGlobalDicts() != null) {
+                dicts.addAll(fragment.normalizeDicts(fragment.getQueryGlobalDicts(), this));
+            }
+            if (fragment.getLoadGlobalDicts() != null) {
+                dicts.addAll(fragment.normalizeDicts(fragment.getLoadGlobalDicts(), this));
+            }
+        }
+        return dicts;
+    }
 
-    public SlotEquivRelation getEquivRelation() {
+    private UnionFind<SlotId> equivRelation = new UnionFind<>();
+
+    public UnionFind<SlotId> getEquivRelation() {
         return equivRelation;
     }
 

@@ -43,14 +43,19 @@
 #include <unordered_set>
 
 #include "common/status.h"
+#include "fs/fs_util.h"
 #include "storage/compaction.h"
 #include "storage/compaction_manager.h"
+#include "storage/lake/tablet_manager.h"
 #include "storage/lake/update_manager.h"
 #include "storage/olap_common.h"
 #include "storage/olap_define.h"
+#include "storage/persistent_index_compaction_manager.h"
+#include "storage/publish_version_manager.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet_manager.h"
 #include "storage/update_manager.h"
+#include "tablet_meta_manager.h"
 #include "util/gc_helper.h"
 #include "util/thread.h"
 #include "util/time.h"
@@ -77,6 +82,9 @@ Status StorageEngine::start_bg_threads() {
     _update_cache_expire_thread = std::thread([this] { _update_cache_expire_thread_callback(nullptr); });
     Thread::set_thread_name(_update_cache_expire_thread, "cache_expire");
 
+    _update_cache_evict_thread = std::thread([this] { _update_cache_evict_thread_callback(nullptr); });
+    Thread::set_thread_name(_update_cache_evict_thread, "evict_update_cache");
+
     _unused_rowset_monitor_thread = std::thread([this] { _unused_rowset_monitor_thread_callback(nullptr); });
     Thread::set_thread_name(_unused_rowset_monitor_thread, "rowset_monitor");
 
@@ -87,6 +95,19 @@ Status StorageEngine::start_bg_threads() {
     // start thread for monitoring the tablet with io error
     _disk_stat_monitor_thread = std::thread([this] { _disk_stat_monitor_thread_callback(nullptr); });
     Thread::set_thread_name(_disk_stat_monitor_thread, "disk_monitor");
+
+    _pk_index_major_compaction_thread = std::thread([this] { _pk_index_major_compaction_thread_callback(nullptr); });
+    Thread::set_thread_name(_pk_index_major_compaction_thread, "pk_index_compaction_scheduler");
+
+#ifdef USE_STAROS
+    _local_pk_index_shard_data_gc_thread =
+            std::thread([this] { _local_pk_index_shard_data_gc_thread_callback(nullptr); });
+    Thread::set_thread_name(_local_pk_index_shard_data_gc_thread, " pk_index_shard_data_gc");
+#endif
+
+    // start thread for check finish publish version
+    _finish_publish_version_thread = std::thread([this] { _finish_publish_version_thread_callback(nullptr); });
+    Thread::set_thread_name(_finish_publish_version_thread, "finish_publish_version");
 
     // convert store map to vector
     std::vector<DataDir*> data_dirs;
@@ -110,7 +131,7 @@ Status StorageEngine::start_bg_threads() {
             max_compaction_concurrency > base_compaction_num_threads + cumulative_compaction_num_threads) {
             max_compaction_concurrency = base_compaction_num_threads + cumulative_compaction_num_threads;
         }
-        Compaction::init(max_compaction_concurrency);
+        (void)Compaction::init(max_compaction_concurrency);
 
         _base_compaction_threads.reserve(base_compaction_num_threads);
         // The config::tablet_map_shard_size is preferably a multiple of `base_compaction_num_threads_per_disk`,
@@ -170,7 +191,7 @@ Status StorageEngine::start_bg_threads() {
             max_task_num = config::max_compaction_concurrency;
         }
 
-        Compaction::init(max_task_num);
+        (void)Compaction::init(max_task_num);
 
         // compaction_manager must init_max_task_num() before any comapction_scheduler starts
         _compaction_manager->init_max_task_num(max_task_num);
@@ -193,6 +214,11 @@ Status StorageEngine::start_bg_threads() {
     }
     _repair_compaction_thread = std::thread([this] { _repair_compaction_thread_callback(nullptr); });
     Thread::set_thread_name(_repair_compaction_thread, "repair_compact");
+
+    for (uint32_t i = 0; i < config::manual_compaction_threads; i++) {
+        _manual_compaction_threads.emplace_back([this] { _manual_compaction_thread_callback(nullptr); });
+        Thread::set_thread_name(_manual_compaction_threads.back(), "manual_compact");
+    }
 
     // tablet checkpoint thread
     for (auto data_dir : data_dirs) {
@@ -257,7 +283,7 @@ void* StorageEngine::_adjust_pagecache_callback(void* arg_this) {
         if (config::disable_storage_page_cache) {
             continue;
         }
-        MemTracker* memtracker = ExecEnv::GetInstance()->process_mem_tracker();
+        MemTracker* memtracker = GlobalEnv::GetInstance()->process_mem_tracker();
         if (memtracker == nullptr || !memtracker->has_limit() || cache == nullptr) {
             continue;
         }
@@ -297,7 +323,7 @@ void* StorageEngine::_adjust_pagecache_callback(void* arg_this) {
             size_t bytes_to_dec = dec_advisor->bytes_should_gc(MonoTime::Now(), delta_high);
             evict_pagecache(cache, static_cast<int64_t>(bytes_to_dec), _bg_worker_stopped);
         } else {
-            int64_t max_cache_size = std::max(ExecEnv::GetInstance()->get_storage_page_cache_size(), kcacheMinSize);
+            int64_t max_cache_size = std::max(GlobalEnv::GetInstance()->get_storage_page_cache_size(), kcacheMinSize);
             int64_t cur_cache_size = cache->get_capacity();
             if (cur_cache_size >= max_cache_size) {
                 continue;
@@ -365,6 +391,103 @@ void* StorageEngine::_base_compaction_thread_callback(void* arg, DataDir* data_d
     return nullptr;
 }
 
+void* StorageEngine::_pk_index_major_compaction_thread_callback(void* arg) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        SLEEP_IN_BG_WORKER(config::pindex_major_compaction_schedule_interval_seconds);
+        // schedule persistent index compaction
+        _update_manager->get_pindex_compaction_mgr()->schedule();
+    }
+
+    return nullptr;
+}
+
+#ifdef USE_STAROS
+void* StorageEngine::_local_pk_index_shard_data_gc_thread_callback(void* arg) {
+    if (is_as_cn()) {
+        return nullptr;
+    }
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    auto lake_update_manager = ExecEnv::GetInstance()->lake_update_manager();
+    auto lake_tablet_manager = ExecEnv::GetInstance()->lake_tablet_manager();
+
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        SLEEP_IN_BG_WORKER(config::pindex_shard_data_gc_interval_seconds);
+
+        for (DataDir* data_dir : get_stores()) {
+            auto pk_path = data_dir->get_persistent_index_path();
+            LOG(INFO) << "start to gc local persistent index dir:" << pk_path;
+            int64_t t_start = MonotonicMillis();
+
+            std::set<std::string> tablet_ids;
+            Status ret = fs::list_dirs_files(pk_path, &tablet_ids, nullptr);
+            if (!ret.ok()) {
+                LOG(WARNING) << "fail to walk dir. path=[" + pk_path << "] error[" << ret.to_string() << "]";
+                continue;
+            }
+
+            std::vector<int64_t> not_in_worker_tablet_ids;
+            std::vector<int64_t> dir_changed_tablet_ids;
+            std::vector<int64_t> removed_dir_tablet_ids;
+
+            for (const auto& tablet_id : tablet_ids) {
+                auto tablet_pk_path = pk_path + "/" + tablet_id;
+                int64_t id = std::stoll(tablet_id);
+                // judge whether tablet should be in the data_dir or not,
+                // for data_dir may change if config:storage_path changed.
+                // just remove if not.
+                if (get_persistent_index_store(id) != data_dir) {
+                    dir_changed_tablet_ids.push_back(id);
+                    if (_clear_persistent_index(data_dir, id, tablet_pk_path).ok()) {
+                        removed_dir_tablet_ids.push_back(id);
+                    }
+                } else if (!lake_tablet_manager->is_tablet_in_worker(id)) {
+                    // the shard may be scheduled to other nodes
+                    if (lake_update_manager->try_lock_pk_index_shard(id)) {
+                        not_in_worker_tablet_ids.emplace_back(id);
+                        // judge whether tablet is scheduled again,
+                        // and pk_index_shard write_lock has been hold, so no process will build the persistent index.
+                        if (!lake_tablet_manager->is_tablet_in_worker(id)) {
+                            // try to remove pk index cache to avoid continuing to use the index in the cache after deletion.
+                            if (lake_update_manager->try_remove_primary_index_cache(id)) {
+                                if (_clear_persistent_index(data_dir, id, tablet_pk_path).ok()) {
+                                    removed_dir_tablet_ids.push_back(id);
+                                }
+                            }
+                        }
+                        lake_update_manager->unlock_pk_index_shard(id);
+                    }
+                }
+            }
+
+            auto debug_vector_info = [](std::vector<int64_t> vector) -> std::string {
+                std::string result;
+                for (int i = 0; i < vector.size(); i++) {
+                    if (i != 0) {
+                        result.append(",");
+                    }
+                    result += std::to_string(vector[i]);
+                }
+                return result;
+            };
+
+            int64_t t_end = MonotonicMillis();
+            LOG(INFO) << "finish gc local persistent index dir: " << pk_path
+                      << ", found tablet not in the worker, tablet_ids: " << debug_vector_info(not_in_worker_tablet_ids)
+                      << ", data_dir changed tablet_ids: " << debug_vector_info(dir_changed_tablet_ids)
+                      << ", and removed dir successfully, tablet_ids: " << debug_vector_info(removed_dir_tablet_ids)
+                      << ", cost:" << t_end - t_start << "ms";
+        }
+    }
+
+    return nullptr;
+}
+#endif
+
 void* StorageEngine::_update_compaction_thread_callback(void* arg, DataDir* data_dir) {
 #ifdef GOOGLE_PROFILER
     ProfilerRegisterThread();
@@ -377,7 +500,9 @@ void* StorageEngine::_update_compaction_thread_callback(void* arg, DataDir* data
         } else {
             status = Status::InternalError("data dir out of capacity");
         }
-        if (status.ok()) {
+        if (status.ok() && !_options.compaction_mem_tracker->any_limit_exceeded() &&
+            !_options.update_mem_tracker->any_limit_exceeded()) {
+            // keep schedule compaction if memory is fine.
             continue;
         }
 
@@ -388,7 +513,8 @@ void* StorageEngine::_update_compaction_thread_callback(void* arg, DataDir* data
         }
         do {
             SLEEP_IN_BG_WORKER(interval);
-            if (!_options.compaction_mem_tracker->any_limit_exceeded()) {
+            if (!_options.compaction_mem_tracker->any_limit_exceeded() &&
+                !_options.update_mem_tracker->any_limit_exceeded()) {
                 break;
             }
         } while (true);
@@ -423,7 +549,7 @@ void* StorageEngine::_repair_compaction_thread_callback(void* arg) {
             }
             vector<pair<uint32_t, string>> rowset_results;
             for (auto rowsetid : task.second) {
-                auto st = tablet->updates()->compaction(ExecEnv::GetInstance()->compaction_mem_tracker(), {rowsetid});
+                auto st = tablet->updates()->compaction(GlobalEnv::GetInstance()->compaction_mem_tracker(), {rowsetid});
                 if (!st.ok()) {
                     LOG(WARNING) << "repair compaction failed tablet: " << task.first << " rowset: " << rowsetid << " "
                                  << st;
@@ -583,6 +709,27 @@ void* StorageEngine::_disk_stat_monitor_thread_callback(void* arg) {
     return nullptr;
 }
 
+void* StorageEngine::_finish_publish_version_thread_callback(void* arg) {
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        int32_t interval = config::finish_publish_version_internal;
+        {
+            std::unique_lock<std::mutex> wl(_finish_publish_version_mutex);
+            while (!_publish_version_manager->has_pending_task() &&
+                   !_bg_worker_stopped.load(std::memory_order_consume)) {
+                _finish_publish_version_cv.wait(wl);
+            }
+            _publish_version_manager->finish_publish_version_task();
+            if (interval <= 0) {
+                LOG(WARNING) << "finish_publish_version_internal config is illegal: " << interval << ", force set to 1";
+                interval = 1000;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+    }
+
+    return nullptr;
+}
+
 void* StorageEngine::_cumulative_compaction_thread_callback(void* arg, DataDir* data_dir,
                                                             const std::pair<int32_t, int32_t>& tablet_shards_range) {
 #ifdef GOOGLE_PROFILER
@@ -642,6 +789,33 @@ void* StorageEngine::_update_cache_expire_thread_callback(void* arg) {
     return nullptr;
 }
 
+void* StorageEngine::_update_cache_evict_thread_callback(void* arg) {
+#ifdef GOOGLE_PROFILER
+    ProfilerRegisterThread();
+#endif
+    while (!_bg_worker_stopped.load(std::memory_order_consume)) {
+        SLEEP_IN_BG_WORKER(config::update_cache_evict_internal_sec);
+        if (!config::enable_auto_evict_update_cache) {
+            continue;
+        }
+
+        // Check config valid
+        int64_t memory_urgent_level = config::memory_urgent_level;
+        int64_t memory_high_level = config::memory_high_level;
+        if (UNLIKELY(!(memory_urgent_level > memory_high_level && memory_high_level >= 1 &&
+                       memory_urgent_level <= 100))) {
+            LOG(ERROR) << "memory water level config is illegal: memory_urgent_level=" << memory_urgent_level
+                       << " memory_high_level=" << memory_high_level;
+            continue;
+        }
+        _update_manager->evict_cache(memory_urgent_level, memory_high_level);
+#if defined(USE_STAROS) && !defined(BE_TEST)
+        ExecEnv::GetInstance()->lake_update_manager()->evict_cache(memory_urgent_level, memory_high_level);
+#endif
+    }
+    return nullptr;
+}
+
 void* StorageEngine::_unused_rowset_monitor_thread_callback(void* arg) {
 #ifdef GOOGLE_PROFILER
     ProfilerRegisterThread();
@@ -671,6 +845,8 @@ void* StorageEngine::_path_gc_thread_callback(void* arg) {
         LOG(INFO) << "try to perform path gc by rowsetid!";
         // perform path gc by rowset id
         ((DataDir*)arg)->perform_path_gc_by_rowsetid();
+        // perform dcg files gc
+        ((DataDir*)arg)->perform_delta_column_files_gc();
 
         int32_t interval = config::path_gc_check_interval_second;
         if (interval <= 0) {

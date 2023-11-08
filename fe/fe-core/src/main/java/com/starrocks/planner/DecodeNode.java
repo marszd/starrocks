@@ -15,8 +15,11 @@
 
 package com.starrocks.planner;
 
+import com.google.common.collect.Lists;
+import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.SlotId;
+import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.common.Pair;
 import com.starrocks.thrift.TDecodeNode;
@@ -27,8 +30,11 @@ import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeType;
 
 import java.nio.ByteBuffer;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 public class DecodeNode extends PlanNode {
@@ -37,20 +43,27 @@ public class DecodeNode extends PlanNode {
     // The string functions have applied global dict optimization
     private final Map<SlotId, Expr> stringFunctions;
 
+    // TupleId is changed when DecodeNode is interpolated, so pushing down runtime filters
+    // across DecodeNode requires that replace the output SlotRef with the input SlotRef.
+    private final Map<SlotRef, SlotRef> slotRefMap;
+
     public DecodeNode(PlanNodeId id,
                       TupleDescriptor tupleDescriptor,
                       PlanNode child,
                       Map<Integer, Integer> dictIdToStringIds,
-                      Map<SlotId, Expr> stringFunctions) {
+                      Map<SlotId, Expr> stringFunctions,
+                      Map<SlotRef, SlotRef> slotRefMap
+                      ) {
         super(id, tupleDescriptor.getId().asList(), "Decode");
         addChild(child);
         this.dictIdToStringIds = dictIdToStringIds;
         this.stringFunctions = stringFunctions;
+        this.slotRefMap = slotRefMap;
     }
 
     @Override
-    public boolean canUsePipeLine() {
-        return getChildren().stream().allMatch(PlanNode::canUsePipeLine);
+    public boolean canUseRuntimeAdaptiveDop() {
+        return getChildren().stream().allMatch(PlanNode::canUseRuntimeAdaptiveDop);
     }
 
     @Override
@@ -89,11 +102,41 @@ public class DecodeNode extends PlanNode {
     }
 
     @Override
+    public Optional<List<Expr>> candidatesOfSlotExpr(Expr expr, Function<Expr, Boolean> couldBound) {
+        if (!(expr instanceof SlotRef)) {
+            return Optional.empty();
+        }
+        if (!couldBound.apply(expr)) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(slotRefMap.get(expr)).map(Lists::newArrayList);
+    }
+
+    @Override
+    public boolean pushDownRuntimeFilters(DescriptorTable descTbl, RuntimeFilterDescription description,
+                                          Expr probeExpr,
+                                          List<Expr> partitionByExprs) {
+        if (!canPushDownRuntimeFilter()) {
+            return false;
+        }
+
+        if (!couldBound(probeExpr, description, descTbl)) {
+            return false;
+        }
+
+        return pushdownRuntimeFilterForChildOrAccept(descTbl, description, probeExpr, candidatesOfSlotExpr(probeExpr, couldBound(description, descTbl)),
+                partitionByExprs, candidatesOfSlotExprs(partitionByExprs, couldBoundForPartitionExpr()), 0, true);
+    }
+
+    @Override
     protected void toNormalForm(TNormalPlanNode planNode, FragmentNormalizer normalizer) {
         TNormalDecodeNode decodeNode = new TNormalDecodeNode();
-        List<Integer> fromDictIds = dictIdToStringIds.keySet().stream().sorted(Integer::compareTo)
+        List<Pair<SlotId, SlotId>> dictIdAndStrIdPairs = dictIdToStringIds.entrySet().stream().map(
+                e -> Pair.create(normalizer.remapSlotId(new SlotId(e.getKey())), new SlotId(e.getValue()))
+        ).sorted(Comparator.comparing(p -> p.first.asInt())).collect(Collectors.toList());
+        List<Integer> fromDictIds = dictIdAndStrIdPairs.stream().map(p -> p.first.asInt())
                 .collect(Collectors.toList());
-        List<Integer> toStringIds = fromDictIds.stream().map(dictIdToStringIds::get)
+        List<Integer> toStringIds = dictIdAndStrIdPairs.stream().map(p -> normalizer.remapSlotId(p.second).asInt())
                 .collect(Collectors.toList());
         decodeNode.setFrom_dict_ids(fromDictIds);
         decodeNode.setTo_string_ids(toStringIds);

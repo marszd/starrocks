@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.cost;
 
 import com.starrocks.qe.ConnectContext;
@@ -20,6 +19,7 @@ import com.starrocks.sql.optimizer.ExpressionContext;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 import com.starrocks.sql.optimizer.statistics.ExpressionStatisticCalculator;
@@ -69,13 +69,16 @@ public class HashJoinCostModel {
 
     private final List<BinaryPredicateOperator> eqOnPredicates;
 
+    private final Statistics joinStatistics;
+
     public HashJoinCostModel(ExpressionContext context, List<PhysicalPropertySet> inputProperties,
-                             List<BinaryPredicateOperator> eqOnPredicates) {
+                             List<BinaryPredicateOperator> eqOnPredicates, final Statistics joinStatistics) {
         this.context = context;
         this.leftStatistics = context.getChildStatistics(0);
         this.rightStatistics = context.getChildStatistics(1);
         this.inputProperties = inputProperties;
         this.eqOnPredicates = eqOnPredicates;
+        this.joinStatistics = joinStatistics;
     }
 
     public double getCpuCost() {
@@ -99,7 +102,10 @@ public class HashJoinCostModel {
                 buildCost = rightOutput;
                 probeCost = leftOutput;
         }
-        return buildCost + probeCost;
+        double joinCost = buildCost + probeCost;
+        // should add output cost
+        joinCost += joinStatistics.getComputeSize();
+        return joinCost;
     }
 
     public double getMemCost() {
@@ -163,13 +169,20 @@ public class HashJoinCostModel {
                 buildMapOp = rightOp;
             }
 
+            ColumnStatistic keyStatistics;
             if (buildMapOp.isColumnRef()) {
-                keySize += rightTableStat.getColumnStatistics().get(buildMapOp).getAverageRowSize();
+                keyStatistics = rightTableStat.getColumnStatistic((ColumnRefOperator) buildMapOp);
             } else {
                 Statistics.Builder allBuilder = Statistics.builder();
                 allBuilder.addColumnStatistics(rightTableStat.getColumnStatistics());
-                ColumnStatistic outputStatistic = ExpressionStatisticCalculator.calculate(buildMapOp, allBuilder.build());
-                keySize += outputStatistic.getAverageRowSize();
+                keyStatistics = ExpressionStatisticCalculator.calculate(buildMapOp, allBuilder.build());
+            }
+
+            if (keyStatistics.isUnknown()) {
+                // can't trust unknown statistics, may be produced by other node
+                keySize += buildMapOp.getType().getTypeSize();
+            } else {
+                keySize += keyStatistics.getAverageRowSize();
             }
         }
         return keySize;

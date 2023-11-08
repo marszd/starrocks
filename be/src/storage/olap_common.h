@@ -239,10 +239,18 @@ struct OlapReaderStatistics {
 
     int64_t get_rowsets_ns = 0;
     int64_t get_delvec_ns = 0;
+    int64_t get_delta_column_group_ns = 0;
     int64_t segment_init_ns = 0;
+    int64_t column_iterator_init_ns = 0;
+    int64_t bitmap_index_iterator_init_ns = 0;
+    int64_t zone_map_filter_ns = 0;
+    int64_t rows_key_range_filter_ns = 0;
+    int64_t bf_filter_ns = 0;
 
     int64_t segment_stats_filtered = 0;
     int64_t rows_key_range_filtered = 0;
+    int64_t rows_after_key_range = 0;
+    int64_t rows_key_range_num = 0;
     int64_t rows_stats_filtered = 0;
     int64_t rows_bf_filtered = 0;
     int64_t rows_del_filtered = 0;
@@ -261,9 +269,43 @@ struct OlapReaderStatistics {
     int64_t total_columns_data_page_count = 0;
 
     int64_t runtime_stats_filtered = 0;
+
+    int64_t read_pk_index_ns = 0;
+
+    // ------ for lake tablet ------
+    int64_t pages_from_local_disk = 0;
+
+    int64_t compressed_bytes_read_local_disk = 0;
+    int64_t compressed_bytes_read_remote = 0;
+    // bytes read requested from be, same as compressed_bytes_read for local tablet
+    int64_t compressed_bytes_read_request = 0;
+
+    int64_t io_count = 0;
+    int64_t io_count_local_disk = 0;
+    int64_t io_count_remote = 0;
+    int64_t io_count_request = 0;
+
+    int64_t io_ns_local_disk = 0;
+    int64_t io_ns_remote = 0;
+
+    int64_t prefetch_hit_count = 0;
+    int64_t prefetch_wait_finish_ns = 0;
+    int64_t prefetch_pending_ns = 0;
+    // ------ for lake tablet ------
 };
 
+const char* const kBytesReadLocalDisk = "bytes_read_local_disk";
+const char* const kBytesReadRemote = "bytes_read_remote";
+const char* const kIOCountLocalDisk = "io_count_local_disk";
+const char* const kIOCountRemote = "io_count_remote";
+const char* const kIONsLocalDisk = "io_ns_local_disk";
+const char* const kIONsRemote = "io_ns_remote";
+const char* const kPrefetchHitCount = "prefetch_hit_count";
+const char* const kPrefetchWaitFinishNs = "prefetch_wait_finish_ns";
+const char* const kPrefetchPendingNs = "prefetch_pending_ns";
+
 typedef uint32_t ColumnId;
+typedef int32_t ColumnUID;
 // Column unique id set
 typedef std::set<uint32_t> UniqueIdSet;
 // Column unique Id -> column id map

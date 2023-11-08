@@ -42,7 +42,7 @@ import com.starrocks.catalog.StructField;
 import com.starrocks.catalog.StructType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.FeConstants;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.util.List;
 
@@ -53,7 +53,14 @@ public class TypeDef implements ParseNode {
     private Type parsedType;
     private boolean isAnalyzed;
 
+    private final NodePosition pos;
+
     public TypeDef(Type parsedType) {
+        this(parsedType, NodePosition.ZERO);
+    }
+
+    public TypeDef(Type parsedType, NodePosition pos) {
+        this.pos = pos;
         this.parsedType = parsedType;
     }
 
@@ -94,17 +101,6 @@ public class TypeDef implements ParseNode {
         isAnalyzed = true;
     }
 
-    public void analyze(boolean isOlap) throws AnalysisException {
-        if (isOlap && (!FeConstants.runningUnitTest)) {
-            // we haven't support create table with map or struct type column in native table
-            Type innerType = Type.getInnermostType(parsedType);
-            if (innerType.isMapType() || innerType.isStructType()) {
-                throw new AnalysisException("Unsupported data type: " + parsedType.toSql());
-            }
-        }
-        analyze();
-    }
-
     private void analyze(Type type) throws AnalysisException {
         if (!type.isSupported()) {
             throw new AnalysisException("Unsupported data type: " + type.toSql());
@@ -132,7 +128,7 @@ public class TypeDef implements ParseNode {
                 int maxLen;
                 if (type == PrimitiveType.VARCHAR) {
                     name = "Varchar";
-                    maxLen = ScalarType.MAX_VARCHAR_LENGTH;
+                    maxLen = ScalarType.OLAP_MAX_VARCHAR_LENGTH;
                 } else {
                     name = "Char";
                     maxLen = ScalarType.MAX_CHAR_LENGTH;
@@ -151,7 +147,7 @@ public class TypeDef implements ParseNode {
             }
             case VARBINARY: {
                 String name = "VARBINARY";
-                int maxLen = ScalarType.MAX_VARCHAR_LENGTH;
+                int maxLen = ScalarType.OLAP_MAX_VARCHAR_LENGTH;
                 int len = scalarType.getLength();
                 // len is decided by child, when it is -1.
                 if (scalarType.getLength() > maxLen) {
@@ -205,6 +201,10 @@ public class TypeDef implements ParseNode {
 
     private void analyzeMapType(MapType type) throws AnalysisException {
         Type keyType = type.getKeyType();
+        if (!keyType.isValidMapKeyType()) {
+            throw new AnalysisException("Invalid map.key's type: " + keyType.toSql() +
+                    ", which should be base types");
+        }
         analyze(keyType);
         Type valueType = type.getValueType();
         analyze(valueType);
@@ -226,5 +226,10 @@ public class TypeDef implements ParseNode {
     @Override
     public String toSql() {
         return parsedType.toSql();
+    }
+
+    @Override
+    public NodePosition getPos() {
+        return pos;
     }
 }

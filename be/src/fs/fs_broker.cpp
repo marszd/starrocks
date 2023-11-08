@@ -85,9 +85,9 @@ static Status to_status(const TBrokerOperationStatus& st) {
 template <typename Method, typename Request, typename Response>
 static Status call_method(const TNetworkAddress& broker, Method method, const Request& request, Response* response,
                           int retry_count = 1, int timeout_ms = DEFAULT_TIMEOUT_MS) {
-    Status status;
     TFileBrokerServiceClient* client;
 #ifndef BE_TEST
+    Status status;
     BrokerServiceConnection conn(client_cache(), broker, timeout_ms, &status);
     if (!status.ok()) {
         LOG(WARNING) << "Fail to get broker client: " << status;
@@ -210,9 +210,14 @@ class BrokerWritableFile : public WritableFile {
 public:
     BrokerWritableFile(const TNetworkAddress& broker, std::string path, const TBrokerFD& fd, size_t offset,
                        int timeout_ms)
-            : _broker(broker), _path(std::move(path)), _fd(fd), _offset(offset), _timeout_ms(timeout_ms) {}
+            : _broker(broker), _path(std::move(path)), _fd(fd), _offset(offset), _timeout_ms(timeout_ms) {
+        FileSystem::on_file_write_open(this);
+    }
 
-    ~BrokerWritableFile() override { (void)BrokerWritableFile::close(); }
+    ~BrokerWritableFile() override {
+        auto st = BrokerWritableFile::close();
+        st.permit_unchecked_error();
+    }
 
     Status append(const Slice& data) override {
         TBrokerPWriteRequest request;
@@ -248,6 +253,7 @@ public:
         if (_closed) {
             return Status::OK();
         }
+        FileSystem::on_file_write_close(this);
         Status st = broker_close_writer(_broker, _fd, _timeout_ms);
         _closed = true;
         return st;
@@ -333,7 +339,7 @@ StatusOr<std::unique_ptr<WritableFile>> BrokerFileSystem::new_writable_file(cons
                                                                             const std::string& path) {
     if (opts.mode == FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE) {
         if (auto st = _path_exists(path); st.ok()) {
-            return Status::NotSupported("Cannot truncate a file by broker, path={}"_format(path));
+            return Status::NotSupported(fmt::format("Cannot truncate a file by broker, path={}", path));
         }
     } else if (opts.mode == MUST_CREATE) {
         if (auto st = _path_exists(path); st.ok()) {
@@ -343,7 +349,8 @@ StatusOr<std::unique_ptr<WritableFile>> BrokerFileSystem::new_writable_file(cons
         return Status::NotSupported("Open with MUST_EXIST not supported by broker");
     } else if (opts.mode == CREATE_OR_OPEN) {
         if (auto st = _path_exists(path); st.ok()) {
-            return Status::NotSupported("Cannot open an already exists file through broker, path={}"_format(path));
+            return Status::NotSupported(
+                    fmt::format("Cannot open an already exists file through broker, path={}", path));
         }
     } else {
         auto msg = strings::Substitute("Unsupported open mode $0", opts.mode);
@@ -403,6 +410,10 @@ Status BrokerFileSystem::iterate_dir(const std::string& dir, const std::function
         }
     }
     return Status::OK();
+}
+
+Status BrokerFileSystem::iterate_dir2(const std::string& dir, const std::function<bool(DirEntry)>& cb) {
+    return iterate_dir(dir, [&](std::string_view name) { return cb(DirEntry{.name = name}); });
 }
 
 Status BrokerFileSystem::delete_file(const std::string& path) {

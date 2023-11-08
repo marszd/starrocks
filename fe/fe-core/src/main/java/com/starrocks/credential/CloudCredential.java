@@ -14,16 +14,16 @@
 
 package com.starrocks.credential;
 
-import com.starrocks.thrift.TCloudProperty;
+import com.staros.proto.FileStoreInfo;
 import org.apache.hadoop.conf.Configuration;
 
-import java.util.List;
+import java.util.Map;
 
 public interface CloudCredential {
 
     /**
-    * Set credentials into Hadoop configuration
-    */
+     * Set credentials into Hadoop configuration
+     */
     void applyToConfiguration(Configuration configuration);
 
     /**
@@ -36,5 +36,11 @@ public interface CloudCredential {
     /**
      * Write credential into thrift.
      */
-    void toThrift(List<TCloudProperty> properties);
+    void toThrift(Map<String, String> properties);
+
+    // Generate unique credential string, used as cache key in FileSystem cache
+    String toCredString();
+
+    // Convert to the protobuf used by staros.
+    FileStoreInfo toFileStoreInfo();
 }

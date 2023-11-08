@@ -21,27 +21,24 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeFormatterBuilder;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 public class HudiScannerUtils {
-    private static final DateTimeFormatter DATETIME_FORMATTER;
-    public static final Map<String, String> MARK_TYPE_VALUE_MAPPING = new HashMap<>();
+    private static final DateTimeFormatter DATETIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    public static final Map<String, String> HIVE_TYPE_MAPPING = new HashMap<>();
     public static Map<ColumnType.TypeValue, TimeUnit> TIMESTAMP_UNIT_MAPPING = new HashMap<>();
 
     static {
-        DateTimeFormatterBuilder builder = new DateTimeFormatterBuilder();
-        // Date and time parts
-        builder.append(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-        DATETIME_FORMATTER = builder.toFormatter();
-
-        MARK_TYPE_VALUE_MAPPING.put("TimestampMicros", "timestamp");
-        MARK_TYPE_VALUE_MAPPING.put("TimestampMillis", "timestamp");
+        HIVE_TYPE_MAPPING.put("timestamp-micros", "timestamp");
+        HIVE_TYPE_MAPPING.put("timestamp-millis", "timestamp");
 
         TIMESTAMP_UNIT_MAPPING.put(ColumnType.TypeValue.DATETIME_MICROS, TimeUnit.MICROSECONDS);
         TIMESTAMP_UNIT_MAPPING.put(ColumnType.TypeValue.DATETIME_MILLIS, TimeUnit.MILLISECONDS);
+        // https://spark.apache.org/docs/3.1.3/api/java/org/apache/spark/sql/types/TimestampType.html
+        TIMESTAMP_UNIT_MAPPING.put(ColumnType.TypeValue.DATETIME, TimeUnit.MICROSECONDS);
     }
 
     private static final long MILLI = 1000;
@@ -58,6 +55,11 @@ public class HudiScannerUtils {
         long nanoseconds = 0L;
 
         switch (timeUnit) {
+            case SECONDS:
+                seconds = value;
+                nanoseconds = 0;
+                break;
+
             case MILLISECONDS:
                 seconds = value / MILLI;
                 nanoseconds = (value % MILLI) * MICRO;
@@ -82,8 +84,51 @@ public class HudiScannerUtils {
         return dateTime.format(DATETIME_FORMATTER);
     }
 
-    public static boolean isInt64Timestamp(ColumnType.TypeValue type) {
+    public static boolean isMaybeInt64Timestamp(ColumnType.TypeValue type) {
         return (type == ColumnType.TypeValue.DATETIME_MICROS
-                || type == ColumnType.TypeValue.DATETIME_MILLIS);
+                || type == ColumnType.TypeValue.DATETIME_MILLIS
+                || type == ColumnType.TypeValue.DATETIME);
+    }
+
+    public static String mapColumnTypeToHiveType(ColumnType type) {
+        ColumnType.TypeValue typeValue = type.getTypeValue();
+        StringBuilder sb = new StringBuilder();
+        if (type.isStruct()) {
+            List<String> childNames = type.getChildNames();
+            List<ColumnType> childTypes = type.getChildTypes();
+            sb.append("struct<");
+            for (int i = 0; i < childNames.size(); i++) {
+                sb.append(childNames.get(i));
+                sb.append(":");
+                sb.append(mapColumnTypeToHiveType(childTypes.get(i)));
+                sb.append(",");
+            }
+            if (childNames.size() > 0) {
+                sb.deleteCharAt(sb.length() - 1);
+            }
+            sb.append(">");
+            return sb.toString();
+        } else if (type.isMap() || type.isArray()) {
+            List<ColumnType> childTypes = type.getChildTypes();
+            sb.append(type.getTypeValueString());
+            sb.append("<");
+            for (int i = 0; i < childTypes.size(); i++) {
+                sb.append(mapColumnTypeToHiveType(childTypes.get(i)));
+                sb.append(",");
+            }
+            if (childTypes.size() > 0) {
+                sb.deleteCharAt(sb.length() - 1);
+            }
+            sb.append(">");
+            return sb.toString();
+        } else if (type.isDecimal()) {
+            return type.getRawTypeValue();
+        } else {
+            String value = type.getTypeValueString();
+            if (value == null) {
+                throw new IllegalArgumentException("Invalid type: " + type.toString());
+            }
+            return HIVE_TYPE_MAPPING.getOrDefault(value, value);
+        }
     }
 }

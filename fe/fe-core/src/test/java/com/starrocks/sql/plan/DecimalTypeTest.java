@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.plan;
 
+import com.starrocks.common.Config;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -78,7 +78,7 @@ public class DecimalTypeTest extends PlanTestBase {
                 "THEN CAST(151971657 AS DECIMAL32 ) " +
                 " WHEN false THEN CASE WHEN NULL THEN 0.03 ELSE 0.02 END ELSE 0.04 END) AND (0.04) ) IS NULL)";
         String explain = getFragmentPlan(sql);
-        String snippet = "5:OlapScanNode\n" +
+        String snippet = "2:OlapScanNode\n" +
                 "     TABLE: tab1\n" +
                 "     PREAGGREGATION: OFF. Reason: Has can not pre-aggregation Join\n" +
                 "     partitions=0/1\n" +
@@ -86,8 +86,7 @@ public class DecimalTypeTest extends PlanTestBase {
                 "     tabletRatio=0/0\n" +
                 "     tabletList=\n" +
                 "     cardinality=1\n" +
-                "     avgRowSize=3.0\n" +
-                "     numNodes=0";
+                "     avgRowSize=3.0\n";
         assertContains(explain, snippet);
     }
 
@@ -184,5 +183,88 @@ public class DecimalTypeTest extends PlanTestBase {
         String sql = "select * from tab1 where c_1_3 between c_1_3 and 1000";
         String plan = getFragmentPlan(sql);
         assertContains(plan, "PREDICATES: 4: c_1_3 <= 1000");
+    }
+
+    @Test
+    public void testArrayAggDecimal() throws Exception {
+        int stage = connectContext.getSessionVariable().getNewPlannerAggStage();
+        connectContext.getSessionVariable().setNewPlanerAggStage(2);
+        try {
+            String sql = "select array_agg(c_0_0) from tab0";
+            String plan = getVerboseExplain(sql);
+            assertContains(plan, "array_agg[([16: array_agg, struct<col1 array<decimal128(26, 2)>>, true]); " +
+                    "args: DECIMAL128; result: ARRAY<DECIMAL128(26,2)>;");
+            assertContains(plan, "array_agg[([1: c_0_0, DECIMAL128(26,2), false]); " +
+                    "args: DECIMAL128; result: struct<col1 array<decimal128(26, 2)>>;");
+        } finally {
+            connectContext.getSessionVariable().setNewPlanerAggStage(stage);
+        }
+
+        connectContext.getSessionVariable().setNewPlanerAggStage(0);
+        try {
+            String sql = "select array_agg(c_0_0) from tab0";
+            String plan = getVerboseExplain(sql);
+            assertContains(plan, "array_agg[([1: c_0_0, DECIMAL128(26,2), false]); " +
+                    "args: DECIMAL128; result: ARRAY<DECIMAL128(26,2)>;");
+        } finally {
+            connectContext.getSessionVariable().setNewPlanerAggStage(stage);
+        }
+        try {
+            String sql = "select array_agg(distinct c_2_0) from tab2";
+            String plan = getVerboseExplain(sql);
+            assertContains(plan, "array_agg_distinct");
+        } finally {
+            connectContext.getSessionVariable().setNewPlanerAggStage(stage);
+        }
+
+        try {
+            String sql = "select array_agg(distinct c_1_6) from tab1 group by c_1_0,c_1_1;";
+            String plan = getVerboseExplain(sql);
+            assertContains(plan, "array_agg_distinct");
+        } finally {
+            connectContext.getSessionVariable().setNewPlanerAggStage(stage);
+        }
+    }
+
+    @Test
+    public void testDecimalV2ArraySlice() throws Exception {
+        try {
+            Config.enable_decimal_v3 = false;
+            starRocksAssert.withTable("CREATE TABLE dec22 (" +
+                    "c_2_0 INT NULL," +
+                    "c_1_0 ARRAY<DECIMAL(10, 0)> NULL " +
+                    ") " +
+                    "DUPLICATE KEY (c_2_0) " +
+                    "DISTRIBUTED BY HASH (c_2_0) " +
+                    "properties(\"replication_num\"=\"1\") ;");
+            String sql = "select array_slice(c_1_0, 1) from dec22";
+            String plan = getVerboseExplain(sql);
+            assertContains(plan,
+                    "array_slice[([2: c_1_0, ARRAY<DECIMAL(10,0)>, true], 1); ",
+                    "result: ARRAY<DECIMAL(9,0)>;");
+        } finally {
+            Config.enable_decimal_v3 = true;
+            starRocksAssert.dropTable("dec22");
+        }
+
+    }
+
+    @Test
+    public void testDecimalV2Cast() throws Exception {
+        String sql = "select cast('12.367' as decimalv2(9,0));";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "12.367");
+
+        sql = "select cast('12.367' as decimalv2(9,1));";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "12.367");
+
+        sql = "select cast('12.367' as decimalv2(9,2));";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "12.367");
+
+        sql = "select cast(cast('12.56' as decimalv2(9,1)) as varchar);";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "'12.56'");
     }
 }

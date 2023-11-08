@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.connector.hive.glue.metastore;
 
 import com.amazonaws.ClientConfiguration;
@@ -25,18 +24,18 @@ import com.amazonaws.services.glue.AWSGlueClientBuilder;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.starrocks.connector.hive.glue.util.AWSGlueConfig;
-import com.starrocks.credential.AWSCloudConfigurationFactory;
-import com.starrocks.credential.AWSCloudCredential;
-import com.starrocks.credential.CloudCredential;
+import com.starrocks.credential.CloudConfigurationFactory;
+import com.starrocks.credential.aws.AWSCloudCredential;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.metastore.api.MetaException;
 import org.apache.hadoop.util.ReflectionUtils;
-import org.apache.log4j.Logger;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 public final class AWSGlueClientFactory implements GlueClientFactory {
 
-    private static final Logger LOGGER = Logger.getLogger(AWSGlueClientFactory.class);
+    private static final Logger LOGGER = LogManager.getLogger(AWSGlueClientFactory.class);
 
     private final HiveConf conf;
 
@@ -47,12 +46,10 @@ public final class AWSGlueClientFactory implements GlueClientFactory {
 
     @Override
     public AWSGlue newClient() throws MetaException {
-        AWSCloudConfigurationFactory factory = new AWSCloudConfigurationFactory(conf);
-        CloudCredential cloudCredential = factory.buildGlueCloudCredential();
+        AWSCloudCredential glueCloudCredential = CloudConfigurationFactory.buildGlueCloudCredential(conf);
         try {
             AWSGlueClientBuilder glueClientBuilder = null;
-            if (cloudCredential != null) {
-                AWSCloudCredential glueCloudCredential = (AWSCloudCredential) cloudCredential;
+            if (glueCloudCredential != null) {
                 Preconditions.checkNotNull(glueCloudCredential);
                 AWSCredentialsProvider awsCredentialsProvider = glueCloudCredential.generateAWSCredentialsProvider();
                 glueClientBuilder = AWSGlueClientBuilder.standard().withCredentials(awsCredentialsProvider);
@@ -93,7 +90,7 @@ public final class AWSGlueClientFactory implements GlueClientFactory {
             return glueClientBuilder.build();
         } catch (Exception e) {
             String message = "Unable to build AWSGlueClient: " + e;
-            LOGGER.error(message);
+            LOGGER.error(message, e);
             throw new MetaException(message);
         }
     }

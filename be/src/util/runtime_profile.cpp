@@ -410,8 +410,24 @@ void RuntimeProfile::copy_all_info_strings_from(RuntimeProfile* src_profile) {
     }
 
     std::lock_guard<std::mutex> l(src_profile->_info_strings_lock);
-    for (auto& [key, value] : src_profile->_info_strings) {
-        add_info_string(key, value);
+    for (const auto& [key, value] : src_profile->_info_strings) {
+        const std::string* exist_ptr = get_info_string(key);
+        if (exist_ptr == nullptr) {
+            add_info_string(key, value);
+        } else if (value != *exist_ptr) {
+            std::string original_key = key;
+            if (size_t pos; (pos = key.find("__DUP(")) != std::string::npos) {
+                original_key = key.substr(0, pos);
+            }
+            size_t i = 0;
+            while (true) {
+                const std::string indexed_key = strings::Substitute("$0__DUP($1)", original_key, i++);
+                if (get_info_string(indexed_key) == nullptr) {
+                    add_info_string(indexed_key, value);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -471,6 +487,16 @@ RuntimeProfile::ThreadCounters* RuntimeProfile::add_thread_counters(const std::s
     return counter;
 }
 
+std::pair<RuntimeProfile::Counter*, std::string> RuntimeProfile::get_counter_pair(const std::string& name) {
+    std::lock_guard<std::mutex> l(_counter_lock);
+
+    if (_counter_map.find(name) != _counter_map.end()) {
+        return _counter_map[name];
+    }
+
+    return {nullptr, ROOT_COUNTER};
+}
+
 RuntimeProfile::Counter* RuntimeProfile::get_counter(const std::string& name) {
     std::lock_guard<std::mutex> l(_counter_lock);
 
@@ -481,7 +507,7 @@ RuntimeProfile::Counter* RuntimeProfile::get_counter(const std::string& name) {
     return nullptr;
 }
 
-void RuntimeProfile::copy_all_counters_from(RuntimeProfile* src_profile) {
+void RuntimeProfile::copy_all_counters_from(RuntimeProfile* src_profile, const std::string& attached_counter_name) {
     DCHECK(src_profile != nullptr);
     if (this == src_profile) {
         return;
@@ -501,6 +527,10 @@ void RuntimeProfile::copy_all_counters_from(RuntimeProfile* src_profile) {
         if (name != ROOT_COUNTER) {
             auto* src_counter = src_profile->_counter_map[name].first;
             DCHECK(src_counter != nullptr);
+            if (attached_counter_name != ROOT_COUNTER && parent_name == ROOT_COUNTER &&
+                this->_counter_map.find(attached_counter_name) != this->_counter_map.end()) {
+                parent_name = attached_counter_name;
+            }
             auto* new_counter = add_counter_unlock(name, src_counter->type(), src_counter->strategy(), parent_name);
             new_counter->set(src_counter->value());
         }
@@ -778,16 +808,19 @@ RuntimeProfile::EventSequence* RuntimeProfile::add_event_sequence(const std::str
     return timer;
 }
 
-void RuntimeProfile::merge_isomorphic_profiles(std::vector<RuntimeProfile*>& profiles) {
-    if (profiles.empty()) {
-        return;
-    }
-
-    static const std::string MERGED_INFO_PREFIX_MIN = "__MIN_OF_";
-    static const std::string MERGED_INFO_PREFIX_MAX = "__MAX_OF_";
+RuntimeProfile* RuntimeProfile::merge_isomorphic_profiles(ObjectPool* obj_pool, std::vector<RuntimeProfile*>& profiles,
+                                                          bool require_identical) {
+    DCHECK(!profiles.empty());
 
     // all metrics will be merged into the first profile
-    auto* profile0 = profiles[0];
+    auto* merged_profile = obj_pool->add(new RuntimeProfile(profiles[0]->name(), profiles[0]->_is_averaged_profile));
+
+    // Merge into string, if contents are different, only the last will be preserved;
+    {
+        for (auto& profile : profiles) {
+            merged_profile->copy_all_info_strings_from(profile);
+        }
+    }
 
     // Merge counters
     {
@@ -822,9 +855,6 @@ void RuntimeProfile::merge_isomorphic_profiles(std::vector<RuntimeProfile*>& pro
                     DCHECK(pair_it != profile->_counter_map.end());
                     const auto& pair = pair_it->second;
                     const auto* counter = pair.first;
-                    if (counter->skip_merge()) {
-                        continue;
-                    }
                     const auto& parent_name = pair.second;
 
                     while (all_level_counters.size() <= level_idx) {
@@ -838,10 +868,10 @@ void RuntimeProfile::merge_isomorphic_profiles(std::vector<RuntimeProfile*>& pro
                     }
                     const auto exist_type = it->second.first;
                     if (counter->type() != exist_type) {
-                        LOG(WARNING) << "find non-isomorphic counter, profile_name=" << profile0->name()
+                        LOG(WARNING) << "find non-isomorphic counter, profile_name=" << merged_profile->name()
                                      << ", counter_name=" << name << ", exist_type=" << std::to_string(exist_type)
                                      << ", another_type=" << std::to_string(counter->type());
-                        return;
+                        continue;
                     }
                 }
             }
@@ -868,6 +898,8 @@ void RuntimeProfile::merge_isomorphic_profiles(std::vector<RuntimeProfile*>& pro
             int64_t min_value = std::numeric_limits<int64_t>::max();
             int64_t max_value = std::numeric_limits<int64_t>::min();
             bool already_merged = false;
+            bool skip_merge = false;
+            Counter* skip_merge_counter = nullptr;
             TCounterStrategy strategy;
             for (auto profile : profiles) {
                 auto* counter = profile->get_counter(name);
@@ -879,84 +911,113 @@ void RuntimeProfile::merge_isomorphic_profiles(std::vector<RuntimeProfile*>& pro
                     continue;
                 }
                 if (type != counter->type()) {
-                    LOG(WARNING) << "find non-isomorphic counter, profile_name=" << profile0->name()
+                    LOG(WARNING) << "find non-isomorphic counter, profile_name=" << merged_profile->name()
                                  << ", counter_name=" << name << ", exist_type=" << std::to_string(type)
                                  << ", another_type=" << std::to_string(counter->type());
-                    return;
+                    continue;
                 }
                 strategy = counter->strategy();
+                if (counter->skip_merge()) {
+                    skip_merge = true;
+                    skip_merge_counter = counter;
+                    break;
+                }
 
-                auto* min_counter = profile->get_counter(strings::Substitute("$0$1", MERGED_INFO_PREFIX_MIN, name));
-                if (min_counter != nullptr) {
-                    already_merged = true;
-                    if (min_counter->value() < min_value) {
-                        min_value = min_counter->value();
+                if (!counter->skip_min_max()) {
+                    auto* min_counter = profile->get_counter(strings::Substitute("$0$1", MERGED_INFO_PREFIX_MIN, name));
+                    if (min_counter != nullptr) {
+                        already_merged = true;
+                        if (min_counter->value() < min_value) {
+                            min_value = min_counter->value();
+                        }
+                    }
+                    auto* max_counter = profile->get_counter(strings::Substitute("$0$1", MERGED_INFO_PREFIX_MAX, name));
+                    if (max_counter != nullptr) {
+                        already_merged = true;
+                        if (max_counter->value() > max_value) {
+                            max_value = max_counter->value();
+                        }
                     }
                 }
-                auto* max_counter = profile->get_counter(strings::Substitute("$0$1", MERGED_INFO_PREFIX_MAX, name));
-                if (max_counter != nullptr) {
-                    already_merged = true;
-                    if (max_counter->value() > max_value) {
-                        max_value = max_counter->value();
-                    }
-                }
+
                 counters.push_back(counter);
             }
 
-            const auto merged_info = merge_isomorphic_counters(counters);
-            const auto merged_value = std::get<0>(merged_info);
-            if (!already_merged) {
-                min_value = std::get<1>(merged_info);
-                max_value = std::get<2>(merged_info);
+            Counter* merged_counter = nullptr;
+            if (ROOT_COUNTER != parent_name && merged_profile->get_counter(parent_name) != nullptr) {
+                merged_counter = merged_profile->add_child_counter(name, type, strategy, parent_name);
+            } else {
+                if (ROOT_COUNTER != parent_name) {
+                    LOG(WARNING) << "missing parent counter, profile_name=" << merged_profile->name()
+                                 << ", counter_name=" << name << ", parent_counter_name=" << parent_name;
+                }
+                merged_counter = merged_profile->add_counter(name, type, strategy);
             }
 
-            auto* counter0 = profile0->get_counter(name);
-            // As stated before, some counters may only attach to one of the isomorphic profiles
-            // and the first profile may not have this counter, so we create a counter here
-            if (counter0 == nullptr) {
-                if (ROOT_COUNTER != parent_name && profile0->get_counter(parent_name) != nullptr) {
-                    counter0 = profile0->add_child_counter(name, type, strategy, parent_name);
-                } else {
-                    if (ROOT_COUNTER != parent_name) {
-                        LOG(WARNING) << "missing parent counter, profile_name=" << profile0->name()
-                                     << ", counter_name=" << name << ", parent_counter_name=" << parent_name;
-                    }
-                    counter0 = profile0->add_counter(name, type, strategy);
+            if (skip_merge) {
+                merged_counter->set(skip_merge_counter->value());
+            } else {
+                const auto merged_info = merge_isomorphic_counters(counters);
+                const auto merged_value = std::get<0>(merged_info);
+                if (!already_merged) {
+                    min_value = std::get<1>(merged_info);
+                    max_value = std::get<2>(merged_info);
+                }
+
+                merged_counter->set(merged_value);
+
+                if (!merged_counter->skip_min_max()) {
+                    auto* min_counter =
+                            merged_profile->add_child_counter(strings::Substitute("$0$1", MERGED_INFO_PREFIX_MIN, name),
+                                                              type, merged_counter->strategy(), name);
+                    auto* max_counter =
+                            merged_profile->add_child_counter(strings::Substitute("$0$1", MERGED_INFO_PREFIX_MAX, name),
+                                                              type, merged_counter->strategy(), name);
+                    min_counter->set(min_value);
+                    max_counter->set(max_value);
                 }
             }
-            counter0->set(merged_value);
-
-            auto* min_counter = profile0->add_child_counter(strings::Substitute("$0$1", MERGED_INFO_PREFIX_MIN, name),
-                                                            type, counter0->strategy(), name);
-            auto* max_counter = profile0->add_child_counter(strings::Substitute("$0$1", MERGED_INFO_PREFIX_MAX, name),
-                                                            type, counter0->strategy(), name);
-            min_counter->set(min_value);
-            max_counter->set(max_value);
         }
     }
 
     // merge children
     {
-        std::lock_guard<std::mutex> l(profile0->_children_lock);
-        for (auto i = 0; i < profile0->_children.size(); i++) {
-            std::vector<RuntimeProfile*> sub_profiles;
-            auto* child0 = profile0->_children[i].first;
-            sub_profiles.push_back(child0);
-            for (auto j = 1; j < profiles.size(); j++) {
-                auto* profile = profiles[j];
-                if (i >= profile->num_children()) {
-                    LOG(WARNING) << "find non-isomorphic children, profile_name=" << profile0->name()
-                                 << ", children_names=" << profile0->get_children_name_string()
-                                 << ", another profile_name=" << profile->name()
-                                 << ", another children_names=" << profile->get_children_name_string();
-                    return;
-                }
-                auto* child = profile->get_child(i);
-                sub_profiles.push_back(child);
+        size_t max_child_size = 0;
+        RuntimeProfile* profile_with_full_child = nullptr;
+        for (auto* profile : profiles) {
+            if (profile->_children.size() > max_child_size) {
+                max_child_size = profile->_children.size();
+                profile_with_full_child = profile;
             }
-            merge_isomorphic_profiles(sub_profiles);
+        }
+        if (profile_with_full_child != nullptr) {
+            bool identical = true;
+            for (size_t i = 0; i < max_child_size; i++) {
+                auto& prototype_kv = profile_with_full_child->_children[i];
+                const std::string& child_name = prototype_kv.first->name();
+                std::vector<RuntimeProfile*> sub_profiles;
+                for (auto* profile : profiles) {
+                    auto* child = profile->get_child(child_name);
+                    if (child == nullptr) {
+                        identical = false;
+                        if (require_identical) {
+                            LOG(INFO) << "find non-isomorphic children, profile_name=" << profile->name()
+                                      << ", required_child_name=" << child_name;
+                        }
+                        continue;
+                    }
+                    sub_profiles.push_back(child);
+                }
+                auto* merged_child = merge_isomorphic_profiles(obj_pool, sub_profiles, require_identical);
+                merged_profile->add_child(merged_child, prototype_kv.second, nullptr);
+            }
+            if (require_identical && !identical) {
+                merged_profile->add_info_string("NotIdentical");
+            }
         }
     }
+
+    return merged_profile;
 }
 
 RuntimeProfile::MergedInfo RuntimeProfile::merge_isomorphic_counters(std::vector<Counter*>& counters) {
@@ -997,7 +1058,7 @@ void RuntimeProfile::print_child_counters(const std::string& prefix, const std::
             DCHECK(iter != counter_map.end());
             auto value = iter->second.first->value();
             auto display_threshold = iter->second.first->display_threshold();
-            if (display_threshold > 0 && value > display_threshold) {
+            if (display_threshold == 0 || (display_threshold > 0 && value > display_threshold)) {
                 stream << prefix << "   - " << iter->first << ": "
                        << PrettyPrinter::print(iter->second.first->value(), iter->second.first->type()) << std::endl;
                 RuntimeProfile::print_child_counters(prefix + "  ", child_counter, counter_map, child_counter_map, s);

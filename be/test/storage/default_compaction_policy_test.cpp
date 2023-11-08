@@ -65,6 +65,20 @@ public:
         tablet_meta->add_rs_meta(src_rowset->rowset_meta());
     }
 
+    void write_empty_version(const TabletMetaSharedPtr& tablet_meta) {
+        RowsetWriterContext rowset_writer_context;
+        create_rowset_writer_context(&rowset_writer_context, _version);
+        _version++;
+        std::unique_ptr<RowsetWriter> rowset_writer;
+        ASSERT_TRUE(RowsetFactory::create_rowset_writer(rowset_writer_context, &rowset_writer).ok());
+
+        RowsetSharedPtr src_rowset = *rowset_writer->build();
+        ASSERT_TRUE(src_rowset != nullptr);
+        ASSERT_EQ(0, src_rowset->num_rows());
+
+        tablet_meta->add_rs_meta(src_rowset->rowset_meta());
+    }
+
     void write_specify_version(const TabletSharedPtr& tablet, int64_t version) {
         RowsetWriterContext rowset_writer_context;
         create_rowset_writer_context(&rowset_writer_context, version);
@@ -111,7 +125,7 @@ public:
         rowset_writer_context->partition_id = 10;
         rowset_writer_context->rowset_path_prefix = config::storage_root_path + "/data/0/12345/1111";
         rowset_writer_context->rowset_state = VISIBLE;
-        rowset_writer_context->tablet_schema = _tablet_schema.get();
+        rowset_writer_context->tablet_schema = _tablet_schema;
         rowset_writer_context->version.first = version;
         rowset_writer_context->version.second = version;
     }
@@ -177,7 +191,7 @@ public:
 
     void rowset_writer_add_rows(std::unique_ptr<RowsetWriter>& writer) {
         std::vector<std::string> test_data;
-        auto schema = ChunkHelper::convert_schema(*_tablet_schema);
+        auto schema = ChunkHelper::convert_schema(_tablet_schema);
         for (size_t j = 0; j < 8; ++j) {
             auto chunk = ChunkHelper::new_chunk(schema, 128);
             for (size_t i = 0; i < 128; ++i) {
@@ -198,7 +212,7 @@ public:
         tablet->set_compaction_context(compaction_context);
     }
 
-    Status compact(const TabletSharedPtr& tablet) {
+    Status compact(const TabletSharedPtr& tablet, bool* is_shortcut_compaction = nullptr) {
         if (!tablet->need_compaction()) {
             LOG(WARNING) << "no need compact";
             return Status::InternalError("no need compact");
@@ -215,6 +229,9 @@ public:
             LOG(WARNING) << "task fail";
             return Status::InternalError("task fail");
         }
+        if (is_shortcut_compaction != nullptr) {
+            *is_shortcut_compaction = task->is_shortcut_compaction();
+        }
 
         return Status::OK();
     }
@@ -227,7 +244,7 @@ public:
         Compaction::init(config::max_compaction_concurrency);
 
         _default_storage_root_path = config::storage_root_path;
-        config::storage_root_path = std::filesystem::current_path().string() + "/data_test_cumulative_compaction";
+        config::storage_root_path = std::filesystem::current_path().string() + "/default_compaction_policy";
         fs::remove_all(config::storage_root_path);
         ASSERT_TRUE(fs::create_directories(config::storage_root_path).ok());
         std::vector<StorePath> paths;
@@ -265,7 +282,7 @@ public:
 
 protected:
     StorageEngine* _engine = nullptr;
-    std::unique_ptr<TabletSchema> _tablet_schema;
+    std::shared_ptr<TabletSchema> _tablet_schema;
     std::string _schema_hash_path;
     std::unique_ptr<MemTracker> _metadata_mem_tracker;
     std::unique_ptr<MemTracker> _compaction_mem_tracker;
@@ -292,7 +309,7 @@ TEST_F(DefaultCompactionPolicyTest, test_candidate_rowsets_empty) {
     tablet_meta->set_tablet_schema(schema);
 
     TabletSharedPtr tablet = Tablet::create_tablet_from_meta(tablet_meta, nullptr);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     init_compaction_context(tablet);
 
     ASSERT_FALSE(compact(tablet).ok());
@@ -309,7 +326,7 @@ TEST_F(DefaultCompactionPolicyTest, test_min_cumulative_compaction) {
 
     TabletSharedPtr tablet =
             Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     init_compaction_context(tablet);
 
     auto res = compact(tablet);
@@ -337,7 +354,7 @@ TEST_F(DefaultCompactionPolicyTest, test_max_cumulative_compaction) {
 
     TabletSharedPtr tablet =
             Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     init_compaction_context(tablet);
 
     auto res = compact(tablet);
@@ -367,7 +384,7 @@ TEST_F(DefaultCompactionPolicyTest, test_tablet_not_running) {
 
     TabletSharedPtr tablet =
             Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     tablet->set_tablet_state(TABLET_NOTREADY);
     init_compaction_context(tablet);
 
@@ -403,7 +420,7 @@ TEST_F(DefaultCompactionPolicyTest, test_missed_first_version) {
 
     TabletSharedPtr tablet =
             Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     init_compaction_context(tablet);
 
     {
@@ -439,7 +456,7 @@ TEST_F(DefaultCompactionPolicyTest, test_missed_version_after_cumulative_point) 
 
     TabletSharedPtr tablet =
             Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     init_compaction_context(tablet);
 
     ASSERT_EQ(4, tablet->version_count());
@@ -544,7 +561,7 @@ TEST_F(DefaultCompactionPolicyTest, test_missed_two_version) {
 
     TabletSharedPtr tablet =
             Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     init_compaction_context(tablet);
 
     ASSERT_EQ(4, tablet->version_count());
@@ -682,7 +699,7 @@ TEST_F(DefaultCompactionPolicyTest, test_delete_version) {
 
     TabletSharedPtr tablet =
             Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     init_compaction_context(tablet);
 
     ASSERT_EQ(3, tablet->version_count());
@@ -760,7 +777,7 @@ TEST_F(DefaultCompactionPolicyTest, test_missed_and_delete_version) {
 
     TabletSharedPtr tablet =
             Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     init_compaction_context(tablet);
 
     ASSERT_EQ(5, tablet->version_count());
@@ -872,7 +889,7 @@ TEST_F(DefaultCompactionPolicyTest, test_multi_segment_cumulative_compaction) {
 
     TabletSharedPtr tablet =
             Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
-    tablet->init();
+    ASSERT_OK(tablet->init());
     init_compaction_context(tablet);
 
     auto res = compact(tablet);
@@ -885,6 +902,37 @@ TEST_F(DefaultCompactionPolicyTest, test_multi_segment_cumulative_compaction) {
     ASSERT_EQ(1, versions.size());
     ASSERT_EQ(0, versions[0].first);
     ASSERT_EQ(0, versions[0].second);
+}
+
+TEST_F(DefaultCompactionPolicyTest, test_shortcut_compaction) {
+    LOG(INFO) << "test_shortcut_compaction";
+    create_tablet_schema(UNIQUE_KEYS);
+
+    TabletMetaSharedPtr tablet_meta = std::make_shared<TabletMeta>();
+    create_tablet_meta(tablet_meta.get());
+
+    write_new_version(tablet_meta);
+    write_empty_version(tablet_meta);
+    write_empty_version(tablet_meta);
+
+    TabletSharedPtr tablet =
+            Tablet::create_tablet_from_meta(tablet_meta, starrocks::StorageEngine::instance()->get_stores()[0]);
+    ASSERT_OK(tablet->init());
+    init_compaction_context(tablet);
+    ASSERT_EQ(3, tablet->version_count());
+
+    bool is_shortcut_compaction = false;
+    auto res = compact(tablet, &is_shortcut_compaction);
+    ASSERT_TRUE(res.ok());
+    ASSERT_TRUE(is_shortcut_compaction);
+
+    ASSERT_EQ(1, tablet->version_count());
+    ASSERT_EQ(3, tablet->cumulative_layer_point());
+    std::vector<Version> versions;
+    tablet->list_versions(&versions);
+    ASSERT_EQ(1, versions.size());
+    ASSERT_EQ(0, versions[0].first);
+    ASSERT_EQ(2, versions[0].second);
 }
 
 } // namespace starrocks

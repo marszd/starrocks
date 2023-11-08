@@ -39,7 +39,9 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
 import com.starrocks.common.Config;
 import com.starrocks.common.Reference;
+import com.starrocks.common.util.NetUtils;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
 import com.starrocks.system.Backend;
 import com.starrocks.system.ComputeNode;
 import com.starrocks.system.SystemInfoService;
@@ -48,12 +50,15 @@ import com.starrocks.thrift.TScanRangeLocation;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 public class SimpleScheduler {
@@ -73,31 +78,49 @@ public class SimpleScheduler {
     }
 
     @Nullable
-    public static TNetworkAddress getHost(long backendId,
+    public static TNetworkAddress getHost(long nodeId,
                                           List<TScanRangeLocation> locations,
-                                          ImmutableMap<Long, Backend> backends,
+                                          ImmutableMap<Long, ComputeNode> computeNodes,
                                           Reference<Long> backendIdRef) {
-        if (locations == null || backends == null) {
+
+        if (locations == null || computeNodes == null) {
             return null;
         }
-        LOG.debug("getHost backendID={}, backendSize={}", backendId, backends.size());
-        Backend backend = backends.get(backendId);
+        LOG.debug("getHost nodeID={}, nodeSize={}", nodeId, computeNodes.size());
+
+        ComputeNode node = computeNodes.get(nodeId);
+
         lock.lock();
         try {
-            if (backend != null && backend.isAlive() && !blacklistBackends.containsKey(backendId)) {
-                backendIdRef.setRef(backendId);
-                return new TNetworkAddress(backend.getHost(), backend.getBePort());
+            if (node != null && node.isAlive() && !blacklistBackends.containsKey(nodeId)) {
+                backendIdRef.setRef(nodeId);
+                return new TNetworkAddress(node.getHost(), node.getBePort());
             } else {
                 for (TScanRangeLocation location : locations) {
-                    if (location.backend_id == backendId) {
+                    if (location.backend_id == nodeId) {
                         continue;
                     }
                     // choose the first alive backend(in analysis stage, the locations are random)
-                    Backend candidateBackend = backends.get(location.backend_id);
+                    ComputeNode candidateBackend = computeNodes.get(location.backend_id);
                     if (candidateBackend != null && candidateBackend.isAlive()
                             && !blacklistBackends.containsKey(location.backend_id)) {
                         backendIdRef.setRef(location.backend_id);
                         return new TNetworkAddress(candidateBackend.getHost(), candidateBackend.getBePort());
+                    }
+                }
+
+                // In shared data mode, we can select any alive node to replace the original dead node for query
+                if (RunMode.getCurrentRunMode() == RunMode.SHARED_DATA) {
+                    List<ComputeNode> allNodes = new ArrayList<>(computeNodes.size());
+                    allNodes.addAll(computeNodes.values());
+                    List<ComputeNode> candidateNodes = allNodes.stream()
+                            .filter(x -> x.getId() != nodeId && x.isAlive() &&
+                                    !blacklistBackends.containsKey(x.getId())).collect(Collectors.toList());
+                    if (!candidateNodes.isEmpty()) {
+                        // use modulo operation to ensure that the same node is selected for the dead node
+                        ComputeNode candidateNode = candidateNodes.get((int) (nodeId % candidateNodes.size()));
+                        backendIdRef.setRef(candidateNode.getId());
+                        return new TNetworkAddress(candidateNode.getHost(), candidateNode.getBePort());
                     }
                 }
             }
@@ -120,9 +143,9 @@ public class SimpleScheduler {
     }
 
     @Nullable
-    public static TNetworkAddress getBackendHost(ImmutableMap<Long, Backend> backendMap,
+    public static TNetworkAddress getBackendHost(ImmutableMap<Long, ComputeNode> backendMap,
                                                  Reference<Long> backendIdRef) {
-        Backend node = getBackend(backendMap);
+        ComputeNode node = getBackend(backendMap);
         if (node != null) {
             backendIdRef.setRef(node.getId());
             return new TNetworkAddress(node.getHost(), node.getBePort());
@@ -131,7 +154,7 @@ public class SimpleScheduler {
     }
 
     @Nullable
-    public static Backend getBackend(ImmutableMap<Long, Backend> nodeMap) {
+    public static ComputeNode getBackend(ImmutableMap<Long, ComputeNode> nodeMap) {
         if (nodeMap == null || nodeMap.isEmpty()) {
             return null;
         }
@@ -183,6 +206,19 @@ public class SimpleScheduler {
         }
     }
 
+    // The function is used for unit test
+    public static boolean removeFromBlacklist(Long backendID) {
+        if (backendID == null) {
+            return true;
+        }
+        lock.lock();
+        try {
+            return blacklistBackends.remove(backendID) != null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private static class UpdateBlacklistThread implements Runnable {
         private static final Logger LOG = LogManager.getLogger(UpdateBlacklistThread.class);
         private static Thread thread;
@@ -211,23 +247,30 @@ public class SimpleScheduler {
                             Map.Entry<Long, Integer> entry = iterator.next();
                             Long backendId = entry.getKey();
 
-                            // remove from blacklist if
-                            // 1. backend does not exist anymore
-                            // 2. backend is alive
-                            if (clusterInfoService.getBackend(backendId) == null
-                                    || clusterInfoService.checkBackendAvailable(backendId)) {
+                            // 1. If the backend is null, means that the backend has been removed.
+                            // 2. check the all ports of the backend
+                            // 3. retry three times
+                            // If both of the above conditions are met, the backend is removed from the blacklist
+                            Backend backend = clusterInfoService.getBackend(backendId);
+                            if (backend == null) {
                                 iterator.remove();
-                                LOG.debug("remove backendID {} which is alive", backendId);
+                                LOG.warn("remove backendID {} from blacklist", backendId);
+                            } else if (clusterInfoService.checkBackendAvailable(backendId)) {
+                                String host = backend.getHost();
+                                List<Integer> ports = new ArrayList<Integer>();
+                                Collections.addAll(ports, backend.getBePort(), backend.getBrpcPort(), backend.getHttpPort());
+                                if (NetUtils.checkAccessibleForAllPorts(host, ports)) {
+                                    iterator.remove();
+                                    LOG.warn("remove backendID {} from blacklist", backendId);
+                                }
                             } else {
-                                // 3. max try time is reach
                                 Integer retryTimes = entry.getValue();
                                 retryTimes = retryTimes - 1;
                                 if (retryTimes <= 0) {
                                     iterator.remove();
-                                    LOG.warn("remove backendID {}. reach max try time", backendId);
+                                    LOG.warn("remove backendID {} from blacklist", backendId);
                                 } else {
                                     entry.setValue(retryTimes);
-                                    LOG.debug("blacklistBackends backendID={} retryTimes={}", backendId, retryTimes);
                                 }
                             }
                         }

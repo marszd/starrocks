@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "exprs/math_functions.h"
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 #include <runtime/decimalv3.h>
 #include <types/logical_type.h>
@@ -20,8 +22,10 @@
 
 #include <cmath>
 
+#include "column/array_column.h"
 #include "column/column_helper.h"
 #include "exprs/expr.h"
+#include "exprs/math_functions.h"
 #include "util/time.h"
 
 namespace starrocks {
@@ -54,7 +58,7 @@ DEFINE_UNARY_FN_WITH_IMPL(ZeroCheck, value) {
 #define DEFINE_MATH_UNARY_FN(NAME, TYPE, RESULT_TYPE)                                                          \
     StatusOr<ColumnPtr> MathFunctions::NAME(FunctionContext* context, const Columns& columns) {                \
         using VectorizedUnaryFunction = VectorizedStrictUnaryFunction<NAME##Impl>;                             \
-        if constexpr (pt_is_decimal<TYPE>) {                                                                   \
+        if constexpr (lt_is_decimal<TYPE>) {                                                                   \
             const auto& type = context->get_return_type();                                                     \
             return VectorizedUnaryFunction::evaluate<TYPE, RESULT_TYPE>(VECTORIZED_FN_ARGS(0), type.precision, \
                                                                         type.scale);                           \
@@ -221,7 +225,7 @@ DEFINE_STRING_UNARY_FN_WITH_IMPL(binImpl, v) {
     do {
         result[--index] = '0' + (n & 1);
     } while (n >>= 1);
-    return std::string(result + index, max_bits - index);
+    return {result + index, max_bits - index};
 }
 
 StatusOr<ColumnPtr> MathFunctions::bin(FunctionContext* context, const Columns& columns) {
@@ -402,7 +406,7 @@ std::string MathFunctions::decimal_to_base(int64_t src_num, int8_t dest_base) {
     // Max number of digits of any base (base 2 gives max digits), plus sign.
     const size_t max_digits = sizeof(uint64_t) * 8 + 1;
     char buf[max_digits];
-    int32_t result_len = 0;
+    size_t result_len = 0;
     int32_t buf_index = max_digits - 1;
     uint64_t temp_num;
     if (dest_base < 0) {
@@ -425,7 +429,7 @@ std::string MathFunctions::decimal_to_base(int64_t src_num, int8_t dest_base) {
         buf[buf_index] = '-';
         ++result_len;
     }
-    return std::string(buf + max_digits - result_len, result_len);
+    return {buf + max_digits - result_len, result_len};
 }
 
 template <DecimalRoundRule rule, bool keep_scale>
@@ -715,7 +719,7 @@ Status MathFunctions::rand_prepare(FunctionContext* context, FunctionContext::Fu
         } else {
             seed = GetCurrentTimeNanos();
         }
-        context->set_function_state(scope, reinterpret_cast<void*>(seed));
+        context->set_function_state(scope, reinterpret_cast<void*>(seed)); // NOLINT
     }
     return Status::OK();
 }
@@ -730,7 +734,7 @@ StatusOr<ColumnPtr> MathFunctions::rand(FunctionContext* context, const Columns&
 
     ColumnBuilder<TYPE_DOUBLE> result(num_rows);
     int64_t res = generate_randoms(&result, num_rows, reinterpret_cast<int64_t>(state));
-    state = reinterpret_cast<void*>(res);
+    state = reinterpret_cast<void*>(res); // NOLINT
     context->set_function_state(FunctionContext::THREAD_LOCAL, state);
 
     return result.build(false);
@@ -745,5 +749,148 @@ StatusOr<ColumnPtr> MathFunctions::rand_seed(FunctionContext* context, const Col
 
     return rand(context, columns);
 }
+
+#ifdef __AVX2__
+static float sum_m256(__m256 v) {
+    __m256 hadd = _mm256_hadd_ps(v, v);
+    __m256 hadd2 = _mm256_hadd_ps(hadd, hadd);
+    __m128 vlow = _mm256_castps256_ps128(hadd2);
+    __m128 vhigh = _mm256_extractf128_ps(hadd2, 1);
+    __m128 result = _mm_add_ss(vlow, vhigh);
+    return _mm_cvtss_f32(result);
+}
+#endif
+
+template <LogicalType TYPE, bool isNorm>
+StatusOr<ColumnPtr> MathFunctions::cosine_similarity(FunctionContext* context, const Columns& columns) {
+    DCHECK_EQ(columns.size(), 2);
+
+    const Column* base = columns[0].get();
+    const Column* target = columns[1].get();
+    size_t target_size = target->size();
+    if (base->size() != target_size) {
+        return Status::InvalidArgument(fmt::format(
+                "cosine_similarity requires equal length arrays. base array size is {} and target array size is {}.",
+                base->size(), target->size()));
+    }
+    if (base->has_null() || target->has_null()) {
+        return Status::InvalidArgument(
+                fmt::format("cosine_similarity does not support null values. {} array has null value.",
+                            base->has_null() ? "base" : "target"));
+    }
+    if (base->is_nullable()) {
+        base = down_cast<const NullableColumn*>(base)->data_column().get();
+    }
+    if (target->is_nullable()) {
+        target = down_cast<const NullableColumn*>(target)->data_column().get();
+    }
+
+    // check dimension equality.
+    const Column* base_flat = down_cast<const ArrayColumn*>(base)->elements_column().get();
+    const uint32_t* base_offset = down_cast<const ArrayColumn*>(base)->offsets().get_data().data();
+    size_t base_flat_size = base_flat->size();
+
+    const Column* target_flat = down_cast<const ArrayColumn*>(target)->elements_column().get();
+    size_t target_flat_size = target_flat->size();
+    const uint32_t* target_offset = down_cast<const ArrayColumn*>(target)->offsets().get_data().data();
+
+    if (base_flat_size != target_flat_size) {
+        return Status::InvalidArgument("cosine_similarity requires equal length arrays");
+    }
+
+    if (base_flat->has_null() || target_flat->has_null()) {
+        return Status::InvalidArgument("cosine_similarity does not support null values");
+    }
+    if (base_flat->is_nullable()) {
+        base_flat = down_cast<const NullableColumn*>(base_flat)->data_column().get();
+    }
+    if (target_flat->is_nullable()) {
+        target_flat = down_cast<const NullableColumn*>(target_flat)->data_column().get();
+    }
+
+    using CppType = RunTimeCppType<TYPE>;
+    using ColumnType = RunTimeColumnType<TYPE>;
+
+    const CppType* base_data_head = down_cast<const ColumnType*>(base_flat)->get_data().data();
+    const CppType* target_data_head = down_cast<const ColumnType*>(target_flat)->get_data().data();
+
+    // prepare result with nullable value.
+    ColumnPtr result = ColumnHelper::create_column(TypeDescriptor{TYPE}, false, false, target_size);
+    ColumnType* data_result = down_cast<ColumnType*>(result.get());
+    CppType* result_data = data_result->get_data().data();
+
+    for (size_t i = 0; i < target_size; i++) {
+        size_t t_dim_size = target_offset[i + 1] - target_offset[i];
+        size_t b_dim_size = base_offset[i + 1] - base_offset[i];
+        if (t_dim_size != b_dim_size) {
+            return Status::InvalidArgument(
+                    fmt::format("cosine_similarity requires equal length arrays in each row. base array dimension size "
+                                "is {}, target array dimension size is {}.",
+                                b_dim_size, t_dim_size));
+        }
+        if (t_dim_size == 0) {
+            return Status::InvalidArgument("cosine_similarity requires non-empty arrays in each row");
+        }
+    }
+
+    const CppType* target_data = target_data_head;
+    const CppType* base_data = base_data_head;
+    for (size_t i = 0; i < target_size; i++) {
+        CppType sum = 0;
+        CppType base_sum = 0;
+        CppType target_sum = 0;
+        size_t dim_size = target_offset[i + 1] - target_offset[i];
+        CppType result_value = 0;
+        size_t j = 0;
+#ifdef __AVX2__
+        if (std::is_same_v<CppType, float>) {
+            __m256 sum_vec = _mm256_setzero_ps();
+            __m256 base_sum_vec = _mm256_setzero_ps();
+            __m256 target_sum_vec = _mm256_setzero_ps();
+            for (; j + 7 < dim_size; j += 8) {
+                __m256 base_data_vec = _mm256_loadu_ps(base_data + j);
+                __m256 target_data_vec = _mm256_loadu_ps(target_data + j);
+
+                __m256 mul_vec = _mm256_mul_ps(base_data_vec, target_data_vec);
+                sum_vec = _mm256_add_ps(sum_vec, mul_vec);
+
+                if constexpr (!isNorm) {
+                    __m256 base_mul_vec = _mm256_mul_ps(base_data_vec, base_data_vec);
+                    base_sum_vec = _mm256_add_ps(base_sum_vec, base_mul_vec);
+                    __m256 target_mul_vec = _mm256_mul_ps(target_data_vec, target_data_vec);
+                    target_sum_vec = _mm256_add_ps(target_sum_vec, target_mul_vec);
+                }
+            }
+            sum += sum_m256(sum_vec);
+            if constexpr (!isNorm) {
+                base_sum += sum_m256(base_sum_vec);
+                target_sum += sum_m256(target_sum_vec);
+            }
+        }
+#endif
+        for (; j < dim_size; j++) {
+            sum += base_data[j] * target_data[j];
+            if constexpr (!isNorm) {
+                base_sum += base_data[j] * base_data[j];
+                target_sum += target_data[j] * target_data[j];
+            }
+        }
+
+        if constexpr (!isNorm) {
+            result_value = sum / (std::sqrt(base_sum) * std::sqrt(target_sum));
+        } else {
+            result_value = sum;
+        }
+        result_data[i] = result_value;
+        target_data += dim_size;
+    }
+    return result;
+}
+
+// explicitly instaniate template function.
+template StatusOr<ColumnPtr> MathFunctions::cosine_similarity<TYPE_FLOAT, true>(FunctionContext* context,
+                                                                                const Columns& columns);
+template StatusOr<ColumnPtr> MathFunctions::cosine_similarity<TYPE_FLOAT, false>(FunctionContext* context,
+                                                                                 const Columns& columns);
 
 } // namespace starrocks

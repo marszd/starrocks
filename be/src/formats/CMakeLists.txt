@@ -17,7 +17,6 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/formats")
 add_library(Formats STATIC
         csv/array_converter.cpp
         csv/array_reader.cpp
-        csv/binary_converter.cpp
         csv/boolean_converter.cpp
         csv/converter.cpp
         csv/csv_reader.cpp
@@ -27,17 +26,29 @@ add_library(Formats STATIC
         csv/decimalv3_converter.cpp
         csv/float_converter.cpp
         csv/json_converter.cpp
+        csv/map_converter.cpp
         csv/numeric_converter.cpp
         csv/nullable_converter.cpp
+        csv/default_value_converter.cpp
+        csv/string_converter.cpp
+        csv/varbinary_converter.cpp
         json/nullable_column.cpp
         json/numeric_column.cpp
         json/binary_column.cpp
+        avro/nullable_column.cpp
+        avro/numeric_column.cpp
+        avro/binary_column.cpp
         orc/orc_chunk_reader.cpp
+        orc/orc_chunk_writer.cpp
         orc/orc_input_stream.cpp
         orc/orc_mapping.cpp
+        orc/orc_memory_pool.cpp
         orc/orc_min_max_decoder.cpp
-        orc/fill_function.cpp
+        orc/orc_schema_builder.cpp
         orc/utils.cpp
+        orc/column_reader.cpp
+        orc/memory_stream/MemoryInputStream.cc
+        orc/memory_stream/MemoryOutputStream.cc
         parquet/column_chunk_reader.cpp
         parquet/column_converter.cpp
         parquet/column_reader.cpp
@@ -48,8 +59,15 @@ add_library(Formats STATIC
         parquet/stored_column_reader.cpp
         parquet/utils.cpp
         parquet/metadata.cpp
+        parquet/meta_helper.cpp
         parquet/group_reader.cpp
         parquet/file_reader.cpp
+        parquet/file_writer.cpp
+        parquet/chunk_writer.cpp
+        parquet/level_builder.cpp
+        parquet/column_chunk_writer.cpp
+        parquet/column_read_order_ctx.cpp
+        utils.h
         )
 
 add_subdirectory(orc/apache-orc)

@@ -92,7 +92,7 @@ public class TabletStatMgrTest {
 
         // Db
         Database db = new Database();
-        db.createTable(table);
+        db.registerTableUnlocked(table);
 
         TTabletStatResult result = new TTabletStatResult();
         Map<Long, TTabletStat> tabletsStats = Maps.newHashMap();
@@ -161,7 +161,7 @@ public class TabletStatMgrTest {
 
         // db
         Database db = new Database(dbId, "db");
-        db.createTable(table);
+        db.registerTableUnlocked(table);
 
         new MockUp<BrpcProxy>() {
             @Mock
@@ -182,7 +182,7 @@ public class TabletStatMgrTest {
         };
         new Expectations() {
             {
-                systemInfoService.getBackend(anyLong);
+                systemInfoService.getBackendOrComputeNode(anyLong);
                 result = new Backend(1000L, "", 123);
 
                 lakeService.getTabletStats((TabletStatRequest) any);

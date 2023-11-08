@@ -51,7 +51,8 @@ class TabletReader final : public ChunkIterator {
 public:
     TabletReader(Tablet tablet, int64_t version, Schema schema);
     TabletReader(Tablet tablet, int64_t version, Schema schema, std::vector<RowsetPtr> rowsets);
-    TabletReader(Tablet tablet, int64_t version, Schema schema, bool is_key, RowSourceMaskBuffer* mask_buffer);
+    TabletReader(Tablet tablet, int64_t version, Schema schema, std::vector<RowsetPtr> rowsets, bool is_key,
+                 RowSourceMaskBuffer* mask_buffer);
     ~TabletReader() override;
 
     DISALLOW_COPY_AND_MOVE(TabletReader);
@@ -94,8 +95,9 @@ private:
                                    MemPool* mempool);
 
     Tablet _tablet;
-    std::shared_ptr<const TabletSchema> _tablet_schema;
     int64_t _version;
+    std::shared_ptr<const TabletMetadataPB> _tablet_metadata;
+    std::shared_ptr<const TabletSchema> _tablet_schema;
 
     // _rowsets is specified in the constructor when compaction
     bool _rowsets_inited = false;

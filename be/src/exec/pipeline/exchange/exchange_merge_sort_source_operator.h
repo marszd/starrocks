@@ -29,7 +29,7 @@ public:
                                     int32_t num_sender, const RowDescriptor& row_desc, SortExecExprs* sort_exec_exprs,
                                     const std::vector<bool>& is_asc_order, const std::vector<bool>& nulls_first,
                                     int64_t offset, int64_t limit)
-            : SourceOperator(factory, id, "global_merge_source", plan_node_id, driver_sequence),
+            : SourceOperator(factory, id, "global_merge_source", plan_node_id, false, driver_sequence),
               _num_sender(num_sender),
               _row_desc(row_desc),
               _sort_exec_exprs(sort_exec_exprs),
@@ -96,6 +96,8 @@ public:
 
     Status prepare(RuntimeState* state) override;
     void close(RuntimeState* state) override;
+
+    SourceOperatorFactory::AdaptiveState adaptive_state() const override { return AdaptiveState::ACTIVE; }
 
 private:
     int32_t _num_sender;

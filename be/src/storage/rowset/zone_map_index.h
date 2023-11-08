@@ -58,7 +58,7 @@ class WritableFile;
 // reader can prune an entire segment without reading pages.
 class ZoneMapIndexWriter {
 public:
-    static std::unique_ptr<ZoneMapIndexWriter> create(TypeInfo* type_info, int length);
+    static std::unique_ptr<ZoneMapIndexWriter> create(TypeInfo* type_info);
 
     virtual ~ZoneMapIndexWriter() = default;
 
@@ -87,8 +87,7 @@ public:
     //
     // Return true if the index data was successfully loaded by the caller, false if
     // the data was loaded by another caller.
-    StatusOr<bool> load(FileSystem* fs, const std::string& filename, const ZoneMapIndexPB& meta, bool use_page_cache,
-                        bool kept_in_memory);
+    StatusOr<bool> load(const IndexReadOptions& opts, const ZoneMapIndexPB& meta);
 
     // REQUIRES: the index data has been successfully `load()`ed into memory.
     const std::vector<ZoneMapPB>& page_zone_maps() const { return _page_zone_maps; }
@@ -98,13 +97,12 @@ public:
 
     bool loaded() const { return invoked(_load_once); }
 
+    size_t mem_usage() const;
+
 private:
     void _reset() { std::vector<ZoneMapPB>{}.swap(_page_zone_maps); }
 
-    Status _do_load(FileSystem* fs, const std::string& filename, const ZoneMapIndexPB& meta, bool use_page_cache,
-                    bool kept_in_memory);
-
-    size_t _mem_usage() const;
+    Status _do_load(const IndexReadOptions& opts, const ZoneMapIndexPB& meta);
 
     OnceFlag _load_once;
     std::vector<ZoneMapPB> _page_zone_maps;

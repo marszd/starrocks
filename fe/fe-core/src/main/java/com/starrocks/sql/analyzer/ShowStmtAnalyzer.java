@@ -17,6 +17,7 @@ package com.starrocks.sql.analyzer;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.LikePredicate;
@@ -26,11 +27,9 @@ import com.starrocks.analysis.Predicate;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.TableName;
-import com.starrocks.analysis.UserIdentity;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.KeysType;
-import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.MysqlTable;
 import com.starrocks.catalog.OlapTable;
@@ -50,10 +49,7 @@ import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.DescribeStmt;
-import com.starrocks.sql.ast.SetType;
 import com.starrocks.sql.ast.ShowAlterStmt;
-import com.starrocks.sql.ast.ShowAuthenticationStmt;
-import com.starrocks.sql.ast.ShowClustersStmt;
 import com.starrocks.sql.ast.ShowColumnStmt;
 import com.starrocks.sql.ast.ShowCreateDbStmt;
 import com.starrocks.sql.ast.ShowCreateExternalCatalogStmt;
@@ -66,7 +62,7 @@ import com.starrocks.sql.ast.ShowFunctionsStmt;
 import com.starrocks.sql.ast.ShowIndexStmt;
 import com.starrocks.sql.ast.ShowLoadStmt;
 import com.starrocks.sql.ast.ShowLoadWarningsStmt;
-import com.starrocks.sql.ast.ShowMaterializedViewStmt;
+import com.starrocks.sql.ast.ShowMaterializedViewsStmt;
 import com.starrocks.sql.ast.ShowPartitionsStmt;
 import com.starrocks.sql.ast.ShowProcStmt;
 import com.starrocks.sql.ast.ShowRoutineLoadStmt;
@@ -77,7 +73,6 @@ import com.starrocks.sql.ast.ShowTableStatusStmt;
 import com.starrocks.sql.ast.ShowTableStmt;
 import com.starrocks.sql.ast.ShowTabletStmt;
 import com.starrocks.sql.ast.ShowTransactionStmt;
-import com.starrocks.sql.ast.ShowVariablesStmt;
 import com.starrocks.sql.ast.ShowWarehousesStmt;
 import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
@@ -131,14 +126,6 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowVariablesStatement(ShowVariablesStmt node, ConnectContext context) {
-            if (node.getType() == null) {
-                node.setType(SetType.DEFAULT);
-            }
-            return null;
-        }
-
-        @Override
         public Void visitShowColumnStatement(ShowColumnStmt node, ConnectContext context) {
             node.init();
             String db = node.getTableName().getDb();
@@ -175,7 +162,7 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowMaterializedViewStatement(ShowMaterializedViewStmt node, ConnectContext context) {
+        public Void visitShowMaterializedViewStatement(ShowMaterializedViewsStmt node, ConnectContext context) {
             String db = node.getDb();
             db = getDatabaseName(db, context);
             node.setDb(db);
@@ -193,20 +180,6 @@ public class ShowStmtAnalyzer {
 
         @Override
         public Void visitShowWarehousesStatement(ShowWarehousesStmt node, ConnectContext context) {
-            return null;
-        }
-
-        @Override
-        public Void visitShowClusterStatement(ShowClustersStmt node, ConnectContext context) {
-            String warehouseName;
-            if (node.getWarehouseName() != null) {
-                warehouseName = node.getWarehouseName();
-            } else {
-                warehouseName = context.getCurrentWarehouse();
-            }
-            if (!GlobalStateMgr.getCurrentState().getWarehouseMgr().warehouseExists(warehouseName)) {
-                ErrorReport.reportSemanticException(ErrorCode.ERR_BAD_WAREHOUSE_ERROR, warehouseName);
-            }
             return null;
         }
 
@@ -358,9 +331,9 @@ public class ShowStmtAnalyzer {
                     for (Table tb : db.getTables()) {
                         if (tb.getType() == Table.TableType.OLAP) {
                             OlapTable olapTable = (OlapTable) tb;
-                            for (MaterializedIndex mvIdx : olapTable.getVisibleIndex()) {
-                                if (olapTable.getIndexNameById(mvIdx.getId()).equalsIgnoreCase(node.getTableName())) {
-                                    List<Column> columns = olapTable.getIndexIdToSchema().get(mvIdx.getId());
+                            for (MaterializedIndexMeta mvMeta : olapTable.getVisibleIndexMetas()) {
+                                if (olapTable.getIndexNameById(mvMeta.getIndexId()).equalsIgnoreCase(node.getTableName())) {
+                                    List<Column> columns = olapTable.getIndexIdToSchema().get(mvMeta.getIndexId());
                                     for (Column column : columns) {
                                         // Extra string (aggregation and bloom filter)
                                         List<String> extras = Lists.newArrayList();
@@ -371,9 +344,12 @@ public class ShowStmtAnalyzer {
                                         String defaultStr = column.getMetaDefaultValue(extras);
                                         String extraStr = StringUtils.join(extras, ",");
                                         List<String> row = Arrays.asList(
-                                                column.getDisplayName(),
-                                                column.getType().canonicalName(),
-                                                column.isAllowNull() ? "Yes" : "No",
+                                                column.getName(),
+                                                // In Mysql, the Type column should lowercase, and the Null column should uppercase.
+                                                // If you do not follow this specification, it may cause the BI system,
+                                                // such as superset, to fail to recognize the column type.
+                                                column.getType().canonicalName().toLowerCase(),
+                                                column.isAllowNull() ? "YES" : "NO",
                                                 ((Boolean) column.isKey()).toString(),
                                                 defaultStr,
                                                 extraStr);
@@ -410,7 +386,7 @@ public class ShowStmtAnalyzer {
                         throw new SemanticException(String.format("Unknown proc node path: %s", procString));
                     }
                 } else {
-                    if (table.isNativeTable()) {
+                    if (table.isNativeTableOrMaterializedView()) {
                         node.setOlapTable(true);
                         OlapTable olapTable = (OlapTable) table;
                         Set<String> bfColumns = olapTable.getCopiedBfColumns();
@@ -447,9 +423,12 @@ public class ShowStmtAnalyzer {
                                 String extraStr = StringUtils.join(extras, ",");
                                 List<String> row = Arrays.asList("",
                                         "",
-                                        column.getDisplayName(),
-                                        column.getType().canonicalName(),
-                                        column.isAllowNull() ? "Yes" : "No",
+                                        column.getName(),
+                                        // In Mysql, the Type column should lowercase, and the Null column should uppercase.
+                                        // If you do not follow this specification, it may cause the BI system,
+                                        // such as superset, to fail to recognize the column type.
+                                        column.getType().canonicalName().toLowerCase(),
+                                        column.isAllowNull() ? "YES" : "NO",
                                         ((Boolean) column.isKey()).toString(),
                                         defaultStr,
                                         extraStr);
@@ -620,7 +599,7 @@ public class ShowStmtAnalyzer {
 
         private void binaryPredicateHandler(Expr subExpr, String leftKey, boolean filter) {
             BinaryPredicate binaryPredicate = (BinaryPredicate) subExpr;
-            if (filter && binaryPredicate.getOp() != BinaryPredicate.Operator.EQ) {
+            if (filter && binaryPredicate.getOp() != BinaryType.EQ) {
                 throw new SemanticException(String.format("Only operator =|like are supported for %s", leftKey));
             }
             if (leftKey.equalsIgnoreCase(ShowPartitionsStmt.FILTER_LAST_CONSISTENCY_CHECK_TIME)) {
@@ -668,24 +647,6 @@ public class ShowStmtAnalyzer {
         @Override
         public Void visitShowLoadWarningsStatement(ShowLoadWarningsStmt statement, ConnectContext context) {
             ShowLoadWarningsStmtAnalyzer.analyze(statement, context);
-            return null;
-        }
-
-        @Override
-        public Void visitShowAuthenticationStatement(ShowAuthenticationStmt statement, ConnectContext context) {
-            UserIdentity user = statement.getUserIdent();
-            if (user != null) {
-                try {
-                    user.analyze();
-                } catch (AnalysisException e) {
-                    SemanticException exception =
-                            new SemanticException("failed to show authentication for " + user.toString());
-                    exception.initCause(e);
-                    throw exception;
-                }
-            } else if (!statement.isAll()) {
-                statement.setUserIdent(context.getCurrentUserIdentity());
-            }
             return null;
         }
 

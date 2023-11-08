@@ -81,15 +81,15 @@ struct PerLaneBuffer {
         }
         // CRITICAL!!!: we should append last empty chunk to the empty buffer to guarantee that pull_chunk method
         // would fetch a chunk and reset_lane.
-        if (!chunk->is_empty() || (chunks.empty() && chunk->owner_info().is_last_chunk())) {
+        // We must guarantee happen-before invariant as follows:
+        // append EOS chunk[PLBS_TOTAL] -> propulate_cache[PLBS_POPULATE] -> pull last EOS chunk -> release_lane
+        if (!chunk->is_empty() || chunk->owner_info().is_last_chunk()) {
             chunks.push_back(chunk);
             num_rows += chunk->num_rows();
             num_bytes += chunk->bytes_usage();
         }
 
-        if (chunk->owner_info().is_last_chunk()) {
-            state = chunk->owner_info().is_last_chunk() ? PLBS_TOTAL : PLBS_PARTIAL;
-        }
+        state = chunk->owner_info().is_last_chunk() ? PLBS_TOTAL : PLBS_PARTIAL;
     }
 
     bool has_chunks() const { return next_chunk_idx < chunks.size(); }
@@ -100,7 +100,7 @@ struct PerLaneBuffer {
         }
     }
 
-    bool can_release() {
+    bool can_release() const {
         return (state == PLBS_POPULATE || state == PLBS_PASSTHROUGH || state == PLBS_HIT_TOTAL) && !has_chunks();
     }
 
@@ -126,7 +126,8 @@ struct PerLaneBuffer {
 
 CacheOperator::CacheOperator(pipeline::OperatorFactory* factory, int32_t driver_sequence, CacheManagerRawPtr cache_mgr,
                              const CacheParam& cache_param)
-        : pipeline::Operator(factory, factory->id(), factory->get_name(), factory->plan_node_id(), driver_sequence),
+        : pipeline::Operator(factory, factory->id(), factory->get_raw_name(), factory->plan_node_id(), true,
+                             driver_sequence),
           _cache_mgr(cache_mgr),
           _cache_param(cache_param),
           _lane_arbiter(std::make_shared<LaneArbiter>(_cache_param.num_lanes)) {
@@ -200,9 +201,9 @@ void CacheOperator::close(RuntimeState* state) {
     _cache_populate_tablets_counter->update(_populate_tablets.size());
     _cache_probe_tablets_counter->update(_probe_tablets.size());
     _cache_passthrough_tablets_counter->update(passthrough_tablets.size());
-    _runtime_profile->add_info_string("CacheProbeTablets", flatten_tablet_set(_probe_tablets));
-    _runtime_profile->add_info_string("CachePopulateTablets", flatten_tablet_set(_populate_tablets));
-    _runtime_profile->add_info_string("CachePassthroughTablets", flatten_tablet_set(passthrough_tablets));
+    _unique_metrics->add_info_string("CacheProbeTablets", flatten_tablet_set(_probe_tablets));
+    _unique_metrics->add_info_string("CachePopulateTablets", flatten_tablet_set(_populate_tablets));
+    _unique_metrics->add_info_string("CachePassthroughTablets", flatten_tablet_set(passthrough_tablets));
 
     Operator::close(state);
 }
@@ -337,7 +338,7 @@ void CacheOperator::_update_probe_metrics(int64_t tablet_id, const std::vector<C
         num_rows += chunk->num_rows();
     }
     _cache_probe_bytes_counter->update(num_bytes);
-    _cache_probe_chunks_counter->update(num_rows);
+    _cache_probe_chunks_counter->update(chunks.size());
     _cache_probe_rows_counter->update(num_rows);
     _probe_tablets.insert(tablet_id);
 }
@@ -466,7 +467,7 @@ bool CacheOperator::is_finished() const {
 bool CacheOperator::has_output() const {
     for (const auto& [_, lane_id] : _owner_to_lanes) {
         auto& buffer = _per_lane_buffers[lane_id];
-        if (buffer->has_chunks()) {
+        if (buffer->has_chunks() || buffer->can_release()) {
             return true;
         }
     }
@@ -521,9 +522,9 @@ Status CacheOperator::reset_lane(RuntimeState* state, LaneOwnerType lane_owner) 
         _lane_arbiter->enable_passthrough_mode();
         for (auto i = 0; i <= premature_finished_idx; ++i) {
             auto& multi_op = _multilane_operators[i];
-            multi_op->set_finished(state);
+            (void)multi_op->set_finished(state);
         }
-        _scan_operator->set_finished(state);
+        (void)_scan_operator->set_finished(state);
     }
     return Status::OK();
 }
@@ -556,10 +557,13 @@ Status CacheOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
 }
 
 ChunkPtr CacheOperator::_pull_chunk_from_per_lane_buffer(PerLaneBufferPtr& buffer) {
-    if (buffer->has_chunks()) {
+    if (buffer->can_release()) {
+        _lane_arbiter->release_lane(buffer->lane_owner);
+        buffer->reset();
+    } else if (buffer->has_chunks()) {
         auto chunk = buffer->get_next_chunk();
         if (buffer->can_release()) {
-            _lane_arbiter->release_lane(chunk->owner_info().owner_id());
+            _lane_arbiter->release_lane(buffer->lane_owner);
             buffer->reset();
         }
         return chunk;

@@ -26,9 +26,9 @@
 
 namespace starrocks {
 
-template <LogicalType PT>
+template <LogicalType LT>
 struct AnyValueAggregateData {
-    using T = AggDataValueType<PT>;
+    using T = AggDataValueType<LT>;
 
     T result;
     bool has_value = false;
@@ -39,23 +39,23 @@ struct AnyValueAggregateData {
     }
 };
 
-template <LogicalType PT, typename State>
+template <LogicalType LT, typename State>
 struct AnyValueElement {
-    using RefType = AggDataRefType<PT>;
+    using RefType = AggDataRefType<LT>;
 
     void operator()(State& state, RefType right) const {
         if (UNLIKELY(!state.has_value)) {
-            AggDataTypeTraits<PT>::assign_value(state.result, right);
+            AggDataTypeTraits<LT>::assign_value(state.result, right);
             state.has_value = true;
         }
     }
 };
 
-template <LogicalType PT, typename State, class OP, typename T = RunTimeCppType<PT>, typename = guard::Guard>
+template <LogicalType LT, typename State, class OP, typename T = RunTimeCppType<LT>, typename = guard::Guard>
 class AnyValueAggregateFunction final
-        : public AggregateFunctionBatchHelper<State, AnyValueAggregateFunction<PT, State, OP, T>> {
+        : public AggregateFunctionBatchHelper<State, AnyValueAggregateFunction<LT, State, OP, T>> {
 public:
-    using InputColumnType = RunTimeColumnType<PT>;
+    using InputColumnType = RunTimeColumnType<LT>;
 
     void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
         this->data(state).reset();
@@ -65,7 +65,7 @@ public:
                 size_t row_num) const override {
         DCHECK(!columns[0]->is_nullable());
         const auto& column = down_cast<const InputColumnType&>(*columns[0]);
-        OP()(this->data(state), AggDataTypeTraits<PT>::get_row_ref(column, row_num));
+        OP()(this->data(state), AggDataTypeTraits<LT>::get_row_ref(column, row_num));
     }
 
     void update_batch_single_state(FunctionContext* ctx, size_t chunk_size, const Column** columns,
@@ -76,12 +76,12 @@ public:
     void merge(FunctionContext* ctx, const Column* column, AggDataPtr __restrict state, size_t row_num) const override {
         DCHECK(!column->is_nullable());
         const auto& input_column = down_cast<const InputColumnType&>(*column);
-        OP()(this->data(state), AggDataTypeTraits<PT>::get_row_ref(input_column, row_num));
+        OP()(this->data(state), AggDataTypeTraits<LT>::get_row_ref(input_column, row_num));
     }
 
     void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         DCHECK(!to->is_nullable());
-        AggDataTypeTraits<PT>::append_value(down_cast<InputColumnType*>(to), this->data(state).result);
+        AggDataTypeTraits<LT>::append_value(down_cast<InputColumnType*>(to), this->data(state).result);
     }
 
     void convert_to_serialize_format(FunctionContext* ctx, const Columns& src, size_t chunk_size,
@@ -91,15 +91,65 @@ public:
 
     void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
         DCHECK(!to->is_nullable());
-        AggDataTypeTraits<PT>::append_value(down_cast<InputColumnType*>(to), this->data(state).result);
+        AggDataTypeTraits<LT>::append_value(down_cast<InputColumnType*>(to), this->data(state).result);
     }
 
     void get_values(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* dst, size_t start,
                     size_t end) const override {
         DCHECK_GT(end, start);
-        InputColumnType* column = down_cast<InputColumnType*>(dst);
+        auto* column = down_cast<InputColumnType*>(dst);
         for (size_t i = start; i < end; ++i) {
-            AggDataTypeTraits<PT>::append_value(column, this->data(state).result);
+            AggDataTypeTraits<LT>::append_value(column, this->data(state).result);
+        }
+    }
+
+    std::string get_name() const override { return "any_value"; }
+};
+
+struct AnyValueSemiState {
+    void update(FunctionContext* ctx, const Column& column, size_t offset) {
+        if (!has_fill) {
+            data_column = ctx->create_column(*ctx->get_arg_type(0), false);
+            data_column->append(column, offset, 1);
+            has_fill = true;
+        }
+    }
+
+    ColumnPtr data_column = nullptr;
+    bool has_fill = false;
+};
+
+class AnyValueSemiAggregateFunction final
+        : public AggregateFunctionBatchHelper<AnyValueSemiState, AnyValueSemiAggregateFunction> {
+public:
+    void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
+                size_t row_num) const override {
+        this->data(state).update(ctx, *columns[0], row_num);
+    }
+
+    void update_batch_single_state(FunctionContext* ctx, size_t chunk_size, const Column** columns,
+                                   AggDataPtr __restrict state) const override {
+        this->data(state).update(ctx, *columns[0], 0);
+    }
+
+    void merge(FunctionContext* ctx, const Column* column, AggDataPtr __restrict state, size_t row_num) const override {
+        this->data(state).update(ctx, *column, row_num);
+    }
+
+    void serialize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
+        if (this->data(state).data_column != nullptr) {
+            to->append(*(this->data(state).data_column.get()));
+        }
+    }
+
+    void convert_to_serialize_format(FunctionContext* ctx, const Columns& src, size_t chunk_size,
+                                     ColumnPtr* dst) const override {
+        *dst = src[0];
+    }
+
+    void finalize_to_column(FunctionContext* ctx, ConstAggDataPtr __restrict state, Column* to) const override {
+        if (this->data(state).data_column != nullptr) {
+            to->append(*(this->data(state).data_column.get()));
         }
     }
 

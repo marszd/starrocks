@@ -16,9 +16,7 @@
 package com.starrocks.mysql.privilege;
 
 import com.starrocks.analysis.CompoundPredicate;
-import com.starrocks.analysis.UserIdentity;
-import com.starrocks.common.FeMetaVersion;
-import com.starrocks.meta.MetaContext;
+import com.starrocks.sql.ast.UserIdentity;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.junit.Assert;
@@ -38,10 +36,6 @@ public class PrivTableTest {
      */
     @Test
     public void testSerializedAndDeserialized() throws Exception {
-        MetaContext metaContext = new MetaContext();
-        metaContext.setMetaVersion(FeMetaVersion.VERSION_CURRENT);
-        metaContext.setThreadLocalInfo();
-
         // use ResourcePrivTable because PrivTable is a abstract class
         ResourcePrivTable table = new ResourcePrivTable();
         PrivBitSet resourceUsage = PrivBitSet.of(Privilege.USAGE_PRIV);
@@ -52,7 +46,7 @@ public class PrivTableTest {
         // 1. only one entry
         // 1.1 grant
         ResourcePrivEntry entry1 = ResourcePrivEntry.create(
-                user1.getHost(), resource1, user1.getQualifiedUser(), false, resourceUsage);
+                user1.getHost(), resource1, user1.getUser(), false, resourceUsage);
         table.addEntry(entry1, true, false);
         LOG.info("current table: {}", table);
         // 1.2 dump to file
@@ -79,7 +73,7 @@ public class PrivTableTest {
         UserIdentity user2 = UserIdentity.createAnalyzedUserIdentWithIp("user2", "%");
         String resource2 = "resource2";
         ResourcePrivEntry entry2 = ResourcePrivEntry.create(
-                user2.getHost(), resource2, user2.getQualifiedUser(), false, resourceUsage);
+                user2.getHost(), resource2, user2.getUser(), false, resourceUsage);
         table.addEntry(entry2, true, false);
         LOG.info("current table: {}", table);
 

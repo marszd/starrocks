@@ -45,8 +45,8 @@
 namespace starrocks {
 
 DataStreamMgr::DataStreamMgr() {
-    REGISTER_GAUGE_STARROCKS_METRIC(data_stream_receiver_count, [this]() { return _receiver_count.load(); });
-    REGISTER_GAUGE_STARROCKS_METRIC(fragment_endpoint_count, [this]() { return _fragment_count.load(); });
+    REGISTER_GAUGE_STARROCKS_METRIC(data_stream_receiver_count, [this]() { return _receiver_count.load(); })
+    REGISTER_GAUGE_STARROCKS_METRIC(fragment_endpoint_count, [this]() { return _fragment_count.load(); })
 }
 
 inline uint32_t DataStreamMgr::get_bucket(const TUniqueId& fragment_instance_id) {
@@ -57,16 +57,15 @@ inline uint32_t DataStreamMgr::get_bucket(const TUniqueId& fragment_instance_id)
 
 std::shared_ptr<DataStreamRecvr> DataStreamMgr::create_recvr(
         RuntimeState* state, const RowDescriptor& row_desc, const TUniqueId& fragment_instance_id,
-        PlanNodeId dest_node_id, int num_senders, int buffer_size, const std::shared_ptr<RuntimeProfile>& profile,
-        bool is_merging, std::shared_ptr<QueryStatisticsRecvr> sub_plan_query_statistics_recvr, bool is_pipeline,
+        PlanNodeId dest_node_id, int num_senders, int buffer_size, bool is_merging,
+        std::shared_ptr<QueryStatisticsRecvr> sub_plan_query_statistics_recvr, bool is_pipeline,
         int32_t degree_of_parallelism, bool keep_order) {
-    DCHECK(profile != nullptr);
     VLOG_FILE << "creating receiver for fragment=" << fragment_instance_id << ", node=" << dest_node_id;
     PassThroughChunkBuffer* pass_through_chunk_buffer = get_pass_through_chunk_buffer(state->query_id());
     DCHECK(pass_through_chunk_buffer != nullptr);
     std::shared_ptr<DataStreamRecvr> recvr(
             new DataStreamRecvr(this, state, row_desc, fragment_instance_id, dest_node_id, num_senders, is_merging,
-                                buffer_size, profile, std::move(sub_plan_query_statistics_recvr), is_pipeline,
+                                buffer_size, std::move(sub_plan_query_statistics_recvr), is_pipeline,
                                 degree_of_parallelism, keep_order, pass_through_chunk_buffer));
 
     uint32_t bucket = get_bucket(fragment_instance_id);
@@ -99,41 +98,6 @@ std::shared_ptr<DataStreamRecvr> DataStreamMgr::find_recvr(const TUniqueId& frag
     return {};
 }
 
-Status DataStreamMgr::transmit_data(const PTransmitDataParams* request, ::google::protobuf::Closure** done) {
-    const PUniqueId& finst_id = request->finst_id();
-    TUniqueId t_finst_id;
-    t_finst_id.hi = finst_id.hi();
-    t_finst_id.lo = finst_id.lo();
-    std::shared_ptr<DataStreamRecvr> recvr = find_recvr(t_finst_id, request->node_id());
-    if (recvr == nullptr) {
-        // The receiver may remove itself from the receiver map via deregister_recvr()
-        // at any time without considering the remaining number of senders.
-        // As a consequence, find_recvr() may return an innocuous NULL if a thread
-        // calling deregister_recvr() beat the thread calling find_recvr()
-        // in acquiring _lock.
-        // TODO: Rethink the lifecycle of DataStreamRecvr to distinguish
-        // errors from receiver-initiated teardowns.
-        return Status::OK();
-    }
-
-    // Request can only be used before calling recvr's add_batch or when request
-    // is the last for the sender, because request maybe released after it's batch
-    // is consumed by ExchangeNode.
-    if (request->has_query_statistics()) {
-        recvr->add_sub_plan_statistics(request->query_statistics(), request->sender_id());
-    }
-
-    bool eos = request->eos();
-    if (request->has_row_batch()) {
-        return Status::InternalError("Non-vectorized execute engine is not supported");
-    }
-
-    if (eos) {
-        recvr->remove_sender(request->sender_id(), request->be_number());
-    }
-    return Status::OK();
-}
-
 Status DataStreamMgr::transmit_chunk(const PTransmitChunkParams& request, ::google::protobuf::Closure** done) {
     const PUniqueId& finst_id = request.finst_id();
     // TODO(zc): Use PUniqueId directly
@@ -142,7 +106,7 @@ Status DataStreamMgr::transmit_chunk(const PTransmitChunkParams& request, ::goog
     TUniqueId t_finst_id;
     t_finst_id.hi = finst_id.hi();
     t_finst_id.lo = finst_id.lo();
-    SCOPED_SET_TRACE_INFO({}, {}, t_finst_id);
+    SCOPED_SET_TRACE_INFO({}, {}, t_finst_id)
     std::shared_ptr<DataStreamRecvr> recvr = find_recvr(t_finst_id, request.node_id());
     if (recvr == nullptr) {
         // The receiver may remove itself from the receiver map via deregister_recvr()
@@ -175,7 +139,7 @@ Status DataStreamMgr::transmit_chunk(const PTransmitChunkParams& request, ::goog
     return Status::OK();
 }
 
-Status DataStreamMgr::deregister_recvr(const TUniqueId& fragment_instance_id, PlanNodeId node_id) {
+void DataStreamMgr::deregister_recvr(const TUniqueId& fragment_instance_id, PlanNodeId node_id) {
     std::shared_ptr<DataStreamRecvr> target_recvr;
     VLOG_QUERY << "deregister_recvr(): fragment_instance_id=" << fragment_instance_id << ", node=" << node_id;
     uint32_t bucket = get_bucket(fragment_instance_id);
@@ -201,13 +165,23 @@ Status DataStreamMgr::deregister_recvr(const TUniqueId& fragment_instance_id, Pl
     // cancel_stream maybe take a long time, so we handle it out of lock.
     if (target_recvr) {
         target_recvr->cancel_stream();
-        return Status::OK();
     } else {
         std::stringstream err;
         err << "unknown row receiver id: fragment_instance_id=" << fragment_instance_id << " node_id=" << node_id;
         LOG(ERROR) << err.str();
-        return Status::InternalError(err.str());
     }
+}
+
+void DataStreamMgr::close() {
+    for (size_t i = 0; i < _receiver_map->size(); i++) {
+        std::lock_guard<Mutex> l(_lock[i]);
+        for (auto& iter : _receiver_map[i]) {
+            for (auto& sub_iter : *iter.second) {
+                sub_iter.second->cancel_stream();
+            }
+        }
+    }
+    _pass_through_chunk_buffer_manager.close();
 }
 
 void DataStreamMgr::cancel(const TUniqueId& fragment_instance_id) {

@@ -38,6 +38,7 @@
 #include "runtime/routine_load/data_consumer.h"
 #include "runtime/routine_load/kafka_consumer_pipe.h"
 #include "runtime/stream_load/stream_load_context.h"
+#include "util/defer_op.h"
 
 namespace starrocks {
 
@@ -120,7 +121,7 @@ Status KafkaDataConsumerGroup::start_all(StreamLoadContext* ctx) {
     //improve performance
     Status (KafkaConsumerPipe::*append_data)(const char* data, size_t size, char row_delimiter);
     char row_delimiter = '\n';
-    if (ctx->format == TFileFormatType::FORMAT_JSON) {
+    if (ctx->format == TFileFormatType::FORMAT_JSON || ctx->format == TFileFormatType::FORMAT_AVRO) {
         append_data = &KafkaConsumerPipe::append_json;
     } else {
         append_data = &KafkaConsumerPipe::append_with_row_delimiter;
@@ -151,7 +152,7 @@ Status KafkaDataConsumerGroup::start_all(StreamLoadContext* ctx) {
             _queue.shutdown();
             // cancel all consumers
             for (auto& consumer : _consumers) {
-                consumer->cancel(ctx);
+                (void)consumer->cancel(ctx);
             }
 
             // waiting all threads finished
@@ -171,7 +172,7 @@ Status KafkaDataConsumerGroup::start_all(StreamLoadContext* ctx) {
                 // we need to commit and tell fe to move offset to the newest offset, otherwise, fe will retry consume.
                 for (auto& item : cmt_offset) {
                     if (item.second > ctx->kafka_info->cmt_offset[item.first]) {
-                        kafka_pipe->finish();
+                        RETURN_IF_ERROR(kafka_pipe->finish());
                         ctx->kafka_info->cmt_offset = std::move(cmt_offset);
                         ctx->receive_bytes = 0;
                         return Status::OK();
@@ -181,7 +182,7 @@ Status KafkaDataConsumerGroup::start_all(StreamLoadContext* ctx) {
                 return Status::Cancelled("Cancelled");
             } else {
                 DCHECK(left_bytes < ctx->max_batch_size);
-                kafka_pipe->finish();
+                RETURN_IF_ERROR(kafka_pipe->finish());
                 ctx->kafka_info->cmt_offset = std::move(cmt_offset);
                 ctx->receive_bytes = ctx->max_batch_size - left_bytes;
                 return Status::OK();
@@ -193,6 +194,7 @@ Status KafkaDataConsumerGroup::start_all(StreamLoadContext* ctx) {
         if (res) {
             VLOG(3) << "get kafka message"
                     << ", partition: " << msg->partition() << ", offset: " << msg->offset() << ", len: " << msg->len();
+            DeferOp msgDeleter([&] { delete msg; });
 
             if (msg->err() == RdKafka::ERR__PARTITION_EOF) {
                 // For transaction producer, producer will append one control msg to the group of msgs,
@@ -209,8 +211,9 @@ Status KafkaDataConsumerGroup::start_all(StreamLoadContext* ctx) {
                     cmt_offset[msg->partition()] = msg->offset() - 1;
                 }
             } else {
-                Status st = (kafka_pipe.get()->*append_data)(static_cast<const char*>(msg->payload()),
-                                                             static_cast<size_t>(msg->len()), row_delimiter);
+                Status st = Status::OK();
+                st = (kafka_pipe.get()->*append_data)(static_cast<const char*>(msg->payload()),
+                                                      static_cast<size_t>(msg->len()), row_delimiter);
                 if (st.ok()) {
                     received_rows++;
                     left_bytes -= msg->len();
@@ -229,7 +232,6 @@ Status KafkaDataConsumerGroup::start_all(StreamLoadContext* ctx) {
                     }
                 }
             }
-            delete msg;
         } else {
             // queue is empty and shutdown
             eos = true;
@@ -357,7 +359,7 @@ Status PulsarDataConsumerGroup::start_all(StreamLoadContext* ctx) {
             _queue.shutdown();
             // cancel all consumers
             for (auto& consumer : _consumers) {
-                consumer->cancel(ctx);
+                (void)consumer->cancel(ctx);
             }
 
             // waiting all threads finished
@@ -376,7 +378,7 @@ Status PulsarDataConsumerGroup::start_all(StreamLoadContext* ctx) {
                 return Status::Cancelled("Cancelled");
             } else {
                 DCHECK(left_bytes < ctx->max_batch_size);
-                pulsar_pipe->finish();
+                RETURN_IF_ERROR(pulsar_pipe->finish());
                 ctx->pulsar_info->ack_offset = std::move(ack_offset);
                 ctx->receive_bytes = ctx->max_batch_size - left_bytes;
                 get_backlog_nums(ctx);

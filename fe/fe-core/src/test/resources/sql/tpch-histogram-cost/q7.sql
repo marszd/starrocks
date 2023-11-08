@@ -116,11 +116,11 @@ OutPut Exchange Id: 21
 |
 18:HASH JOIN
 |  join op: INNER JOIN (BROADCAST)
-|  equal join conjunct: [11: L_SUPPKEY, INT, false] = [1: S_SUPPKEY, INT, false]
 |  equal join conjunct: [45: N_NATIONKEY, INT, false] = [4: S_NATIONKEY, INT, false]
+|  equal join conjunct: [11: L_SUPPKEY, INT, false] = [1: S_SUPPKEY, INT, false]
 |  build runtime filters:
-|  - filter_id = 3, build_expr = (1: S_SUPPKEY), remote = false
-|  - filter_id = 4, build_expr = (4: S_NATIONKEY), remote = true
+|  - filter_id = 3, build_expr = (4: S_NATIONKEY), remote = true
+|  - filter_id = 4, build_expr = (1: S_SUPPKEY), remote = false
 |  output columns: 14, 15, 19, 46, 51
 |  cardinality: 292324
 |  column statistics:
@@ -178,18 +178,19 @@ OutPut Exchange Id: 21
 |       partition exprs: [26: O_ORDERKEY, INT, false]
 |       cardinality: 6000000
 |       probe runtime filters:
-|       - filter_id = 4, probe_expr = (45: N_NATIONKEY)
+|       - filter_id = 3, probe_expr = (45: N_NATIONKEY)
 |
 0:OlapScanNode
 table: lineitem, rollup: lineitem
 preAggregation: on
 Predicates: [19: L_SHIPDATE, DATE, false] >= '1995-01-01', [19: L_SHIPDATE, DATE, false] <= '1996-12-31'
 partitionsRatio=1/1, tabletsRatio=20/20
+tabletList=10289,10291,10293,10295,10297,10299,10301,10303,10305,10307 ...
 actualRows=0, avgRowSize=32.0
 cardinality: 182702669
 probe runtime filters:
 - filter_id = 2, probe_expr = (9: L_ORDERKEY)
-- filter_id = 3, probe_expr = (11: L_SUPPKEY)
+- filter_id = 4, probe_expr = (11: L_SUPPKEY)
 column statistics:
 * L_ORDERKEY-->[1.0, 6.0E8, 0.0, 8.0, 1.5E8] ESTIMATE
 * L_SUPPKEY-->[1.0, 1000000.0, 0.0, 4.0, 1000000.0] ESTIMATE
@@ -207,6 +208,7 @@ OutPut Exchange Id: 17
 table: supplier, rollup: supplier
 preAggregation: on
 partitionsRatio=1/1, tabletsRatio=1/1
+tabletList=10187
 actualRows=0, avgRowSize=8.0
 cardinality: 1000000
 column statistics:
@@ -239,8 +241,6 @@ OutPut Exchange Id: 13
 |  - filter_id = 1, build_expr = (36: C_CUSTKEY), remote = false
 |  output columns: 26, 45, 46, 51
 |  cardinality: 6000000
-|  probe runtime filters:
-|  - filter_id = 4, probe_expr = (45: N_NATIONKEY)
 |  column statistics:
 |  * O_ORDERKEY-->[1.0, 6.0E8, 0.0, 8.0, 6000000.0] ESTIMATE
 |  * N_NATIONKEY-->[0.0, 24.0, 0.0, 4.0, 25.0] ESTIMATE
@@ -255,6 +255,7 @@ OutPut Exchange Id: 13
 table: orders, rollup: orders
 preAggregation: on
 partitionsRatio=1/1, tabletsRatio=10/10
+tabletList=10215,10217,10219,10221,10223,10225,10227,10229,10231,10233
 actualRows=0, avgRowSize=16.0
 cardinality: 150000000
 probe runtime filters:
@@ -278,7 +279,7 @@ OutPut Exchange Id: 10
 |  cardinality: 600000
 |  column statistics:
 |  * C_CUSTKEY-->[1.0, 1.5E7, 0.0, 8.0, 600000.0] ESTIMATE
-|  * N_NATIONKEY-->[0.0, 24.0, 0.0, 4.0, 1.0] ESTIMATE
+|  * N_NATIONKEY-->[0.0, 24.0, 0.0, 4.0, 25.0] ESTIMATE
 |  * N_NAME-->[-Infinity, Infinity, 0.0, 25.0, 1.0] ESTIMATE
 |  * N_NAME-->[-Infinity, Infinity, 0.0, 25.0, 1.0] ESTIMATE
 |
@@ -291,20 +292,21 @@ OutPut Exchange Id: 10
 |  cardinality: 600000
 |  column statistics:
 |  * C_CUSTKEY-->[1.0, 1.5E7, 0.0, 8.0, 600000.0] ESTIMATE
-|  * C_NATIONKEY-->[0.0, 24.0, 0.0, 4.0, 1.0] ESTIMATE
-|  * N_NATIONKEY-->[0.0, 24.0, 0.0, 4.0, 1.0] ESTIMATE
+|  * N_NATIONKEY-->[0.0, 24.0, 0.0, 4.0, 25.0] ESTIMATE
 |  * N_NAME-->[-Infinity, Infinity, 0.0, 25.0, 1.0] ESTIMATE
-|  * N_NATIONKEY-->[0.0, 24.0, 0.0, 4.0, 1.0] ESTIMATE
 |  * N_NAME-->[-Infinity, Infinity, 0.0, 25.0, 1.0] ESTIMATE
 |
 |----7:EXCHANGE
 |       distribution type: BROADCAST
 |       cardinality: 1
+|       probe runtime filters:
+|       - filter_id = 3, probe_expr = (45: N_NATIONKEY)
 |
 2:OlapScanNode
 table: customer, rollup: customer
 preAggregation: on
 partitionsRatio=1/1, tabletsRatio=10/10
+tabletList=10238,10240,10242,10244,10246,10248,10250,10252,10254,10256
 actualRows=0, avgRowSize=12.0
 cardinality: 15000000
 probe runtime filters:
@@ -338,6 +340,7 @@ table: nation, rollup: nation
 preAggregation: on
 Predicates: 46: N_NAME IN ('CANADA', 'IRAN')
 partitionsRatio=1/1, tabletsRatio=1/1
+tabletList=10261
 actualRows=0, avgRowSize=29.0
 cardinality: 25
 column statistics:
@@ -355,6 +358,7 @@ table: nation, rollup: nation
 preAggregation: on
 Predicates: 51: N_NAME IN ('IRAN', 'CANADA')
 partitionsRatio=1/1, tabletsRatio=1/1
+tabletList=10261
 actualRows=0, avgRowSize=29.0
 cardinality: 25
 column statistics:

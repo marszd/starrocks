@@ -15,7 +15,7 @@
 
 package com.starrocks.sql.optimizer.rule.transformation.materialization.rule;
 
-import com.starrocks.sql.optimizer.MaterializationContext;
+import com.starrocks.sql.optimizer.MvRewriteContext;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.operator.OperatorType;
@@ -27,11 +27,11 @@ import com.starrocks.sql.optimizer.rule.transformation.materialization.MvUtils;
 
 /**
  * Materialized View Rewrite Rule for pattern:
- *  - Aggregate
- *      - Scan
+ * - Aggregate
+ * - Scan
  */
 public class AggregateScanRule extends SingleTableRewriteBaseRule {
-    private static AggregateScanRule INSTANCE = new AggregateScanRule();
+    private static final AggregateScanRule INSTANCE = new AggregateScanRule();
 
     public AggregateScanRule() {
         super(RuleType.TF_MV_AGGREGATE_SCAN_RULE, Pattern.create(OperatorType.LOGICAL_AGGR)
@@ -51,7 +51,7 @@ public class AggregateScanRule extends SingleTableRewriteBaseRule {
     }
 
     @Override
-    public MaterializedViewRewriter getMaterializedViewRewrite(MaterializationContext mvContext) {
+    public MaterializedViewRewriter getMaterializedViewRewrite(MvRewriteContext mvContext) {
         return new AggregatedMaterializedViewRewriter(mvContext);
     }
 }

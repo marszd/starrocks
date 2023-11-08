@@ -17,6 +17,7 @@ package com.starrocks.connector.analyzer;
 
 import com.google.common.collect.ImmutableList;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.IntLiteral;
@@ -43,6 +44,7 @@ import com.starrocks.sql.ast.ExceptRelation;
 import com.starrocks.sql.ast.FieldReference;
 import com.starrocks.sql.ast.IntersectRelation;
 import com.starrocks.sql.ast.JoinRelation;
+import com.starrocks.sql.ast.NormalizedTableFunctionRelation;
 import com.starrocks.sql.ast.QueryRelation;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.Relation;
@@ -178,7 +180,7 @@ public class SimpleQueryAnalyzer {
                 TableName rightTableName = right.getResolveTableName();
 
                 // create predicate "<left>.colName = <right>.colName"
-                BinaryPredicate resolvedUsing = new BinaryPredicate(BinaryPredicate.Operator.EQ,
+                BinaryPredicate resolvedUsing = new BinaryPredicate(BinaryType.EQ,
                         new SlotRef(leftTableName, colName), new SlotRef(rightTableName, colName));
 
                 if (joinEqual == null) {
@@ -215,7 +217,7 @@ public class SimpleQueryAnalyzer {
                     analyzeExpression(expression, new AnalyzeState());
 
                     if (!expression.getType().canOrderBy()) {
-                        throw new SemanticException(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+                        throw new SemanticException(Type.NOT_SUPPORT_ORDER_ERROR_MSG);
                     }
                 }
             }
@@ -269,7 +271,7 @@ public class SimpleQueryAnalyzer {
                     analyzeExpression(expression, new AnalyzeState());
 
                     if (!expression.getType().canOrderBy()) {
-                        throw new SemanticException(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+                        throw new SemanticException(Type.NOT_SUPPORT_ORDER_ERROR_MSG);
                     }
                 }
             }
@@ -367,6 +369,14 @@ public class SimpleQueryAnalyzer {
 
             Scope outputScope = new Scope(RelationId.of(node), new RelationFields(fields.build()));
             node.setScope(outputScope);
+            return null;
+        }
+
+        @Override
+        public Void visitNormalizedTableFunction(NormalizedTableFunctionRelation node, Void scope) {
+            visitJoin(node, scope);
+            // Only the scope of the table function is visible outside.
+            node.setScope(node.getRight().getScope());
             return null;
         }
 

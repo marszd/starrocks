@@ -16,12 +16,15 @@
 package com.starrocks.connector.jdbc;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.JDBCResource;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.DdlException;
 import com.starrocks.connector.ConnectorMetadata;
+import com.starrocks.connector.ConnectorTableId;
+import com.starrocks.connector.PartitionInfo;
 import com.starrocks.connector.exception.StarRocksConnectorException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -32,6 +35,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 public class JDBCMetadata implements ConnectorMetadata {
@@ -39,10 +43,12 @@ public class JDBCMetadata implements ConnectorMetadata {
     private static Logger LOG = LogManager.getLogger(JDBCMetadata.class);
 
     private Map<String, String> properties;
+    private String catalogName;
     private JDBCSchemaResolver schemaResolver;
 
-    public JDBCMetadata(Map<String, String> properties) {
+    public JDBCMetadata(Map<String, String> properties, String catalogName) {
         this.properties = properties;
+        this.catalogName = catalogName;
         try {
             Class.forName(properties.get(JDBCResource.DRIVER_CLASS));
         } catch (ClassNotFoundException e) {
@@ -67,9 +73,7 @@ public class JDBCMetadata implements ConnectorMetadata {
     @Override
     public List<String> listDbNames() {
         try (Connection connection = getConnection()) {
-            return schemaResolver.listSchemas(connection).stream()
-                    .map(String::toLowerCase)
-                    .collect(Collectors.toList());
+            return Lists.newArrayList(schemaResolver.listSchemas(connection));
         } catch (SQLException e) {
             throw new StarRocksConnectorException(e.getMessage());
         }
@@ -95,7 +99,7 @@ public class JDBCMetadata implements ConnectorMetadata {
                 ImmutableList.Builder<String> list = ImmutableList.builder();
                 while (resultSet.next()) {
                     String tableName = resultSet.getString("TABLE_NAME");
-                    list.add(tableName.toLowerCase());
+                    list.add(tableName);
                 }
                 return list.build();
             }
@@ -109,13 +113,66 @@ public class JDBCMetadata implements ConnectorMetadata {
         try (Connection connection = getConnection()) {
             ResultSet columnSet = schemaResolver.getColumns(connection, dbName, tblName);
             List<Column> fullSchema = schemaResolver.convertToSRTable(columnSet);
+            List<Column> partitionColumns = listPartitionColumns(dbName, tblName, fullSchema);
             if (fullSchema.isEmpty()) {
                 return null;
             }
-            return schemaResolver.getTable(0, tblName, fullSchema, dbName, properties);
+            JDBCTableName tableKey = JDBCTableName.of(catalogName, dbName, tblName);
+            if (JDBCTableIdCache.containsTableId(tableKey)) {
+                return schemaResolver.getTable(JDBCTableIdCache.getTableId(tableKey),
+                        tblName, fullSchema, partitionColumns, dbName, catalogName, properties);
+            } else {
+                Integer tableId = ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asInt();
+                JDBCTableIdCache.putTableId(tableKey, tableId);
+                return schemaResolver.getTable(tableId, tblName, fullSchema, partitionColumns, dbName, catalogName, properties);
+            }
         } catch (SQLException | DdlException e) {
             LOG.warn(e.getMessage());
             return null;
+        }
+    }
+
+    @Override
+    public List<String> listPartitionNames(String databaseName, String tableName) {
+        try (Connection connection = getConnection()) {
+            return schemaResolver.listPartitionNames(connection, databaseName, tableName);
+        } catch (SQLException e) {
+            throw new StarRocksConnectorException(e.getMessage());
+        }
+    }
+
+    public List<Column> listPartitionColumns(String databaseName, String tableName, List<Column> fullSchema) {
+        try (Connection connection = getConnection()) {
+            Set<String> partitionColumnNames = schemaResolver.listPartitionColumns(connection, databaseName, tableName)
+                    .stream().map(columnName -> columnName.toLowerCase()).collect(Collectors.toSet());
+            if (partitionColumnNames.size() > 0) {
+                return fullSchema.stream().filter(column -> partitionColumnNames.contains(column.getName().toLowerCase()))
+                        .collect(Collectors.toList());
+            } else {
+                return Lists.newArrayList();
+            }
+        } catch (SQLException e) {
+            throw new StarRocksConnectorException(e.getMessage());
+        }
+    }
+
+    @Override
+    public List<PartitionInfo> getPartitions(Table table, List<String> partitionNames) {
+        try (Connection connection = getConnection()) {
+            List<Partition> partitions = schemaResolver.getPartitions(connection, table);
+            ImmutableList.Builder<PartitionInfo> list = ImmutableList.builder();
+            if (partitions.size() > 0) {
+                for (Partition partition : partitions) {
+                    if (partitionNames.contains(partition.getPartitionName())) {
+                        list.add(partition);
+                    }
+                }
+                return list.build();
+            } else {
+                return Lists.newArrayList();
+            }
+        } catch (SQLException e) {
+            throw new StarRocksConnectorException(e.getMessage());
         }
     }
 

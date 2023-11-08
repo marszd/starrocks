@@ -22,6 +22,7 @@
 
 #include "column/column_builder.h"
 #include "common/compiler_util.h"
+#include "common/status.h"
 #include "exprs/function_context.h"
 #include "exprs/function_helper.h"
 #include "exprs/jsonpath.h"
@@ -36,7 +37,7 @@ enum JsonFunctionType {
     JSON_FUN_UNKOWN //The last
 };
 
-template <LogicalType primitive_type>
+template <LogicalType logical_type>
 struct JsonTypeTraits {};
 
 template <>
@@ -88,8 +89,8 @@ struct SimpleJsonPath {
 
 class JsonFunctions {
 public:
-    static Status json_path_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope);
-    static Status json_path_close(FunctionContext* context, FunctionContext::FunctionStateScope scope);
+    [[nodiscard]] static Status json_path_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope);
+    [[nodiscard]] static Status json_path_close(FunctionContext* context, FunctionContext::FunctionStateScope scope);
 
     /**
      * @param: [json_string, tagged_value]
@@ -201,15 +202,27 @@ public:
      */
     DEFINE_VECTORIZED_FN(json_keys);
 
-    static Status native_json_path_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope);
-    static Status native_json_path_close(FunctionContext* context, FunctionContext::FunctionStateScope scope);
+    /**
+     * Return json built from struct/map
+     */
+    DEFINE_VECTORIZED_FN(to_json);
+
+    [[nodiscard]] static Status native_json_path_prepare(FunctionContext* context,
+                                                         FunctionContext::FunctionStateScope scope);
+    [[nodiscard]] static Status native_json_path_close(FunctionContext* context,
+                                                       FunctionContext::FunctionStateScope scope);
 
     // extract_from_object extracts value from object according to the json path.
     // Now, we do not support complete functions of json path.
-    static Status extract_from_object(simdjson::ondemand::object& obj, const std::vector<SimpleJsonPath>& jsonpath,
-                                      simdjson::ondemand::value* value) noexcept;
+    [[nodiscard]] static Status extract_from_object(simdjson::ondemand::object& obj,
+                                                    const std::vector<SimpleJsonPath>& jsonpath,
+                                                    simdjson::ondemand::value* value) noexcept;
 
-    static void parse_json_paths(const std::string& path_strings, std::vector<SimpleJsonPath>* parsed_paths);
+    [[nodiscard]] static Status parse_json_paths(const std::string& path_strings,
+                                                 std::vector<SimpleJsonPath>* parsed_paths);
+
+    // jsonpaths_to_string serializes json patsh to std::string. Setting sub_index to serializes paritially json paths.
+    static std::string jsonpaths_to_string(const std::vector<SimpleJsonPath>& jsonpaths, size_t sub_index = -1);
 
     template <typename ValueType>
     static std::string_view to_json_string(ValueType&& val, size_t limit) {
@@ -222,7 +235,7 @@ public:
 
 private:
     template <LogicalType ResultType>
-    static StatusOr<ColumnPtr> _json_query_impl(FunctionContext* context, const Columns& columns);
+    [[nodiscard]] static StatusOr<ColumnPtr> _json_query_impl(FunctionContext* context, const Columns& columns);
 
     /**
      * Parse string column as json column
@@ -262,8 +275,8 @@ private:
      * @return: JsonColumn
      */
 
-    static Status _get_parsed_paths(const std::vector<std::string>& path_exprs,
-                                    std::vector<SimpleJsonPath>* parsed_paths);
+    [[nodiscard]] static Status _get_parsed_paths(const std::vector<std::string>& path_exprs,
+                                                  std::vector<SimpleJsonPath>* parsed_paths);
 };
 
 } // namespace starrocks

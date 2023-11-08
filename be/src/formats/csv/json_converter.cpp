@@ -24,8 +24,9 @@ namespace starrocks::csv {
 Status JsonConverter::write_string(OutputStream* os, const Column& column, size_t row_num,
                                    const Options& options) const {
     auto data_column = down_cast<const JsonColumn*>(&column);
-    const std::vector<JsonValue>& pool = data_column->get_pool();
-    return os->write(pool[row_num].get_slice());
+    auto json_value = data_column->get_object(row_num);
+    auto json_str = json_value->to_string_uncheck();
+    return os->write(json_str);
 }
 
 Status JsonConverter::write_quoted_string(OutputStream* os, const Column& column, size_t row_num,
@@ -35,7 +36,7 @@ Status JsonConverter::write_quoted_string(OutputStream* os, const Column& column
     return os->write('"');
 }
 
-bool JsonConverter::read_string(Column* column, Slice s, const Options& options) const {
+bool JsonConverter::read_string(Column* column, const Slice& s, const Options& options) const {
     auto json = JsonValue::parse(s);
     if (json.ok()) {
         auto json_column = down_cast<JsonColumn*>(column);
@@ -45,7 +46,8 @@ bool JsonConverter::read_string(Column* column, Slice s, const Options& options)
     return false;
 }
 
-bool JsonConverter::read_quoted_string(Column* column, Slice s, const Options& options) const {
+bool JsonConverter::read_quoted_string(Column* column, const Slice& tmp_s, const Options& options) const {
+    Slice s = tmp_s;
     if (!remove_enclosing_quotes<'"'>(&s)) {
         return false;
     }

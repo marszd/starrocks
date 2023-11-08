@@ -37,8 +37,10 @@
 #include <fmt/format.h>
 
 #include <atomic>
+#include <memory>
 #include <shared_mutex>
 #include <sstream>
+#include <utility>
 
 #include "agent/agent_server.h"
 #include "agent/publish_version.h"
@@ -48,6 +50,8 @@
 #include "common/closure_guard.h"
 #include "common/config.h"
 #include "common/status.h"
+#include "exec/orc_scanner.h"
+#include "exec/parquet_scanner.h"
 #include "exec/pipeline/fragment_context.h"
 #include "exec/pipeline/fragment_executor.h"
 #include "exec/pipeline/pipeline_driver_executor.h"
@@ -55,35 +59,40 @@
 #include "exec/pipeline/stream_epoch_manager.h"
 #include "gen_cpp/AgentService_types.h"
 #include "gen_cpp/BackendService.h"
+#include "gen_cpp/InternalService_types.h"
 #include "gen_cpp/MVMaintenance_types.h"
+#include "gen_cpp/PlanNodes_types.h"
 #include "gutil/strings/substitute.h"
 #include "runtime/buffer_control_block.h"
+#include "runtime/command_executor.h"
 #include "runtime/data_stream_mgr.h"
+#include "runtime/descriptors.h"
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
 #include "runtime/load_channel_mgr.h"
 #include "runtime/result_buffer_mgr.h"
 #include "runtime/routine_load/routine_load_task_executor.h"
 #include "runtime/runtime_filter_worker.h"
+#include "runtime/types.h"
 #include "service/brpc.h"
 #include "storage/storage_engine.h"
 #include "storage/txn_manager.h"
+#include "util/failpoint/fail_point.h"
 #include "util/stopwatch.hpp"
 #include "util/thrift_util.h"
+#include "util/time.h"
 #include "util/uid_util.h"
 
 namespace starrocks {
 
 extern std::atomic<bool> k_starrocks_exit;
+extern std::atomic<bool> k_starrocks_exit_quick;
 
 using PromiseStatus = std::promise<Status>;
 using PromiseStatusSharedPtr = std::shared_ptr<PromiseStatus>;
 
 template <typename T>
-PInternalServiceImplBase<T>::PInternalServiceImplBase(ExecEnv* exec_env)
-        : _exec_env(exec_env),
-          _async_thread_pool("async_thread_pool", config::internal_service_async_thread_num,
-                             config::internal_service_async_thread_num) {}
+PInternalServiceImplBase<T>::PInternalServiceImplBase(ExecEnv* exec_env) : _exec_env(exec_env) {}
 
 template <typename T>
 PInternalServiceImplBase<T>::~PInternalServiceImplBase() = default;
@@ -92,27 +101,9 @@ template <typename T>
 void PInternalServiceImplBase<T>::transmit_data(google::protobuf::RpcController* cntl_base,
                                                 const PTransmitDataParams* request, PTransmitDataResult* response,
                                                 google::protobuf::Closure* done) {
-    VLOG_ROW << "Transmit data: fragment_instance_id = " << print_id(request->finst_id())
-             << " node = " << request->node_id();
-    auto* cntl = static_cast<brpc::Controller*>(cntl_base);
-    if (cntl->request_attachment().size() > 0) {
-        PRowBatch* batch = (const_cast<PTransmitDataParams*>(request))->mutable_row_batch();
-        butil::IOBuf& io_buf = cntl->request_attachment();
-        std::string* tuple_data = batch->mutable_tuple_data();
-        io_buf.copy_to(tuple_data);
-    }
-    // NOTE: we should give a default value to response to avoid concurrent risk.
-    // If we don't give response here, stream manager will call done->Run before
-    // 'transmit_data()', which will cause a dirty memory access.
-    Status st;
-    st.to_protobuf(response->mutable_status());
-    st = _exec_env->stream_mgr()->transmit_data(request, &done);
-    if (!st.ok()) {
-        LOG(WARNING) << "transmit_data failed, message=" << st.get_error_msg()
-                     << ", fragment_instance_id=" << print_id(request->finst_id()) << ", node=" << request->node_id();
-    }
+    Status st = Status::InternalError("transmit_data is only used for non-vectorized engine, is not supported now");
+    LOG(ERROR) << "transmit_data failed: " << st.to_string();
     if (done != nullptr) {
-        // NOTE: only when done is not null, we can set response status
         st.to_protobuf(response->mutable_status());
         done->Run();
     }
@@ -133,30 +124,56 @@ template <typename T>
 void PInternalServiceImplBase<T>::_transmit_chunk(google::protobuf::RpcController* cntl_base,
                                                   const PTransmitChunkParams* request, PTransmitChunkResult* response,
                                                   google::protobuf::Closure* done) {
+    class WrapClosure : public google::protobuf::Closure {
+    public:
+        WrapClosure(google::protobuf::Closure* done, PTransmitChunkResult* response)
+                : _done(done), _response(response) {}
+        ~WrapClosure() override = default;
+        void Run() override {
+            std::unique_ptr<WrapClosure> self_guard(this);
+            const auto response_timestamp = MonotonicNanos();
+            _response->set_receiver_post_process_time(response_timestamp - _receive_timestamp);
+            if (_done != nullptr) {
+                _done->Run();
+            }
+        }
+
+    private:
+        google::protobuf::Closure* _done;
+        PTransmitChunkResult* _response;
+        const int64_t _receive_timestamp = MonotonicNanos();
+    };
+    google::protobuf::Closure* wrapped_done = new WrapClosure(done, response);
+
     auto begin_ts = MonotonicNanos();
-    auto msg = "transmit data: " + std::to_string((uint64_t)(request)) +
-               " fragment_instance_id=" + print_id(request->finst_id()) +
-               " node = " + std::to_string(request->node_id());
-    VLOG_ROW << msg << " begin";
+    std::string transmit_info = "";
+    auto gen_transmit_info = [&transmit_info, &request]() {
+        transmit_info = "transmit data: " + std::to_string((uint64_t)(request)) +
+                        " fragment_instance_id=" + print_id(request->finst_id()) +
+                        " node=" + std::to_string(request->node_id());
+    };
+    if (VLOG_ROW_IS_ON) {
+        gen_transmit_info();
+    }
+    VLOG_ROW << transmit_info << " begin";
     // NOTE: we should give a default value to response to avoid concurrent risk
     // If we don't give response here, stream manager will call done->Run before
     // transmit_data(), which will cause a dirty memory access.
     auto* cntl = static_cast<brpc::Controller*>(cntl_base);
     auto* req = const_cast<PTransmitChunkParams*>(request);
-    const auto receive_timestamp = GetCurrentTimeNanos();
-    response->set_receive_timestamp(receive_timestamp);
     Status st;
     st.to_protobuf(response->mutable_status());
     DeferOp defer([&]() {
         if (!st.ok()) {
-            LOG(WARNING) << "failed to " << msg;
+            gen_transmit_info();
+            LOG(WARNING) << "failed to " << transmit_info;
         }
-        if (done != nullptr) {
+        if (wrapped_done != nullptr) {
             // NOTE: only when done is not null, we can set response status
             st.to_protobuf(response->mutable_status());
-            done->Run();
+            wrapped_done->Run();
         }
-        VLOG_ROW << msg << " cost time = " << MonotonicNanos() - begin_ts;
+        VLOG_ROW << transmit_info << " cost time = " << MonotonicNanos() - begin_ts;
     });
     if (cntl->request_attachment().size() > 0) {
         butil::IOBuf& io_buf = cntl->request_attachment();
@@ -179,7 +196,50 @@ void PInternalServiceImplBase<T>::_transmit_chunk(google::protobuf::RpcControlle
         }
     }
 
-    TRY_CATCH_ALL(st, _exec_env->stream_mgr()->transmit_chunk(*request, &done));
+    st = _exec_env->stream_mgr()->transmit_chunk(*request, &wrapped_done);
+}
+
+template <typename T>
+void PInternalServiceImplBase<T>::transmit_chunk_via_http(google::protobuf::RpcController* cntl_base,
+                                                          const PHttpRequest* request, PTransmitChunkResult* response,
+                                                          google::protobuf::Closure* done) {
+    auto task = [=]() {
+        auto params = std::make_shared<PTransmitChunkParams>();
+        auto get_params = [&]() -> Status {
+            auto* cntl = static_cast<brpc::Controller*>(cntl_base);
+            butil::IOBuf& iobuf = cntl->request_attachment();
+            // deserialize PTransmitChunkParams
+            size_t params_size = 0;
+            iobuf.cutn(&params_size, sizeof(params_size));
+            butil::IOBuf params_from;
+            iobuf.cutn(&params_from, params_size);
+            butil::IOBufAsZeroCopyInputStream wrapper(params_from);
+            params->ParseFromZeroCopyStream(&wrapper);
+            // the left size is from chunks' data
+            size_t attachment_size = 0;
+            iobuf.cutn(&attachment_size, sizeof(attachment_size));
+            if (attachment_size != iobuf.size()) {
+                Status st = Status::InternalError(
+                        fmt::format("{} != {} during deserialization via http", attachment_size, iobuf.size()));
+                return st;
+            }
+            return Status::OK();
+        };
+        // may throw std::bad_alloc exception.
+        Status st = get_params();
+        if (!st.ok()) {
+            st.to_protobuf(response->mutable_status());
+            done->Run();
+            LOG(WARNING) << "transmit_data via http rpc failed, message=" << st.get_error_msg();
+            return;
+        }
+        this->_transmit_chunk(cntl_base, params.get(), response, done);
+    };
+    if (!_exec_env->query_rpc_pool()->try_offer(std::move(task))) {
+        ClosureGuard closure_guard(done);
+        Status::ServiceUnavailable("submit transmit_chunk_via_http task failed")
+                .to_protobuf(response->mutable_status());
+    }
 }
 
 template <typename T>
@@ -236,13 +296,13 @@ void PInternalServiceImplBase<T>::_exec_plan_fragment(google::protobuf::RpcContr
                                                       google::protobuf::Closure* done) {
     ClosureGuard closure_guard(done);
     auto* cntl = static_cast<brpc::Controller*>(cntl_base);
-    if (k_starrocks_exit.load(std::memory_order_relaxed)) {
+    if (k_starrocks_exit.load(std::memory_order_relaxed) || k_starrocks_exit_quick.load(std::memory_order_relaxed)) {
         cntl->SetFailed(brpc::EINTERNAL, "BE is shutting down");
         LOG(WARNING) << "reject exec plan fragment because of exit";
         return;
     }
 
-    auto st = _exec_plan_fragment(cntl);
+    auto st = _exec_plan_fragment(cntl, request);
     if (!st.ok()) {
         LOG(WARNING) << "exec plan fragment failed, errmsg=" << st.get_error_msg();
     }
@@ -335,13 +395,14 @@ void PInternalServiceImplBase<T>::tablet_writer_cancel(google::protobuf::RpcCont
                                                        google::protobuf::Closure* done) {}
 
 template <typename T>
-Status PInternalServiceImplBase<T>::_exec_plan_fragment(brpc::Controller* cntl) {
+Status PInternalServiceImplBase<T>::_exec_plan_fragment(brpc::Controller* cntl,
+                                                        const PExecPlanFragmentRequest* request) {
     auto ser_request = cntl->request_attachment().to_string();
     TExecPlanFragmentParams t_request;
     {
         const auto* buf = (const uint8_t*)ser_request.data();
         uint32_t len = ser_request.size();
-        RETURN_IF_ERROR(deserialize_thrift_msg(buf, &len, TProtocolType::BINARY, &t_request));
+        RETURN_IF_ERROR(deserialize_thrift_msg(buf, &len, request->attachment_protocol(), &t_request));
     }
     bool is_pipeline = t_request.__isset.is_pipeline && t_request.is_pipeline;
     LOG(INFO) << "exec plan fragment, fragment_instance_id=" << print_id(t_request.params.fragment_instance_id)
@@ -350,7 +411,15 @@ Status PInternalServiceImplBase<T>::_exec_plan_fragment(brpc::Controller* cntl) 
     if (is_pipeline) {
         return _exec_plan_fragment_by_pipeline(t_request, t_request);
     } else {
-        return _exec_plan_fragment_by_non_pipeline(t_request);
+        bool has_schema_table_sink = t_request.__isset.fragment && t_request.fragment.__isset.output_sink &&
+                                     t_request.fragment.output_sink.type == TDataSinkType::SCHEMA_TABLE_SINK;
+        // SchemaTableSink is not supported on the Pipeline engine, we have to allow it to be executed on non-pipeline engine temporarily,
+        // this will be removed in the future.
+        if (has_schema_table_sink) {
+            return _exec_plan_fragment_by_non_pipeline(t_request);
+        }
+        return Status::InvalidArgument(
+                "non-pipeline engine is no longer supported since 3.2, please set enable_pipeline_engine=true.");
     }
 }
 
@@ -477,8 +546,35 @@ void PInternalServiceImplBase<T>::trigger_profile_report(google::protobuf::RpcCo
                                                          PTriggerProfileReportResult* result,
                                                          google::protobuf::Closure* done) {
     ClosureGuard closure_guard(done);
-    auto st = _exec_env->fragment_mgr()->trigger_profile_report(request);
-    st.to_protobuf(result->mutable_status());
+    result->mutable_status()->set_status_code(TStatusCode::OK);
+
+    TUniqueId query_id;
+    DCHECK(request->has_query_id());
+    query_id.__set_hi(request->query_id().hi());
+    query_id.__set_lo(request->query_id().lo());
+
+    auto&& query_ctx = _exec_env->query_context_mgr()->get(query_id);
+    if (query_ctx == nullptr) {
+        LOG(WARNING) << "query context is null, query_id=" << print_id(query_id);
+        result->mutable_status()->set_status_code(TStatusCode::NOT_FOUND);
+        return;
+    }
+
+    for (size_t i = 0; i < request->instance_ids_size(); i++) {
+        TUniqueId instance_id;
+        instance_id.__set_hi(request->instance_ids(i).hi());
+        instance_id.__set_lo(request->instance_ids(i).lo());
+
+        auto&& fragment_ctx = query_ctx->fragment_mgr()->get(instance_id);
+        if (fragment_ctx == nullptr) {
+            LOG(WARNING) << "fragment context is null, query_id=" << print_id(query_id)
+                         << ", instance_id=" << print_id(instance_id);
+            result->mutable_status()->set_status_code(TStatusCode::NOT_FOUND);
+            return;
+        }
+        pipeline::DriverExecutor* driver_executor = _exec_env->wg_driver_executor();
+        driver_executor->report_exec_state(query_ctx.get(), fragment_ctx.get(), Status::OK(), false, true);
+    }
 }
 
 template <typename T>
@@ -493,60 +589,53 @@ void PInternalServiceImplBase<T>::collect_query_statistics(google::protobuf::Rpc
 template <typename T>
 void PInternalServiceImplBase<T>::get_info(google::protobuf::RpcController* controller, const PProxyRequest* request,
                                            PProxyResult* response, google::protobuf::Closure* done) {
-    ClosureGuard closure_guard(done);
-
-    GenericCountDownLatch<bthread::Mutex, bthread::ConditionVariable> latch(1);
-
     int timeout_ms =
             request->has_timeout() ? request->timeout() * 1000 : config::routine_load_kafka_timeout_second * 1000;
 
-    // watch estimates the interval before the task is actually executed.
-    MonotonicStopWatch watch;
-    watch.start();
+    auto task = [this, request, response, done, timeout_ms]() {
+        this->_get_info_impl(request, response, done, timeout_ms);
+    };
 
-    if (!_async_thread_pool.try_offer([&]() {
-            timeout_ms -= watch.elapsed_time() / 1000 / 1000;
-            _get_info_impl(request, response, &latch, timeout_ms);
-        })) {
+    auto st = _exec_env->load_rpc_pool()->submit_func(std::move(task));
+    if (!st.ok()) {
+        LOG(WARNING) << "get kafka info: " << st << " ,timeout: " << timeout_ms
+                     << ", thread pool size: " << _exec_env->load_rpc_pool()->num_threads();
+        ClosureGuard closure_guard(done);
         Status::ServiceUnavailable(
-                "too busy to get kafka info, please check the kafka broker status, or set "
-                "internal_service_async_thread_num bigger")
+                fmt::format("too busy to get kafka info, please check the kafka broker status, timeout ms: {}",
+                            timeout_ms))
                 .to_protobuf(response->mutable_status());
-        return;
     }
-
-    latch.wait();
 }
 
 template <typename T>
-void PInternalServiceImplBase<T>::_get_info_impl(
-        const PProxyRequest* request, PProxyResult* response,
-        GenericCountDownLatch<bthread::Mutex, bthread::ConditionVariable>* latch, int timeout_ms) {
-    DeferOp defer([latch] { latch->count_down(); });
+void PInternalServiceImplBase<T>::_get_info_impl(const PProxyRequest* request, PProxyResult* response,
+                                                 google::protobuf::Closure* done, int timeout_ms) {
+    ClosureGuard closure_guard(done);
 
     if (timeout_ms <= 0) {
         Status::TimedOut("get kafka info timeout").to_protobuf(response->mutable_status());
         return;
     }
-
+    Status st = Status::OK();
+    std::string group_id;
+    MonotonicStopWatch watch;
+    watch.start();
     if (request->has_kafka_meta_request()) {
         std::vector<int32_t> partition_ids;
-        Status st = _exec_env->routine_load_task_executor()->get_kafka_partition_meta(request->kafka_meta_request(),
-                                                                                      &partition_ids, timeout_ms);
+        st = _exec_env->routine_load_task_executor()->get_kafka_partition_meta(request->kafka_meta_request(),
+                                                                               &partition_ids, timeout_ms, &group_id);
         if (st.ok()) {
             PKafkaMetaProxyResult* kafka_result = response->mutable_kafka_meta_result();
             for (int32_t id : partition_ids) {
                 kafka_result->add_partition_ids(id);
             }
         }
-        st.to_protobuf(response->mutable_status());
-        return;
-    }
-    if (request->has_kafka_offset_request()) {
+    } else if (request->has_kafka_offset_request()) {
         std::vector<int64_t> beginning_offsets;
         std::vector<int64_t> latest_offsets;
-        Status st = _exec_env->routine_load_task_executor()->get_kafka_partition_offset(
-                request->kafka_offset_request(), &beginning_offsets, &latest_offsets, timeout_ms);
+        st = _exec_env->routine_load_task_executor()->get_kafka_partition_offset(
+                request->kafka_offset_request(), &beginning_offsets, &latest_offsets, timeout_ms, &group_id);
         if (st.ok()) {
             auto result = response->mutable_kafka_offset_result();
             for (int i = 0; i < beginning_offsets.size(); i++) {
@@ -555,24 +644,19 @@ void PInternalServiceImplBase<T>::_get_info_impl(
                 result->add_latest_offsets(latest_offsets[i]);
             }
         }
-        st.to_protobuf(response->mutable_status());
-        return;
-    }
-    if (request->has_kafka_offset_batch_request()) {
-        MonotonicStopWatch watch;
-        watch.start();
+    } else if (request->has_kafka_offset_batch_request()) {
         for (const auto& offset_req : request->kafka_offset_batch_request().requests()) {
             std::vector<int64_t> beginning_offsets;
             std::vector<int64_t> latest_offsets;
 
             auto left_ms = timeout_ms - watch.elapsed_time() / 1000 / 1000;
             if (left_ms <= 0) {
-                Status::TimedOut("get kafka info timeout").to_protobuf(response->mutable_status());
-                return;
+                st = Status::TimedOut("get kafka offset batch timeout");
+                break;
             }
 
-            Status st = _exec_env->routine_load_task_executor()->get_kafka_partition_offset(
-                    offset_req, &beginning_offsets, &latest_offsets, left_ms);
+            st = _exec_env->routine_load_task_executor()->get_kafka_partition_offset(
+                    offset_req, &beginning_offsets, &latest_offsets, left_ms, &group_id);
             auto offset_result = response->mutable_kafka_offset_batch_result()->add_results();
             if (st.ok()) {
                 for (int i = 0; i < beginning_offsets.size(); i++) {
@@ -582,48 +666,45 @@ void PInternalServiceImplBase<T>::_get_info_impl(
                 }
             } else {
                 response->clear_kafka_offset_batch_result();
-                st.to_protobuf(response->mutable_status());
-                return;
+                break;
             }
         }
     }
-    Status::OK().to_protobuf(response->mutable_status());
+    st.to_protobuf(response->mutable_status());
+    if (!st.ok()) {
+        LOG(WARNING) << "group id " << group_id << " get kafka info timeout. used time(ms) "
+                     << watch.elapsed_time() / 1000 / 1000 << ". error: " << st.to_string();
+    }
 }
 
 template <typename T>
 void PInternalServiceImplBase<T>::get_pulsar_info(google::protobuf::RpcController* controller,
                                                   const PPulsarProxyRequest* request, PPulsarProxyResult* response,
                                                   google::protobuf::Closure* done) {
-    ClosureGuard closure_guard(done);
-
-    GenericCountDownLatch<bthread::Mutex, bthread::ConditionVariable> latch(1);
-
     int timeout_ms =
             request->has_timeout() ? request->timeout() * 1000 : config::routine_load_pulsar_timeout_second * 1000;
 
-    // watch estimates the interval before the task is actually executed.
-    MonotonicStopWatch watch;
-    watch.start();
+    auto task = [this, request, response, done, timeout_ms]() {
+        this->_get_pulsar_info_impl(request, response, done, timeout_ms);
+    };
 
-    if (!_async_thread_pool.try_offer([&]() {
-            timeout_ms -= watch.elapsed_time() / 1000 / 1000;
-            _get_pulsar_info_impl(request, response, &latch, timeout_ms);
-        })) {
-        Status::ServiceUnavailable(
-                "too busy to get pulsar info, please check the pulsar service status, or set "
-                "internal_service_async_thread_num bigger")
+    auto st = _exec_env->load_rpc_pool()->submit_func(std::move(task));
+    if (!st.ok()) {
+        LOG(WARNING) << "get pulsar info: " << st << " ,timeout: " << timeout_ms
+                     << ", thread pool size: " << _exec_env->load_rpc_pool()->num_threads();
+        ClosureGuard closure_guard(done);
+        Status::ServiceUnavailable(fmt::format("too busy to get pulsar info, please check the pulsar status, "
+                                               "timeout ms: {}",
+                                               timeout_ms))
                 .to_protobuf(response->mutable_status());
-        return;
     }
-
-    latch.wait();
 }
 
 template <typename T>
-void PInternalServiceImplBase<T>::_get_pulsar_info_impl(
-        const PPulsarProxyRequest* request, PPulsarProxyResult* response,
-        GenericCountDownLatch<bthread::Mutex, bthread::ConditionVariable>* latch, int timeout_ms) {
-    DeferOp defer([latch] { latch->count_down(); });
+void PInternalServiceImplBase<T>::_get_pulsar_info_impl(const PPulsarProxyRequest* request,
+                                                        PPulsarProxyResult* response, google::protobuf::Closure* done,
+                                                        int timeout_ms) {
+    ClosureGuard closure_guard(done);
 
     if (timeout_ms <= 0) {
         Status::TimedOut("get pulsar info timeout").to_protobuf(response->mutable_status());
@@ -676,6 +757,93 @@ void PInternalServiceImplBase<T>::_get_pulsar_info_impl(
         }
     }
     Status::OK().to_protobuf(response->mutable_status());
+}
+
+template <typename T>
+void PInternalServiceImplBase<T>::get_file_schema(google::protobuf::RpcController* controller,
+                                                  const PGetFileSchemaRequest* request, PGetFileSchemaResult* response,
+                                                  google::protobuf::Closure* done) {
+    auto task = [=]() { this->_get_file_schema(controller, request, response, done); };
+
+    auto st = _exec_env->load_rpc_pool()->submit_func(std::move(task));
+    if (!st.ok()) {
+        LOG(WARNING) << "get file schema: " << st
+                     << ", thread pool size: " << _exec_env->load_rpc_pool()->num_threads();
+        ClosureGuard closure_guard(done);
+        Status::ServiceUnavailable("too busy to get file schema").to_protobuf(response->mutable_status());
+    }
+}
+
+template <typename T>
+void PInternalServiceImplBase<T>::_get_file_schema(google::protobuf::RpcController* controller,
+                                                   const PGetFileSchemaRequest* request, PGetFileSchemaResult* response,
+                                                   google::protobuf::Closure* done) {
+    ClosureGuard closure_guard(done);
+    TGetFileSchemaRequest t_request;
+
+    auto st = Status::OK();
+    DeferOp defer1([&st, &response] { st.to_protobuf(response->mutable_status()); });
+
+    {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        auto ser_request = cntl->request_attachment().to_string();
+        const auto* buf = (const uint8_t*)ser_request.data();
+        uint32_t len = ser_request.size();
+        st = deserialize_thrift_msg(buf, &len, TProtocolType::BINARY, &t_request);
+        if (!st.ok()) {
+            LOG(WARNING) << "deserialize thrift message error: " << st;
+            return;
+        }
+    }
+    const auto& scan_range = t_request.scan_range.broker_scan_range;
+    if (scan_range.ranges.empty()) {
+        st = Status::InvalidArgument("No file to scan. Please check the specified path.");
+        return;
+    }
+
+    RuntimeState state(_exec_env);
+    RuntimeProfile profile{"dummy_profile", false};
+    ScannerCounter counter{};
+    std::unique_ptr<FileScanner> p_scanner;
+
+    auto tp = scan_range.ranges[0].format_type;
+    {
+        switch (tp) {
+        case TFileFormatType::FORMAT_PARQUET:
+            p_scanner = std::make_unique<ParquetScanner>(&state, &profile, scan_range, &counter, true);
+            break;
+
+        case TFileFormatType::FORMAT_ORC:
+            p_scanner = std::make_unique<ORCScanner>(&state, &profile, scan_range, &counter, true);
+            break;
+
+        default:
+            auto err_msg = fmt::format("get file schema failed, format: {} not supported", to_string(tp));
+            LOG(WARNING) << err_msg;
+            st = Status::InvalidArgument(err_msg);
+            return;
+        }
+    }
+
+    st = p_scanner->open();
+    if (!st.ok()) {
+        LOG(WARNING) << "open file scanner failed: " << st;
+        return;
+    }
+
+    DeferOp defer2([&p_scanner] { p_scanner->close(); });
+
+    std::vector<SlotDescriptor> schema;
+    st = p_scanner->get_schema(&schema);
+    if (!st.ok()) {
+        LOG(WARNING) << "get schema failed: " << st;
+        return;
+    }
+
+    for (const auto& slot : schema) {
+        slot.to_protobuf(response->add_schema());
+    }
+    return;
 }
 
 template <typename T>
@@ -905,6 +1073,54 @@ void PInternalServiceImplBase<T>::local_tablet_reader_scan_get_next(google::prot
                                                                     google::protobuf::Closure* done) {
     ClosureGuard closure_guard(done);
     response->mutable_status()->set_status_code(TStatusCode::NOT_IMPLEMENTED_ERROR);
+}
+
+template <typename T>
+void PInternalServiceImplBase<T>::execute_command(google::protobuf::RpcController* controller,
+                                                  const ExecuteCommandRequestPB* request,
+                                                  ExecuteCommandResultPB* response, google::protobuf::Closure* done) {
+    ClosureGuard closure_guard(done);
+    Status st = starrocks::execute_command(request->command(), request->params(), response->mutable_result());
+    if (!st.ok()) {
+        LOG(WARNING) << "execute_command failed, errmsg=" << st.to_string();
+    }
+    st.to_protobuf(response->mutable_status());
+}
+
+template <typename T>
+void PInternalServiceImplBase<T>::update_fail_point_status(google::protobuf::RpcController* controller,
+                                                           const PUpdateFailPointStatusRequest* request,
+                                                           PUpdateFailPointStatusResponse* response,
+                                                           google::protobuf::Closure* done) {
+    ClosureGuard closure_guard(done);
+#ifdef FIU_ENABLE
+    const auto name = request->fail_point_name();
+    auto fp = starrocks::failpoint::FailPointRegistry::GetInstance()->get(name);
+    if (fp == nullptr) {
+        Status::InvalidArgument(fmt::format("FailPoint {} is not existed.", name))
+                .to_protobuf(response->mutable_status());
+        return;
+    }
+    fp->setMode(request->trigger_mode());
+    Status::OK().to_protobuf(response->mutable_status());
+#else
+    Status::NotSupported("FailPoint is not supported, need re-compile BE with ENABLE_FAULT_INJECTION")
+            .to_protobuf(response->mutable_status());
+#endif
+}
+
+template <typename T>
+void PInternalServiceImplBase<T>::list_fail_point(google::protobuf::RpcController* controller,
+                                                  const PListFailPointRequest* request,
+                                                  PListFailPointResponse* response, google::protobuf::Closure* done) {
+    ClosureGuard closure_guard(done);
+#ifdef FIU_ENABLE
+    starrocks::failpoint::FailPointRegistry::GetInstance()->iterate([&](starrocks::failpoint::FailPoint* fp) {
+        auto fp_info = response->add_fail_points();
+        *fp_info = fp->to_pb();
+    });
+#endif
+    Status::OK().to_protobuf(response->mutable_status());
 }
 
 template class PInternalServiceImplBase<PInternalService>;

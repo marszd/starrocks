@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.rule;
 
 import com.google.common.collect.ImmutableList;
@@ -42,10 +41,12 @@ import com.starrocks.sql.optimizer.rule.implementation.MetaScanImplementationRul
 import com.starrocks.sql.optimizer.rule.implementation.MysqlScanImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.NestLoopJoinImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.OlapScanImplementationRule;
+import com.starrocks.sql.optimizer.rule.implementation.PaimonScanImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.ProjectImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.RepeatImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.SchemaScanImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.TableFunctionImplementationRule;
+import com.starrocks.sql.optimizer.rule.implementation.TableFunctionTableScanImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.TopNImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.UnionImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.ValuesImplementationRule;
@@ -58,34 +59,40 @@ import com.starrocks.sql.optimizer.rule.transformation.CollectCTEConsumeRule;
 import com.starrocks.sql.optimizer.rule.transformation.CollectCTEProduceRule;
 import com.starrocks.sql.optimizer.rule.transformation.DistributionPruneRule;
 import com.starrocks.sql.optimizer.rule.transformation.EliminateLimitZeroRule;
-import com.starrocks.sql.optimizer.rule.transformation.EsScanPartitionPruneRule;
 import com.starrocks.sql.optimizer.rule.transformation.ExistentialApply2JoinRule;
 import com.starrocks.sql.optimizer.rule.transformation.ExistentialApply2OuterJoinRule;
+import com.starrocks.sql.optimizer.rule.transformation.ExternalScanPartitionPruneRule;
+import com.starrocks.sql.optimizer.rule.transformation.GroupByCountDistinctDataSkewEliminateRule;
 import com.starrocks.sql.optimizer.rule.transformation.InlineOneCTEConsumeRule;
 import com.starrocks.sql.optimizer.rule.transformation.IntersectAddDistinctRule;
 import com.starrocks.sql.optimizer.rule.transformation.JoinAssociativityRule;
 import com.starrocks.sql.optimizer.rule.transformation.JoinCommutativityRule;
 import com.starrocks.sql.optimizer.rule.transformation.JoinCommutativityWithoutInnerRule;
 import com.starrocks.sql.optimizer.rule.transformation.JoinLeftAsscomRule;
+import com.starrocks.sql.optimizer.rule.transformation.LimitPruneTabletsRule;
 import com.starrocks.sql.optimizer.rule.transformation.MergeApplyWithTableFunction;
 import com.starrocks.sql.optimizer.rule.transformation.MergeLimitDirectRule;
 import com.starrocks.sql.optimizer.rule.transformation.MergeLimitWithLimitRule;
 import com.starrocks.sql.optimizer.rule.transformation.MergeLimitWithSortRule;
 import com.starrocks.sql.optimizer.rule.transformation.MergeTwoFiltersRule;
 import com.starrocks.sql.optimizer.rule.transformation.MergeTwoProjectRule;
-import com.starrocks.sql.optimizer.rule.transformation.PartitionPredicatePrune;
 import com.starrocks.sql.optimizer.rule.transformation.PartitionPruneRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneAggregateColumnsRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneAssertOneRowRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneCTEConsumeColumnsRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneCTEProduceRule;
+import com.starrocks.sql.optimizer.rule.transformation.PruneEmptyDirectRule;
+import com.starrocks.sql.optimizer.rule.transformation.PruneEmptyExceptRule;
+import com.starrocks.sql.optimizer.rule.transformation.PruneEmptyIntersectRule;
+import com.starrocks.sql.optimizer.rule.transformation.PruneEmptyJoinRule;
+import com.starrocks.sql.optimizer.rule.transformation.PruneEmptyScanRule;
+import com.starrocks.sql.optimizer.rule.transformation.PruneEmptyUnionRule;
+import com.starrocks.sql.optimizer.rule.transformation.PruneEmptyWindowRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneExceptColumnsRule;
-import com.starrocks.sql.optimizer.rule.transformation.PruneExceptEmptyRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneFilterColumnsRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneGroupByKeysRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneHDFSScanColumnRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneIntersectColumnsRule;
-import com.starrocks.sql.optimizer.rule.transformation.PruneIntersectEmptyRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneJoinColumnsRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneProjectColumnsRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneProjectEmptyRule;
@@ -96,7 +103,6 @@ import com.starrocks.sql.optimizer.rule.transformation.PruneTableFunctionColumnR
 import com.starrocks.sql.optimizer.rule.transformation.PruneTopNColumnsRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneTrueFilterRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneUnionColumnsRule;
-import com.starrocks.sql.optimizer.rule.transformation.PruneUnionEmptyRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneValuesColumnsRule;
 import com.starrocks.sql.optimizer.rule.transformation.PruneWindowColumnsRule;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownApplyAggFilterRule;
@@ -110,7 +116,6 @@ import com.starrocks.sql.optimizer.rule.transformation.PushDownLimitCTEAnchor;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownLimitDirectRule;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownLimitJoinRule;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownLimitUnionRule;
-import com.starrocks.sql.optimizer.rule.transformation.PushDownMinMaxConjunctsRule;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownPredicateAggRule;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownPredicateCTEAnchor;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownPredicateCTEConsumeRule;
@@ -124,28 +129,29 @@ import com.starrocks.sql.optimizer.rule.transformation.PushDownPredicateTableFun
 import com.starrocks.sql.optimizer.rule.transformation.PushDownPredicateToExternalTableScanRule;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownPredicateUnionRule;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownPredicateWindowRule;
+import com.starrocks.sql.optimizer.rule.transformation.PushDownProjectLimitRule;
 import com.starrocks.sql.optimizer.rule.transformation.PushDownProjectToCTEAnchorRule;
 import com.starrocks.sql.optimizer.rule.transformation.QuantifiedApply2JoinRule;
 import com.starrocks.sql.optimizer.rule.transformation.QuantifiedApply2OuterJoinRule;
-import com.starrocks.sql.optimizer.rule.transformation.RemoteScanPartitionPruneRule;
 import com.starrocks.sql.optimizer.rule.transformation.ReorderIntersectRule;
 import com.starrocks.sql.optimizer.rule.transformation.RewriteBitmapCountDistinctRule;
+import com.starrocks.sql.optimizer.rule.transformation.RewriteCountIfFunction;
 import com.starrocks.sql.optimizer.rule.transformation.RewriteDuplicateAggregateFnRule;
 import com.starrocks.sql.optimizer.rule.transformation.RewriteHllCountDistinctRule;
-import com.starrocks.sql.optimizer.rule.transformation.RewriteMinMaxAggToMetaScanRule;
 import com.starrocks.sql.optimizer.rule.transformation.RewriteMultiDistinctByCTERule;
 import com.starrocks.sql.optimizer.rule.transformation.RewriteMultiDistinctRule;
+import com.starrocks.sql.optimizer.rule.transformation.RewriteSimpleAggToMetaScanRule;
 import com.starrocks.sql.optimizer.rule.transformation.RewriteSumByAssociativeRule;
 import com.starrocks.sql.optimizer.rule.transformation.ScalarApply2AnalyticRule;
 import com.starrocks.sql.optimizer.rule.transformation.ScalarApply2JoinRule;
 import com.starrocks.sql.optimizer.rule.transformation.SplitAggregateRule;
 import com.starrocks.sql.optimizer.rule.transformation.SplitLimitRule;
 import com.starrocks.sql.optimizer.rule.transformation.SplitTopNRule;
-import com.starrocks.sql.optimizer.rule.transformation.materialization.rule.AggregateAggregateScanRule;
 import com.starrocks.sql.optimizer.rule.transformation.materialization.rule.AggregateJoinRule;
 import com.starrocks.sql.optimizer.rule.transformation.materialization.rule.AggregateScanRule;
 import com.starrocks.sql.optimizer.rule.transformation.materialization.rule.OnlyJoinRule;
 import com.starrocks.sql.optimizer.rule.transformation.materialization.rule.OnlyScanRule;
+import com.starrocks.sql.optimizer.rule.transformation.pruner.CboTablePruneRule;
 
 import java.util.List;
 import java.util.Map;
@@ -160,11 +166,13 @@ public class RuleSet {
             new IcebergScanImplementationRule(),
             new HudiScanImplementationRule(),
             new DeltaLakeScanImplementationRule(),
+            new PaimonScanImplementationRule(),
             new SchemaScanImplementationRule(),
             new MysqlScanImplementationRule(),
             new EsScanImplementationRule(),
             new MetaScanImplementationRule(),
             new JDBCScanImplementationRule(),
+            new TableFunctionTableScanImplementationRule(),
             new HashAggImplementationRule(),
             new ProjectImplementationRule(),
             new TopNImplementationRule(),
@@ -196,13 +204,14 @@ public class RuleSet {
 
     static {
         REWRITE_RULES.put(RuleSetType.MERGE_LIMIT, ImmutableList.of(
+                new PushDownProjectLimitRule(),
+                new EliminateLimitZeroRule(), // should before MergeLimitWithSortRule
                 new MergeLimitWithSortRule(),
                 new SplitLimitRule(),
                 new PushDownLimitJoinRule(),
                 new PushDownLimitCTEAnchor(),
                 new PushDownLimitUnionRule(),
                 new MergeLimitWithLimitRule(),
-                new EliminateLimitZeroRule(),
                 PushDownLimitDirectRule.PROJECT,
                 PushDownLimitDirectRule.ASSERT_ONE_ROW,
                 PushDownLimitDirectRule.CTE_CONSUME,
@@ -213,6 +222,7 @@ public class RuleSet {
                 MergeLimitDirectRule.HUDI_SCAN,
                 MergeLimitDirectRule.DELTALAKE_SCAN,
                 MergeLimitDirectRule.FILE_SCAN,
+                MergeLimitDirectRule.PAIMON_SCAN,
                 MergeLimitDirectRule.SCHEMA_SCAN,
                 MergeLimitDirectRule.MYSQL_SCAN,
                 MergeLimitDirectRule.ES_SCAN,
@@ -222,24 +232,21 @@ public class RuleSet {
                 MergeLimitDirectRule.EXCEPT,
                 MergeLimitDirectRule.VALUES,
                 MergeLimitDirectRule.FILTER,
-                MergeLimitDirectRule.TABLE_FUNCTION
+                MergeLimitDirectRule.TABLE_FUNCTION,
+                MergeLimitDirectRule.TABLE_FUNCTION_TABLE_SCAN
         ));
 
         REWRITE_RULES.put(RuleSetType.PARTITION_PRUNE, ImmutableList.of(
                 new PartitionPruneRule(),
                 new DistributionPruneRule(),
-                RemoteScanPartitionPruneRule.HIVE_SCAN,
-                RemoteScanPartitionPruneRule.HUDI_SCAN,
-                RemoteScanPartitionPruneRule.ICEBERG_SCAN,
-                RemoteScanPartitionPruneRule.DELTALAKE_SCAN,
-                RemoteScanPartitionPruneRule.FILE_SCAN,
-                PushDownMinMaxConjunctsRule.HIVE_SCAN,
-                PushDownMinMaxConjunctsRule.HUDI_SCAN,
-                PushDownMinMaxConjunctsRule.ICEBERG_SCAN,
-                PushDownMinMaxConjunctsRule.DELTALAKE_SCAN,
-                PushDownMinMaxConjunctsRule.FILE_SCAN,
-                new EsScanPartitionPruneRule(),
-                new PartitionPredicatePrune()
+                ExternalScanPartitionPruneRule.HIVE_SCAN,
+                ExternalScanPartitionPruneRule.HUDI_SCAN,
+                ExternalScanPartitionPruneRule.ICEBERG_SCAN,
+                ExternalScanPartitionPruneRule.DELTALAKE_SCAN,
+                ExternalScanPartitionPruneRule.FILE_SCAN,
+                ExternalScanPartitionPruneRule.ES_SCAN,
+                ExternalScanPartitionPruneRule.PAIMON_SCAN,
+                new LimitPruneTabletsRule()
         ));
 
         REWRITE_RULES.put(RuleSetType.PRUNE_COLUMNS, ImmutableList.of(
@@ -252,6 +259,8 @@ public class RuleSet {
                 PruneHDFSScanColumnRule.DELTALAKE_SCAN,
                 PruneHDFSScanColumnRule.FILE_SCAN,
                 PruneHDFSScanColumnRule.HUDI_SCAN,
+                PruneHDFSScanColumnRule.TABLE_FUNCTION_TABLE_SCAN,
+                PruneHDFSScanColumnRule.PAIMON_SCAN,
                 PruneScanColumnRule.JDBC_SCAN,
                 PruneScanColumnRule.BINLOG_SCAN,
                 new PruneProjectColumnsRule(),
@@ -280,10 +289,12 @@ public class RuleSet {
                 PushDownPredicateScanRule.HUDI_SCAN,
                 PushDownPredicateScanRule.DELTALAKE_SCAN,
                 PushDownPredicateScanRule.FILE_SCAN,
+                PushDownPredicateScanRule.PAIMON_SCAN,
                 PushDownPredicateScanRule.SCHEMA_SCAN,
                 PushDownPredicateScanRule.ES_SCAN,
                 PushDownPredicateScanRule.META_SCAN,
                 PushDownPredicateScanRule.BINLOG_SCAN,
+                PushDownPredicateScanRule.TABLE_FUNCTION_TABLE_SCAN,
                 new PushDownPredicateAggRule(),
                 new PushDownPredicateWindowRule(),
                 new PushDownPredicateJoinRule(),
@@ -334,19 +345,14 @@ public class RuleSet {
                 new RewriteBitmapCountDistinctRule(),
                 new RewriteHllCountDistinctRule(),
                 new RewriteDuplicateAggregateFnRule(),
-                new RewriteMinMaxAggToMetaScanRule(),
-                new RewriteSumByAssociativeRule()
+                new RewriteSimpleAggToMetaScanRule(),
+                new RewriteSumByAssociativeRule(),
+                new RewriteCountIfFunction()
         ));
 
         REWRITE_RULES.put(RuleSetType.MULTI_DISTINCT_REWRITE, ImmutableList.of(
                 new RewriteMultiDistinctByCTERule(),
                 new RewriteMultiDistinctRule()
-        ));
-
-        REWRITE_RULES.put(RuleSetType.PRUNE_SET_OPERATOR, ImmutableList.of(
-                new PruneUnionEmptyRule(),
-                new PruneIntersectEmptyRule(),
-                new PruneExceptEmptyRule()
         ));
 
         REWRITE_RULES.put(RuleSetType.PRUNE_PROJECT, ImmutableList.of(
@@ -372,20 +378,35 @@ public class RuleSet {
         ));
 
         REWRITE_RULES.put(RuleSetType.SINGLE_TABLE_MV_REWRITE, ImmutableList.of(
-                OnlyScanRule.getInstance(),
                 AggregateScanRule.getInstance(),
-                AggregateAggregateScanRule.getInstance()
+                OnlyScanRule.getInstance()
         ));
 
         REWRITE_RULES.put(RuleSetType.MULTI_TABLE_MV_REWRITE, ImmutableList.of(
-                OnlyJoinRule.getInstance(),
-                AggregateJoinRule.getInstance()
+                AggregateJoinRule.getInstance(),
+                OnlyJoinRule.getInstance()
+        ));
+
+        REWRITE_RULES.put(RuleSetType.PRUNE_EMPTY_OPERATOR, ImmutableList.of(
+                PruneEmptyScanRule.OLAP_SCAN,
+                PruneEmptyScanRule.HIVE_SCAN,
+                PruneEmptyScanRule.HUDI_SCAN,
+                PruneEmptyScanRule.ICEBERG_SCAN,
+                PruneEmptyScanRule.PAIMON_SCAN,
+                PruneEmptyJoinRule.JOIN_LEFT_EMPTY,
+                PruneEmptyJoinRule.JOIN_RIGHT_EMPTY,
+                new PruneEmptyDirectRule(),
+                new PruneEmptyUnionRule(),
+                new PruneEmptyIntersectRule(),
+                new PruneEmptyExceptRule(),
+                new PruneEmptyWindowRule()
         ));
     }
 
     public RuleSet() {
         // Add common transform rule
         transformRules.add(SplitAggregateRule.getInstance());
+        transformRules.add(GroupByCountDistinctDataSkewEliminateRule.getInstance());
         transformRules.add(SplitTopNRule.getInstance());
     }
 
@@ -396,11 +417,15 @@ public class RuleSet {
 
     public void addOuterJoinTransformationRules() {
         transformRules.add(JoinAssociativityRule.OUTER_JOIN_ASSOCIATIVITY_RULE);
-        transformRules.add(JoinLeftAsscomRule.getInstance());
+        transformRules.add(JoinLeftAsscomRule.OUTER_JOIN_LEFT_ASSCOM_RULE);
     }
 
-    public void addJoinCommutativityWithOutInnerRule() {
+    public void addJoinCommutativityWithoutInnerRule() {
         transformRules.add(JoinCommutativityWithoutInnerRule.getInstance());
+    }
+
+    public void addCboTablePruneRule() {
+        transformRules.add(CboTablePruneRule.getInstance());
     }
 
     public void addMultiTableMvRewriteRule() {
@@ -442,6 +467,10 @@ public class RuleSet {
         // TODO: implement merge join
         // this.implementRules.add(MergeJoinImplementationRule.getInstance());
         this.implementRules.add(NestLoopJoinImplementationRule.getInstance());
+    }
+
+    public void addSingleTableMvRewriteRule() {
+        transformRules.addAll(getRewriteRulesByType(RuleSetType.SINGLE_TABLE_MV_REWRITE));
     }
 
 }

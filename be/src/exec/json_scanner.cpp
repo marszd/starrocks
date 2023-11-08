@@ -22,6 +22,7 @@
 #include <sstream>
 #include <utility>
 
+#include "column/adaptive_nullable_column.h"
 #include "column/chunk.h"
 #include "column/column_helper.h"
 #include "exec/json_parser.h"
@@ -39,7 +40,6 @@
 
 namespace starrocks {
 
-const int64_t MAX_ERROR_LINES_IN_FILE = 50;
 const int64_t MAX_ERROR_LOG_LENGTH = 64;
 
 JsonScanner::JsonScanner(RuntimeState* state, RuntimeProfile* profile, const TBrokerScanRange& scan_range,
@@ -65,10 +65,10 @@ Status JsonScanner::open() {
     const TBrokerRangeDesc& range = _scan_range.ranges[0];
 
     if (range.__isset.jsonpaths) {
-        RETURN_IF_ERROR(_parse_json_paths(range.jsonpaths, &_json_paths));
+        RETURN_IF_ERROR(parse_json_paths(range.jsonpaths, &_json_paths));
     }
     if (range.__isset.json_root) {
-        JsonFunctions::parse_json_paths(range.json_root, &_root_paths);
+        RETURN_IF_ERROR(JsonFunctions::parse_json_paths(range.json_root, &_root_paths));
     }
     if (range.__isset.strip_outer_array) {
         _strip_outer_array = range.strip_outer_array;
@@ -81,7 +81,6 @@ StatusOr<ChunkPtr> JsonScanner::get_next() {
     SCOPED_RAW_TIMER(&_counter->total_ns);
     ChunkPtr src_chunk;
     RETURN_IF_ERROR(_create_src_chunk(&src_chunk));
-    src_chunk->reserve(_max_chunk_size);
 
     if (_cur_file_eof) {
         RETURN_IF_ERROR(_open_next_reader());
@@ -113,6 +112,7 @@ StatusOr<ChunkPtr> JsonScanner::get_next() {
             return status;
         }
     }
+    _materialize_src_chunk_adaptive_nullable_column(src_chunk);
     ASSIGN_OR_RETURN(auto cast_chunk, _cast_chunk(src_chunk));
     return materialize(src_chunk, cast_chunk);
 }
@@ -239,8 +239,7 @@ Status JsonScanner::_construct_cast_exprs() {
     return Status::OK();
 }
 
-Status JsonScanner::_parse_json_paths(const std::string& jsonpath,
-                                      std::vector<std::vector<SimpleJsonPath>>* path_vecs) {
+Status JsonScanner::parse_json_paths(const std::string& jsonpath, std::vector<std::vector<SimpleJsonPath>>* path_vecs) {
     try {
         simdjson::dom::parser parser;
         simdjson::dom::element elem = parser.parse(jsonpath.c_str(), jsonpath.length());
@@ -255,7 +254,7 @@ Status JsonScanner::_parse_json_paths(const std::string& jsonpath,
             std::vector<SimpleJsonPath> parsed_paths;
             const char* cstr = path.get_c_str();
 
-            JsonFunctions::parse_json_paths(std::string(cstr), &parsed_paths);
+            RETURN_IF_ERROR(JsonFunctions::parse_json_paths(std::string(cstr), &parsed_paths));
             path_vecs->emplace_back(std::move(parsed_paths));
         }
         return Status::OK();
@@ -277,12 +276,23 @@ Status JsonScanner::_create_src_chunk(ChunkPtr* chunk) {
             continue;
         }
 
-        // The columns in source chunk are all in NullableColumn type;
-        auto col = ColumnHelper::create_column(_json_types[column_pos], true);
+        // The columns in source chunk are all in AdaptiveNullableColumn type;
+        auto col = ColumnHelper::create_column(_json_types[column_pos], true, false, 0, true);
         (*chunk)->append_column(col, slot_desc->id());
     }
 
     return Status::OK();
+}
+
+void JsonScanner::_materialize_src_chunk_adaptive_nullable_column(ChunkPtr& chunk) {
+    chunk->materialized_nullable();
+    for (int i = 0; i < chunk->num_columns(); i++) {
+        AdaptiveNullableColumn* adaptive_column =
+                down_cast<AdaptiveNullableColumn*>(chunk->get_column_by_index(i).get());
+        chunk->update_column_by_index(NullableColumn::create(adaptive_column->materialized_raw_data_column(),
+                                                             adaptive_column->materialized_raw_null_column()),
+                                      i);
+    }
 }
 
 Status JsonScanner::_open_next_reader() {
@@ -355,7 +365,7 @@ Status JsonReader::open() {
 }
 
 JsonReader::~JsonReader() {
-    close();
+    (void)close();
 }
 
 Status JsonReader::close() {
@@ -480,6 +490,12 @@ Status JsonReader::_read_rows(Chunk* chunk, int32_t rows_to_read, int32_t* rows_
                 (void)!row.raw_json().get(sv);
                 _state->append_error_msg_to_file(std::string(sv.data(), sv.size()), st.to_string());
                 LOG(WARNING) << "failed to construct row: " << st;
+            }
+            if (_state->enable_log_rejected_record()) {
+                std::string_view sv;
+                (void)!row.raw_json().get(sv);
+                _state->append_rejected_record_to_file(std::string(sv.data(), sv.size()), st.to_string(),
+                                                       _file->filename());
             }
             // Before continuing to process other rows, we need to first clean the fail parsed row.
             chunk->set_num_rows(chunk_row_num);
@@ -634,8 +650,8 @@ Status JsonReader::_construct_row_with_jsonpath(simdjson::ondemand::object* row,
             // it would get an error "Objects and arrays can only be iterated when they are first encountered",
             // Hence, resetting the row object is necessary here.
             row->reset();
-            RETURN_IF_ERROR(add_nullable_column_by_json_object(column, _slot_descs[i]->type(),
-                                                               _slot_descs[i]->col_name(), row, !_strict_mode));
+            RETURN_IF_ERROR(add_adaptive_nullable_column_by_json_object(
+                    column, _slot_descs[i]->type(), _slot_descs[i]->col_name(), row, !_strict_mode));
         } else {
             simdjson::ondemand::value val;
             auto st = JsonFunctions::extract_from_object(*row, _scanner->_json_paths[i], &val);
@@ -688,6 +704,8 @@ Status JsonReader::_read_and_parse_json() {
     {
         SCOPED_RAW_TIMER(&_counter->file_read_ns);
         ASSIGN_OR_RETURN(_parser_buf, stream_file->pipe()->read());
+
+        _state->update_num_bytes_scan_from_source(_parser_buf->remaining());
 
         if (_parser_buf->capacity < _parser_buf->remaining() + simdjson::SIMDJSON_PADDING) {
             // For efficiency reasons, simdjson requires a string with a few bytes (simdjson::SIMDJSON_PADDING) at the end.
@@ -756,7 +774,7 @@ Status JsonReader::_read_and_parse_json() {
 // _construct_column constructs column based on no value.
 Status JsonReader::_construct_column(simdjson::ondemand::value& value, Column* column, const TypeDescriptor& type_desc,
                                      const std::string& col_name) {
-    return add_nullable_column(column, type_desc, col_name, &value, !_strict_mode);
+    return add_adaptive_nullable_column(column, type_desc, col_name, &value, !_strict_mode);
 }
 
 } // namespace starrocks

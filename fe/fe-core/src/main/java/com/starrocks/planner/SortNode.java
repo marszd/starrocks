@@ -87,6 +87,7 @@ public class SortNode extends PlanNode implements RuntimeFilterBuildNode {
     public List<Expr> resolvedTupleExprs;
 
     private final List<RuntimeFilterDescription> buildRuntimeFilters = Lists.newArrayList();
+    private boolean withRuntimeFilters = false;
 
     public void setAnalyticPartitionExprs(List<Expr> exprs) {
         this.analyticPartitionExprs = exprs;
@@ -115,6 +116,10 @@ public class SortNode extends PlanNode implements RuntimeFilterBuildNode {
         this.topNType = topNType;
     }
 
+    public boolean isUseTopN() {
+        return useTopN;
+    }
+
     public long getOffset() {
         return offset;
     }
@@ -140,7 +145,8 @@ public class SortNode extends PlanNode implements RuntimeFilterBuildNode {
     public void buildRuntimeFilters(IdGenerator<RuntimeFilterId> generator, DescriptorTable descTbl) {
         SessionVariable sessionVariable = ConnectContext.get().getSessionVariable();
         // only support the runtime filter in TopN when limit > 0
-        if (limit < 0 || !sessionVariable.getEnableGlobalRuntimeFilter()) {
+        if (limit < 0 || !sessionVariable.getEnableTopNRuntimeFilter() ||
+                getSortInfo().getOrderingExprs().isEmpty()) {
             return;
         }
 
@@ -153,6 +159,7 @@ public class SortNode extends PlanNode implements RuntimeFilterBuildNode {
         rf.setExprOrder(0);
         rf.setJoinMode(JoinNode.DistributionMode.BROADCAST);
         rf.setOnlyLocal(true);
+        rf.setSortInfo(getSortInfo());
         rf.setBuildExpr(orderBy);
         rf.setRuntimeFilterType(RuntimeFilterDescription.RuntimeFilterType.TOPN_FILTER);
 
@@ -161,6 +168,7 @@ public class SortNode extends PlanNode implements RuntimeFilterBuildNode {
                 this.buildRuntimeFilters.add(rf);
             }
         }
+        withRuntimeFilters = !buildRuntimeFilters.isEmpty();
     }
 
     @Override
@@ -191,6 +199,11 @@ public class SortNode extends PlanNode implements RuntimeFilterBuildNode {
 
         msg.sort_node = new TSortNode(sortInfo, useTopN);
         msg.sort_node.setOffset(offset);
+        SessionVariable sessionVariable = ConnectContext.get().getSessionVariable();
+        msg.sort_node.setMax_buffered_rows(sessionVariable.getFullSortMaxBufferedRows());
+        msg.sort_node.setMax_buffered_bytes(sessionVariable.getFullSortMaxBufferedBytes());
+        msg.sort_node.setLate_materialization(sessionVariable.isFullSortLateMaterialization());
+        msg.sort_node.setEnable_parallel_merge(sessionVariable.isEnableParallelMerge());
 
         if (info.getPartitionExprs() != null) {
             msg.sort_node.setPartition_exprs(Expr.treesToThrift(info.getPartitionExprs()));
@@ -332,8 +345,8 @@ public class SortNode extends PlanNode implements RuntimeFilterBuildNode {
     }
 
     @Override
-    public boolean canUsePipeLine() {
-        return getChildren().stream().allMatch(PlanNode::canUsePipeLine);
+    public boolean canUseRuntimeAdaptiveDop() {
+        return !withRuntimeFilters && getChildren().stream().allMatch(PlanNode::canUseRuntimeAdaptiveDop);
     }
 
     @Override

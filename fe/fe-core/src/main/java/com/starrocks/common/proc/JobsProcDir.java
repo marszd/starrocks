@@ -44,7 +44,7 @@ import com.starrocks.catalog.Database;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.load.ExportJob;
 import com.starrocks.load.ExportMgr;
-import com.starrocks.load.loadv2.LoadManager;
+import com.starrocks.load.loadv2.LoadMgr;
 import com.starrocks.server.GlobalStateMgr;
 
 /*
@@ -62,6 +62,7 @@ public class JobsProcDir implements ProcDirInterface {
     private static final String ROLLUP = "rollup";
     private static final String SCHEMA_CHANGE = "schema_change";
     private static final String EXPORT = "export";
+    private static final String OPTIMIZE = "optimize";
 
     private GlobalStateMgr globalStateMgr;
     private Database db;
@@ -85,12 +86,14 @@ public class JobsProcDir implements ProcDirInterface {
         if (jobTypeName.equals(LOAD)) {
             return new LoadProcDir(db);
         } else if (jobTypeName.equals(DELETE)) {
-            return new DeleteInfoProcDir(globalStateMgr.getDeleteHandler(), globalStateMgr.getLoadInstance(),
+            return new DeleteInfoProcDir(globalStateMgr.getDeleteMgr(), globalStateMgr.getLoadInstance(),
                     db.getId());
         } else if (jobTypeName.equals(ROLLUP)) {
             return new RollupProcDir(globalStateMgr.getRollupHandler(), db);
         } else if (jobTypeName.equals(SCHEMA_CHANGE)) {
             return new SchemaChangeProcDir(globalStateMgr.getSchemaChangeHandler(), db);
+        } else if (jobTypeName.equals(OPTIMIZE)) {
+            return new OptimizeProcDir(globalStateMgr.getSchemaChangeHandler(), db);
         } else if (jobTypeName.equals(EXPORT)) {
             return new ExportProcNode(globalStateMgr.getExportMgr(), db);
         } else {
@@ -108,7 +111,7 @@ public class JobsProcDir implements ProcDirInterface {
 
         long dbId = db.getId();
         // load
-        LoadManager loadManager = GlobalStateMgr.getCurrentState().getLoadManager();
+        LoadMgr loadManager = GlobalStateMgr.getCurrentState().getLoadMgr();
         Long pendingNum = loadManager.getLoadJobNum(com.starrocks.load.loadv2.JobState.PENDING, dbId);
         Long runningNum = loadManager.getLoadJobNum(com.starrocks.load.loadv2.JobState.LOADING, dbId);
         Long finishedNum = loadManager.getLoadJobNum(com.starrocks.load.loadv2.JobState.FINISHED, dbId);

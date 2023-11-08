@@ -19,11 +19,14 @@
 namespace starrocks {
 
 class ExecEnv;
-class ThreadPool;
+
+namespace lake {
+class TabletManager;
+}
 
 class LakeServiceImpl : public ::starrocks::lake::LakeService {
 public:
-    explicit LakeServiceImpl(ExecEnv* env);
+    explicit LakeServiceImpl(ExecEnv* env, lake::TabletManager* tablet_mgr);
 
     ~LakeServiceImpl() override;
 
@@ -77,10 +80,20 @@ public:
                            ::starrocks::lake::RestoreSnapshotsResponse* response,
                            ::google::protobuf::Closure* done) override;
 
+    void abort_compaction(::google::protobuf::RpcController* controller,
+                          const ::starrocks::lake::AbortCompactionRequest* request,
+                          ::starrocks::lake::AbortCompactionResponse* response,
+                          ::google::protobuf::Closure* done) override;
+
+    void vacuum(::google::protobuf::RpcController* controller, const ::starrocks::lake::VacuumRequest* request,
+                ::starrocks::lake::VacuumResponse* response, ::google::protobuf::Closure* done) override;
+
+    void vacuum_full(::google::protobuf::RpcController* controller, const ::starrocks::lake::VacuumFullRequest* request,
+                     ::starrocks::lake::VacuumFullResponse* response, ::google::protobuf::Closure* done) override;
+
 private:
     ExecEnv* _env;
-
-    std::unique_ptr<ThreadPool> _compact_thread_pool;
+    lake::TabletManager* _tablet_mgr;
 };
 
 } // namespace starrocks

@@ -77,59 +77,139 @@ public class TrinoQueryTest extends TrinoTestBase {
     }
 
     @Test
+    public void testDateExpression() throws Exception {
+        String sql = "select current_date";
+        analyzeSuccess(sql);
+
+        sql = "select current_time";
+        analyzeSuccess(sql);
+
+        sql = "select current_timestamp";
+        analyzeSuccess(sql);
+
+        sql = "select localtimestamp";
+        analyzeSuccess(sql);
+
+        sql = "select localtime";
+        analyzeSuccess(sql);
+
+        sql = "select timestamp '2021-01-01 00:00:00'";
+        assertPlanContains(sql, "'2021-01-01 00:00:00'");
+
+        sql = "select timestamp '2021-01-01 10:01:02.123456'";
+        assertPlanContains(sql, "'2021-01-01 10:01:02.123456'");
+
+        sql = "select date '2021-01-01'";
+        assertPlanContains(sql, "'2021-01-01'");
+
+        sql = "select timestamp '2023-07-01'";
+        assertPlanContains(sql, "'2023-07-01 00:00:00'");
+    }
+
+    @Test
     public void testCastExpression() throws Exception {
         String sql = "select cast(tb as varchar(10)) from tall";
-        assertPlanContains(sql, "<slot 11> : CAST(2: tb AS VARCHAR(10))");
+        assertPlanContains(sql, "CAST(2: tb AS VARCHAR(10))");
 
         sql = "select cast(tb as char(10)) from tall";
-        assertPlanContains(sql, "<slot 11> : CAST(2: tb AS CHAR(10))");
+        assertPlanContains(sql, "CAST(2: tb AS CHAR(10))");
 
         sql = "select cast(tb as int) from tall";
-        assertPlanContains(sql, "<slot 11> : CAST(2: tb AS INT)");
+        assertPlanContains(sql, "CAST(2: tb AS INT)");
 
         sql = "select cast(ti as datetime) from tall";
-        assertPlanContains(sql, "<slot 11> : CAST(9: ti AS DATETIME)");
+        assertPlanContains(sql, "CAST(9: ti AS DATETIME)");
 
         sql = "select cast(th as date) from tall";
-        assertPlanContains(sql, "<slot 11> : CAST(8: th AS DATE)");
+        assertPlanContains(sql, "CAST(8: th AS DATE)");
 
         sql = "select cast(th as time) from tall";
-        assertPlanContains(sql, "<slot 11> : CAST(8: th AS TIME)");
+        assertPlanContains(sql, "CAST(8: th AS TIME)");
 
         sql = "select cast(ti as timestamp) from tall";
-        assertPlanContains(sql, "<slot 11> : CAST(9: ti AS DATETIME)");
+        assertPlanContains(sql, "CAST(9: ti AS DATETIME)");
+    }
+
+    @Test
+    public void testNullifExpression() throws Exception {
+        String sql = "select nullif(1, 2)";
+        assertPlanContains(sql, "<slot 2> : nullif(1, 2)");
+
+        sql = "select nullif(v1, v2) from t0";
+        assertPlanContains(sql, "<slot 4> : nullif(1: v1, 2: v2)");
+    }
+
+    @Test
+    public void testIfExpression() throws Exception {
+        String sql = "select if(1, 2, 3)";
+        assertPlanContains(sql, "<slot 2> : 2");
+
+        sql = "select if(v1, v2, v3) from t0";
+        assertPlanContains(sql, "<slot 4> : if(CAST(1: v1 AS BOOLEAN), 2: v2, 3: v3)");
+
+        sql = "select if(v1, v2) from t0";
+        assertPlanContains(sql, "<slot 4> : if(CAST(1: v1 AS BOOLEAN), 2: v2, NULL)");
+
+        sql = "select * from t0 where if (v1, v2, v3) = 2";
+        assertPlanContains(sql, "PREDICATES: if(CAST(1: v1 AS BOOLEAN), 2: v2, 3: v3) = 2");
+    }
+
+    @Test
+    public void testDecimal() throws Exception {
+        String sql = "select cast(tj as decimal32) from tall";
+        analyzeFail(sql, "Unknown type: decimal32");
+
+        sql = "select cast(tj as decimal64) from tall";
+        analyzeFail(sql, "Unknown type: decimal64");
+
+        sql = "select cast(tj as decimal128) from tall";
+        analyzeFail(sql, "Unknown type: decimal128");
+
+        sql = "select cast(tj as decimal) from tall";
+        assertPlanContains(sql, "CAST(10: tj AS DECIMAL128(38,0))");
+
+        sql = "select cast(tj as decimal(10, 2)) from tall";
+        assertPlanContains(sql, "CAST(10: tj AS DECIMAL64(10,2))");
+
+        sql = "select cast(tj as decimal(10)) from tall";
+        assertPlanContains(sql, "CAST(10: tj AS DECIMAL64(10,0))");
+
+        sql = "select cast(tj as decimal(28, 2)) from tall";
+        assertPlanContains(sql, "CAST(10: tj AS DECIMAL128(28,2))");
+
+        sql = "select cast(tj as decimal(28)) from tall";
+        assertPlanContains(sql, "CAST(10: tj AS DECIMAL128(28,0))");
     }
 
     @Test
     public void testSelectLiteral() throws Exception {
         String sql = "select date '1998-12-01'";
         assertPlanContains(sql, "<slot 2> : '1998-12-01'");
-        System.out.println(getFragmentPlan(sql));
     }
 
     @Test
     public void testSelectAnalytic() throws Exception {
         String sql = "select sum(v1) over(partition by v2) from t0";
-        assertPlanContains(sql, "3:ANALYTIC\n" +
+        assertPlanContains(sql, "2:ANALYTIC\n" +
                 "  |  functions: [, sum(1: v1), ]\n" +
                 "  |  partition by: 2: v2");
 
         sql = "select sum(v1) over(partition by v2 order by v3) from t0";
-        assertPlanContains(sql, "3:ANALYTIC\n" +
+        assertPlanContains(sql, "2:ANALYTIC\n" +
                 "  |  functions: [, sum(1: v1), ]\n" +
                 "  |  partition by: 2: v2\n" +
                 "  |  order by: 3: v3 ASC\n" +
                 "  |  window: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW");
 
         sql = "select lead(v1,1,0) over(partition by v2 order by v3) from t0";
-        assertPlanContains(sql, "3:ANALYTIC\n" +
+        assertPlanContains(sql, "2:ANALYTIC\n" +
                 "  |  functions: [, lead(1: v1, 1, 0), ]\n" +
                 "  |  partition by: 2: v2\n" +
                 "  |  order by: 3: v3 ASC\n" +
                 "  |  window: ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING");
 
         sql = "select lag(v1) over(partition by v2 order by v3) from t0";
-        assertPlanContains(sql, "3:ANALYTIC\n" +
+        assertPlanContains(sql, "2:ANALYTIC\n" +
                 "  |  functions: [, lag(1: v1, 1, NULL), ]\n" +
                 "  |  partition by: 2: v2\n" +
                 "  |  order by: 3: v3 ASC\n" +
@@ -138,36 +218,50 @@ public class TrinoQueryTest extends TrinoTestBase {
         sql =
                 "select first_value(v1) over(partition by v2 order by v3 range between unbounded preceding and unbounded " +
                         "following) from t0";
-        assertPlanContains(sql, "3:ANALYTIC\n" +
+        assertPlanContains(sql, "2:ANALYTIC\n" +
                 "  |  functions: [, first_value(1: v1), ]\n" +
                 "  |  partition by: 2: v2\n" +
                 "  |  order by: 3: v3 ASC\n" +
                 "  |  window: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW");
 
         sql = "select last_value(v1) over(partition by v2 order by v3 rows 6 preceding) from t0";
-        assertPlanContains(sql, "3:ANALYTIC\n" +
+        assertPlanContains(sql, "2:ANALYTIC\n" +
                 "  |  functions: [, last_value(1: v1), ]\n" +
                 "  |  partition by: 2: v2\n" +
                 "  |  order by: 3: v3 ASC\n" +
                 "  |  window: ROWS BETWEEN 6 PRECEDING AND CURRENT ROW");
 
         sql = "select row_number() over(partition by v2 order by v3) from t0";
-        assertPlanContains(sql, "3:ANALYTIC\n" +
+        assertPlanContains(sql, "2:ANALYTIC\n" +
                 "  |  functions: [, row_number(), ]\n" +
                 "  |  partition by: 2: v2\n" +
                 "  |  order by: 3: v3 ASC\n" +
                 "  |  window: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW");
 
         sql = "select rank() over(partition by v2 order by v3) from t0";
-        assertPlanContains(sql, "3:ANALYTIC\n" +
+        assertPlanContains(sql, "2:ANALYTIC\n" +
                 "  |  functions: [, rank(), ]\n" +
                 "  |  partition by: 2: v2\n" +
                 "  |  order by: 3: v3 ASC\n" +
                 "  |  window: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW");
 
         sql = "select dense_rank() over(partition by v2 order by v3) from t0";
-        assertPlanContains(sql, " 3:ANALYTIC\n" +
+        assertPlanContains(sql, " 2:ANALYTIC\n" +
                 "  |  functions: [, dense_rank(), ]\n" +
+                "  |  partition by: 2: v2\n" +
+                "  |  order by: 3: v3 ASC\n" +
+                "  |  window: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW");
+
+        sql = "select cume_dist() over(partition by v2 order by v3) from t0";
+        assertPlanContains(sql, " 2:ANALYTIC\n" +
+                "  |  functions: [, cume_dist(), ]\n" +
+                "  |  partition by: 2: v2\n" +
+                "  |  order by: 3: v3 ASC\n" +
+                "  |  window: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW");
+
+        sql = "select percent_rank() over(partition by v2 order by v3) from t0";
+        assertPlanContains(sql, " 2:ANALYTIC\n" +
+                "  |  functions: [, percent_rank(), ]\n" +
                 "  |  partition by: 2: v2\n" +
                 "  |  order by: 3: v3 ASC\n" +
                 "  |  window: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW");
@@ -206,29 +300,44 @@ public class TrinoQueryTest extends TrinoTestBase {
                 "  |  <slot 3> : 3: c2\n" +
                 "  |  <slot 4> : 3: c2[1]");
         sql = "select array[array[1,2],array[3,4]][1][2]";
-        assertPlanContains(sql, "ARRAY<ARRAY<tinyint(4)>>[[1,2],[3,4]][1][2]");
+        assertPlanContains(sql, "[[1,2],[3,4]][1][2]");
 
         sql = "select array[][1]";
-        assertPlanContains(sql, "ARRAY<boolean>[][1]");
+        assertPlanContains(sql, "[][1]");
 
         sql = "select array[v1 = 1, v2 = 2, true] from t0";
-        assertPlanContains(sql, "<slot 4> : ARRAY<boolean>[1: v1 = 1,2: v2 = 2,TRUE]");
+        assertPlanContains(sql, "<slot 4> : [1: v1 = 1,2: v2 = 2,TRUE]");
 
         sql = "select array[v1,v2] from t0";
-        assertPlanContains(sql, "ARRAY<bigint(20)>[1: v1,2: v2]");
-
+        assertPlanContains(sql, "[1: v1,2: v2]");
 
         sql = "select array[NULL][1] + 1, array[1,2,3][1] + array[array[1,2,3],array[1,1,1]][2][2];";
         assertPlanContains(sql, "1:Project\n" +
                 "  |  <slot 2> : NULL\n" +
-                "  |  <slot 3> : CAST(ARRAY<tinyint(4)>[1,2,3][1] AS SMALLINT) + CAST(ARRAY<ARRAY<tinyint(4)>>" +
+                "  |  <slot 3> : CAST([1,2,3][1] AS SMALLINT) + CAST(" +
                 "[[1,2,3],[1,1,1]][2][2] AS SMALLINT)");
 
         sql = "select c0, c2[1] + array[1,2,3][1] as v, sum(c2[1]) from test_array group by c0, v order by v";
         assertPlanContains(sql, "1:Project\n" +
                 "  |  <slot 1> : 1: c0\n" +
-                "  |  <slot 4> : CAST(3: c2[1] AS BIGINT) + CAST(ARRAY<tinyint(4)>[1,2,3][1] AS BIGINT)\n" +
-                "  |  <slot 5> : 3: c2[1]");
+                "  |  <slot 4> : CAST(7: expr AS BIGINT) + CAST([1,2,3][1] AS BIGINT)\n" +
+                "  |  <slot 5> : 7: expr\n" +
+                "  |  common expressions:\n" +
+                "  |  <slot 7> : 3: c2[1]");
+
+        sql = "select element_at(array[1,2,3], 1)";
+        assertPlanContains(sql, "[1,2,3][1]");
+
+        sql = "select element_at(c1, 2) from test_array";
+        assertPlanContains(sql, "2: c1[2]");
+
+        sql = "select element_at(array[1,2,3], 1, 0)";
+        try {
+            getFragmentPlan(sql);
+            Assert.fail();
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("element_at function must have 2 arguments"));
+        }
     }
 
     @Test
@@ -237,7 +346,7 @@ public class TrinoQueryTest extends TrinoTestBase {
         assertPlanContains(sql, "array_distinct(2: c1)");
 
         sql =  "select array_intersect(c1, array['star','rocks']) from test_array";
-        assertPlanContains(sql, "array_intersect(2: c1, ARRAY<varchar>['star','rocks'])");
+        assertPlanContains(sql, "array_intersect(2: c1, ['star','rocks'])");
 
         sql = "select array_join(c1, '_') from test_array";
         assertPlanContains(sql, "array_join(2: c1, '_')");
@@ -249,16 +358,32 @@ public class TrinoQueryTest extends TrinoTestBase {
         assertPlanContains(sql, "array_min(2: c1)");
 
         sql = "select array_position(array[1,2,3], 2) from test_array";
-        assertPlanContains(sql, "array_position(ARRAY<tinyint(4)>[1,2,3], 2)");
+        assertPlanContains(sql, "array_position([1,2,3], 2)");
 
         sql = "select array_remove(array[1,2,3], 2) from test_array";
-        assertPlanContains(sql, "array_remove(ARRAY<tinyint(4)>[1,2,3], 2)");
+        assertPlanContains(sql, "array_remove([1,2,3], 2)");
 
         sql = "select array_sort(c1) from test_array";
         assertPlanContains(sql, "array_sort(2: c1)");
 
         sql =  "select arrays_overlap(c1, array['star','rocks']) from test_array";
-        assertPlanContains(sql, "arrays_overlap(2: c1, ARRAY<varchar>['star','rocks'])");
+        assertPlanContains(sql, "arrays_overlap(2: c1, ['star','rocks'])");
+    }
+
+    @Test
+    public void testSelectLambdaFunction() throws Exception {
+        // trino do not support array_map function, just test the lambda function
+        String sql = "select array_map(array['a1_a2','a1_a2'], x->split(x, '_'));";
+        assertPlanContains(sql, "array_map(<slot 2> -> split(<slot 2>, '_'), ['a1_a2','a1_a2'])");
+
+        sql = "select transform(split('a1_a2,b1_b2', ','), x->split(x, '_'));";
+        assertPlanContains(sql, "array_map(<slot 2> -> split(<slot 2>, '_'), split('a1_a2,b1_b2', ','))");
+
+        sql = "select all_match(array[1,2,3], x-> x>0);";
+        assertPlanContains(sql, "all_match(array_map(<slot 2> -> <slot 2> > 0, [1,2,3]))");
+
+        sql = "select any_match(array[1,2,null], x -> x is not null);";
+        assertPlanContains(sql, "any_match(array_map(<slot 2> -> <slot 2> IS NOT NULL, [1,2,NULL]))");
     }
 
     @Test
@@ -296,7 +421,6 @@ public class TrinoQueryTest extends TrinoTestBase {
                 "  |  <slot 5> : 3: c2.b");
     }
 
-    @Test
     public void testSelectRow() throws Exception {
         String sql = "select row(1,2)";
         assertPlanContains(sql, " <slot 2> : row(1, 2)");
@@ -313,7 +437,7 @@ public class TrinoQueryTest extends TrinoTestBase {
         String sql = "select c0, c1[1] from test_map";
         assertPlanContains(sql, "1:Project\n" +
                 "  |  <slot 1> : 1: c0\n" +
-                "  |  <slot 4> : 2: c1[1]");
+                "  |  <slot 5> : 2: c1[1]");
 
         sql = "select c0 from test_map where c1[1] > 10";
         assertPlanContains(sql, "PREDICATES: 2: c1[1] > 10");
@@ -323,16 +447,40 @@ public class TrinoQueryTest extends TrinoTestBase {
                 "  |  output: avg(2: c1[1])");
 
         sql = "select c2[2][1] from test_map";
-        assertPlanContains(sql, "<slot 4> : 3: c2[2][1]");
+        assertPlanContains(sql, "<slot 5> : 3: c2[2][1]");
+
+        sql = "select c3['10'] from test_map";
+        assertPlanContains(sql, "1:Project\n" +
+                "  |  <slot 5> : 4: c3['10']");
+
+        analyzeFail("select c3[\"10\"] from test_map");
     }
 
     @Test
     public void testSelectMapFunction() throws Exception {
         String sql = "select map_keys(c1) from test_map";
-        assertPlanContains(sql, "<slot 4> : map_keys(2: c1)");
+        assertPlanContains(sql, "<slot 5> : map_keys(2: c1)");
 
         sql = "select map_values(c1) from test_map";
-        assertPlanContains(sql, "<slot 4> : map_values(2: c1)");
+        assertPlanContains(sql, "<slot 5> : map_values(2: c1)");
+
+        sql = "select map() from test_map";
+        assertPlanContains(sql, "map{}");
+
+        sql = "select map(array[1,2,3],array['a','b','c']);";
+        assertPlanContains(sql, "map_from_arrays([1,2,3], ['a','b','c'])");
+
+        sql = "select map_filter(map(array[10, 20, 30], array['a', NULL, 'c']), (k, v) -> v IS NOT NULL);";
+        assertPlanContains(sql, "map_filter(7: map_from_arrays, map_values(map_apply((<slot 2>, <slot 3>) -> " +
+                "map{<slot 2>:<slot 3> IS NOT NULL}, 7: map_from_arrays)))");
+
+        sql = "select transform_keys(MAP(ARRAY [1, 2, 3], ARRAY ['a', 'b', 'c']), (k, v) -> k + 1);";
+        assertPlanContains(sql, "map_apply((<slot 2>, <slot 3>) -> map{CAST(<slot 2> AS SMALLINT) + 1:<slot 3>}, " +
+                "map_from_arrays([1,2,3], ['a','b','c']))");
+
+        sql = "select transform_values(map(array [1, 2, 3], array ['a', 'b', 'c']), (k, v) -> k * k);";
+        assertPlanContains(sql, "map_apply((<slot 2>, <slot 3>) -> map{<slot 2>:CAST(<slot 2> AS SMALLINT) * " +
+                "CAST(<slot 2> AS SMALLINT)}, map_from_arrays([1,2,3], ['a','b','c']))");
     }
 
     @Test
@@ -399,13 +547,29 @@ public class TrinoQueryTest extends TrinoTestBase {
                 "    o_year\n" +
                 "order by\n" +
                 "    o_year ";
-        assertPlanContains(sql, "  41:Project\n" +
+        assertPlanContains(sql, "  40:Project\n" +
                 "  |  <slot 69> : 69: year\n" +
                 "  |  <slot 74> : 72: sum / 73: sum");
     }
 
     @Test
+    public void testAliasCaseInsensitive() throws Exception {
+        String sql = "select T.v1 from (select * from t0) t";
+        assertPlanContains(sql, "t0");
+
+        sql = "select t.v1 from (select * from t0) as T";
+        assertPlanContains(sql, "t0");
+
+        sql = "select t.v1 from t0 T";
+        assertPlanContains(sql, "t0");
+
+        sql = "select T.v1 from (select * from t0 join t1 on v2 = v5) t";
+        assertPlanContains(sql, "INNER JOIN ");
+    }
+
+    @Test
     public void testSelectSetOperation() throws Exception {
+        connectContext.getSessionVariable().setCboPushDownTopNLimit(0);
         String sql = "select * from t0 union select * from t1 union select * from t0";
         assertPlanContains(sql, "7:AGGREGATE (update serialize)\n" +
                 "  |  STREAMING\n" +
@@ -437,7 +601,7 @@ public class TrinoQueryTest extends TrinoTestBase {
         sql = "select * from (select v1 from t0 intersect select v4 from t1 intersect select v3 from t0 limit 10) tt " +
                 "order by v1 limit 2;";
         assertPlanContains(sql, "0:INTERSECT\n" +
-                "  |  limit: 10",
+                        "  |  limit: 10",
                 "8:TOP-N\n" +
                         "  |  order by: <slot 10> 10: v1 ASC\n" +
                         "  |  offset: 0\n" +
@@ -601,6 +765,20 @@ public class TrinoQueryTest extends TrinoTestBase {
         assertPlanContains(sql, "<slot 1> : 1: v1", "output: count(if(CAST(1: v1 AS BOOLEAN), 1, NULL))");
     }
 
+    @Test
+    public void testRegexp() throws Exception {
+        String sql = "select regexp_like('1a 2b 14m', '\\d+b')";
+        assertPlanContains(sql, "regexp('1a 2b 14m', '\\\\d+b')");
+
+        sql = "select regexp_like('abc123','abc*');";
+        assertPlanContains(sql, "regexp('abc123', 'abc*')");
+
+        sql = "select regexp_extract('1a 2b 14m', '\\d+');";
+        assertPlanContains(sql, "regexp_extract('1a 2b 14m', '\\\\d+', 0)");
+
+        sql = "select regexp_extract('1abb 2b 14m', '[a-z]+');";
+        assertPlanContains(sql, "regexp_extract('1abb 2b 14m', '[a-z]+', 0)");
+    }
 
     @Test
     public void testLimit() throws Exception {
@@ -689,11 +867,11 @@ public class TrinoQueryTest extends TrinoTestBase {
     @Test
     public void testExplain() throws Exception {
         String sql = "explain (TYPE logical) select v1, v2 from t0,t1";
-        Assert.assertTrue(StringUtils.containsIgnoreCase(getExplain(sql),
+        Assert.assertTrue(getExplain(sql), StringUtils.containsIgnoreCase(getExplain(sql),
                 "SCAN [t1] => [8:auto_fill_col]\n" +
-                "                    Estimates: {row: 1, cpu: 2.00, memory: 0.00, network: 0.00, cost: 1.00}\n" +
-                "                    partitionRatio: 0/1, tabletRatio: 0/0\n" +
-                "                    8:auto_fill_col := 1"));
+                        "                    Estimates: {row: 1, cpu: 9.00, memory: 0.00, network: 0.00, cost: 4.50}\n" +
+                        "                    partitionRatio: 0/1, tabletRatio: 0/0\n" +
+                        "                    8:auto_fill_col := 1"));
 
         sql = "explain select v1, v2 from t0,t1";
         Assert.assertTrue(StringUtils.containsIgnoreCase(getExplain(sql),
@@ -725,5 +903,240 @@ public class TrinoQueryTest extends TrinoTestBase {
                         "  |  column statistics: \n" +
                         "  |  * v1-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN\n" +
                         "  |  * v2-->[-Infinity, Infinity, 0.0, 1.0, 1.0] UNKNOWN"));
+    }
+
+    @Test
+    public void testIntervalLiteral() throws Exception {
+        String sql = "select date '2022-01-01' + interval '1' year;";
+        assertPlanContains(sql, "<slot 2> : '2023-01-01 00:00:00'");
+
+        sql = "select date '2022-01-01' + interval '1' year + interval '1' month;";
+        assertPlanContains(sql, "<slot 2> : '2023-02-01 00:00:00'");
+
+        sql = "select date '2022-01-01' + interval '1' year + interval '1' month + interval '1' day;";
+        assertPlanContains(sql, "<slot 2> : '2023-02-02 00:00:00'");
+
+        sql = "select date '2022-01-01' + interval '1' year + interval '1' month + interval '1' day + interval '1' hour;";
+        assertPlanContains(sql, "<slot 2> : '2023-02-02 01:00:00'");
+
+        sql = "select date '2022-01-01' + interval '1' year + interval '1' month + interval '1' day + interval '1' hour + " +
+                "interval '1' minute;";
+        assertPlanContains(sql, "<slot 2> : '2023-02-02 01:01:00'");
+
+        sql = "select date '2022-01-01' + interval '1' year + interval '1' month + interval '1' day + interval '1' hour + " +
+                "interval '1' minute + interval '1' second;";
+        assertPlanContains(sql, "<slot 2> : '2023-02-02 01:01:01'");
+
+        sql = "select interval '1' year + date '2022-01-01';";
+        assertPlanContains(sql, "<slot 2> : '2023-01-01 00:00:00'");
+    }
+
+    @Test
+    public void selectDoubleLiteral() throws Exception {
+        String sql = "select 1.0";
+        assertPlanContains(sql, "<slot 2> : 1.0");
+
+        sql = "select  -1.79E+309;";
+        analyzeFail(sql);
+
+        sql = "select  -1.79E+3;";
+        assertPlanContains(sql, "<slot 2> : -1790.0");
+
+        sql = "select  -1.79E+10;";
+        assertPlanContains(sql, "<slot 2> : -17900000000");
+
+        sql = "select approx_percentile(2.25, -1.79E+309)";
+        analyzeFail(sql);
+
+        sql = "select approx_percentile(2.25, 1.79E-10)";
+        assertPlanContains(sql, "percentile_approx(2.25, 1.79E-10)");
+
+        sql = "select approx_percentile(2.25, 0.4)";
+        assertPlanContains(sql, "percentile_approx(2.25, 0.4)");
+    }
+
+    @Test
+    public void testTrim() throws Exception {
+        String sql = "select trim(' abc ');";
+        assertPlanContains(sql, "<slot 2> : trim(' abc ')");
+
+        sql = "select trim('!' from '!foo!');";
+        assertPlanContains(sql, "<slot 2> : trim('!foo!', '!')");
+
+        sql = "select trim(leading from '  abcd');";
+        assertPlanContains(sql, "<slot 2> : ltrim('  abcd')");
+
+        sql = "select trim(leading 'a' from '  abcd');";
+        assertPlanContains(sql, "<slot 2> : ltrim('  abcd', 'a')");
+
+        sql = "select trim(both '$' FROM '$var$');";
+        assertPlanContains(sql, "<slot 2> : trim('$var$', '$')");
+
+        sql = "select trim(both from '  abcd');";
+        assertPlanContains(sql, "<slot 2> : trim('  abcd')");
+
+        sql = "select trim(trailing 'ER' from upper('worker'));";
+        assertPlanContains(sql, "<slot 2> : rtrim(upper('worker'), 'ER')");
+
+        sql = "select trim(trailing from '  abcd');";
+        assertPlanContains(sql, "<slot 2> : rtrim('  abcd')");
+    }
+
+    @Test
+    public void testTry() throws Exception {
+        String sql = "select try_cast('aa' as int)";
+        assertPlanContains(sql, "<slot 2> : CAST('aa' AS INT)");
+
+        sql = "select try_cast(ta as bigint) + 1 from tall";
+        assertPlanContains(sql, "CAST(1: ta AS BIGINT) + 1");
+
+        sql = "select try(cast ('aa' as int))";
+        assertPlanContains(sql, "<slot 2> : CAST('aa' AS INT)");
+
+        sql = "select try(2 / 0)";
+        assertPlanContains(sql, "<slot 2> : NULL");
+
+        sql = "select try(100 / v1) from t0 where v1 = 0";
+        assertPlanContains(sql, "100.0 / CAST(1: v1 AS DOUBLE)");
+
+        sql = "select coalesce(try(100 / v1), 1) from t0 where v1 = 0";
+        assertPlanContains(sql, "coalesce(100.0 / CAST(1: v1 AS DOUBLE), 1.0)");
+    }
+
+    @Test
+    public void testUnaryExpression() throws Exception {
+        String sql = "select -abs(1);";
+        assertPlanContains(sql, "-1 * CAST(abs(1) AS INT)");
+
+        sql = "select +abs(-1);";
+        assertPlanContains(sql, "abs(-1)");
+
+        sql = "select \n" +
+                "  - if(\n" +
+                "    day_of_week(\n" +
+                "      cast('2023-01-01' AS date)\n" +
+                "    )= 7, \n" +
+                "    0, \n" +
+                "    day_of_week(\n" +
+                "      cast('2023-01-01' AS date)\n" +
+                "    )\n" +
+                "  );";
+        assertPlanContains(sql, "-1 * CAST(if(3: dayofweek_iso = 7, 0, 3: dayofweek_iso) AS BIGINT)");
+    }
+
+    @Test
+    public void testJsonArray() throws Exception {
+        String sql = "select json_array(1, true, 'starrocks',1.1);";
+        assertPlanContains(sql, "json_array(CAST(1 AS JSON), CAST(TRUE AS JSON), CAST('starrocks' AS JSON), CAST(1.1 AS JSON))");
+
+        sql = "select json_array()";
+        assertPlanContains(sql, "json_array()");
+
+        sql = "select json_array(ta, tb, tc, tg) from tall;";
+        assertPlanContains(sql, "json_array(CAST(1: ta AS JSON), CAST(2: tb AS JSON), CAST(3: tc AS JSON), CAST(7: tg AS JSON))");
+
+        sql = "SELECT json_array_get('[\"a\", [3, 9], \"c\"]', 0);";
+        assertPlanContains(sql, "json_query(parse_json('[\"a\", [3, 9], \"c\"]'), '$.[0]')");
+
+        sql = "select json_array_get(json_array(true, 12e-1, 'text'), 2);";
+        assertPlanContains(sql, "json_query(json_array(CAST(TRUE AS JSON), CAST(1.2 AS JSON), CAST('text' AS JSON)), '$.[2]')");
+
+        sql = "SELECT json_array_get(cast('[true, 12e-1, \"text\"]' as json), 1);";
+        assertPlanContains(sql, "json_query(CAST('[true, 12e-1, \"text\"]' AS JSON), '$.[1]')");
+    }
+
+    @Test
+    public void testJsonQuery() throws Exception {
+        String sql = "select json_query('[true, 12e-1, \"text\"]', 'lax $[1]');";
+        assertPlanContains(sql, "json_query(CAST('[true, 12e-1, \"text\"]' AS JSON), '$[1]')");
+
+        sql = "select json_query('[true, 12e-1, \"text\"]', 'strict $[1]');";
+        assertPlanContains(sql, " json_query(CAST('[true, 12e-1, \"text\"]' AS JSON), '$[1]')");
+
+        sql = "select json_query('{\"comment\" : \"nice\", \"children\" : [10, 13, 16]}', 'lax $.children');";
+        assertPlanContains(sql, "json_query(CAST('{\"comment\" : \"nice\", \"children\" : [10, 13, 16]}' AS JSON), " +
+                "'$.children')");
+    }
+
+    @Test
+    public void testSelectValue() throws Exception {
+        String sql = "select * from (values (1, 2, 3))";
+        assertPlanContains(sql, "1 | 2 | 3");
+
+        sql = "select * from (values (1, 2, 3)) as t0(a,b,c);";
+        assertPlanContains(sql, "1: a | 2: b | 3: c");
+
+        sql = "select * from (values 1, 2, 3)";
+        assertPlanContains(sql, "constant exprs: \n" +
+                "         1\n" +
+                "         2\n" +
+                "         3");
+
+        sql = "select * from (values (1), (2), (3))";
+        assertPlanContains(sql, "1\n" +
+                "         2\n" +
+                "         3");
+
+        sql = "select * from (values (0,1),(1,2),(2,3)) t0 (a,b) ;";
+        assertPlanContains(sql, "0 | 1\n" +
+                "         1 | 2\n" +
+                "         2 | 3");
+
+        sql = "select * from (values (0,(1,2)),(1,(2,3)),(2,(3,4)))  t0 (a,b) ;";
+        assertPlanContains(sql, "0 | row(1, 2)\n" +
+                "         1 | row(2, 3)\n" +
+                "         2 | row(3, 4)");
+    }
+
+    @Test
+    public void testSelectReal() throws Exception {
+        String sql = "select real '10.3'";
+        assertPlanContains(sql, "<slot 2> : 10.3");
+
+        sql = "select cast('1.1' as real)";
+        assertPlanContains(sql, "<slot 2> : 1.1");
+
+        sql = "select cast(v1 / v2 as real) from t0";
+        assertPlanContains(sql, "CAST(CAST(1: v1 AS DOUBLE) / CAST(2: v2 AS DOUBLE) AS FLOAT)");
+    }
+
+    @Test
+    public void testUnnest() throws Exception {
+        String sql = "select * from (\n" +
+                "    select 1 gid, array[11,12,13] aid, array[14,15,16] as bid union all select 2 gid, array[21,22,23] as aid, " +
+                "    array[24,25,26] as bid\n" +
+                ") a\n" +
+                "cross join unnest(array[1, 2]) as plat(plat)";
+        assertPlanContains(sql, "tableFunctionName: unnest");
+
+        sql = "select * from (\n" +
+                "    select 1 gid, array[11,12,13] aid, array[14,15,16] as bid union all select 2 gid, array[21,22,23] as aid, " +
+                "    array[24,25,26] as bid\n" +
+                ") a\n" +
+                "cross join unnest(array[row(1, aid), row(2, bid)]) as plat(plat, pid)";
+        assertPlanContains(sql, "[1,2]", "[10: expr,11: expr]");
+
+        sql = "select * from (\n" +
+                "select 1 gid, array[11,12,13] aid, array[14,15,16] as bid union all select 2 gid, array[21,22,23] as aid, " +
+                "array[24,25,26] as bid\n" +
+                ") a\n" +
+                "cross join unnest(array[row(1,2), row(3,4)],array[2,3]) as plat(a,b,c);";
+        assertPlanContains(sql, "[1,3]", "[2,4]", "[2,3]");
+
+        sql = "select * from (\n" +
+                "select 1 gid, array[11,12,13] aid, array[14,15,16] as bid union all select 2 gid, array[21,22,23] as aid, " +
+                "array[24,25,26] as bid\n" +
+                ") a\n" +
+                "cross join unnest(array[0,0], array[row(1,2), row(3,4)],array[2,3]) as plat(a,b,c,d);";
+        assertPlanContains(sql, "[0,0]", "[1,3]", "[2,4]", "[2,3]");
+
+        sql = "select * from (\n" +
+                "    select 1 gid, array[11,12,13] aid, array[14,15,16] as bid union all select 2 gid, array[21,22,23] as aid, " +
+                "  array[24,25,26] as bid\n" +
+                ") a\n" +
+                "cross join unnest(array[row(1, aid), row(2, bid)]) as plat(plat, pid)\n" +
+                "cross join unnest(plat.pid) as t(plat_id);";
+        assertPlanContains(sql, "[1,2]", "[10: expr,11: expr]", "returnTypes: [TINYINT, ARRAY<TINYINT>]",
+                "returnTypes: [TINYINT]");
     }
 }

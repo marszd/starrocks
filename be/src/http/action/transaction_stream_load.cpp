@@ -161,7 +161,7 @@ void TransactionStreamLoadAction::handle(HttpRequest* req) {
 
     if (!ctx->status.ok()) {
         if (ctx->need_rollback) {
-            _exec_env->transaction_mgr()->_rollback_transaction(ctx);
+            (void)_exec_env->transaction_mgr()->_rollback_transaction(ctx);
         }
     }
 
@@ -170,7 +170,8 @@ void TransactionStreamLoadAction::handle(HttpRequest* req) {
     // For JSON, now the buffer contains a complete json.
     if (ctx->buffer != nullptr && ctx->buffer->pos > 0) {
         ctx->buffer->flip();
-        ctx->body_sink->append(std::move(ctx->buffer));
+        WARN_IF_ERROR(ctx->body_sink->append(std::move(ctx->buffer)),
+                      "append MessageBodySink failed when handle TransactionStreamLoad");
         ctx->buffer = nullptr;
     }
 
@@ -231,7 +232,7 @@ int TransactionStreamLoadAction::on_header(HttpRequest* req) {
     if (!st.ok()) {
         ctx->status = st;
         if (ctx->need_rollback) {
-            _exec_env->transaction_mgr()->_rollback_transaction(ctx);
+            (void)_exec_env->transaction_mgr()->_rollback_transaction(ctx);
         }
         auto resp = _exec_env->transaction_mgr()->_build_reply(TXN_LOAD, ctx);
         ctx->lock.unlock();
@@ -386,6 +387,18 @@ Status TransactionStreamLoadAction::_parse_request(HttpRequest* http_req, Stream
         request.__set_partial_update(true);
     } else {
         request.__set_partial_update(false);
+    }
+    if (!http_req->header(HTTP_MERGE_CONDITION).empty()) {
+        request.__set_merge_condition(http_req->header(HTTP_MERGE_CONDITION));
+    }
+    if (!http_req->header(HTTP_PARTIAL_UPDATE_MODE).empty()) {
+        if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "row") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::ROW_MODE);
+        } else if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "auto") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::AUTO_MODE);
+        } else if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "column") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::COLUMN_UPSERT_MODE);
+        }
     }
     if (!http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE).empty()) {
         request.__set_transmission_compression_type(http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE));

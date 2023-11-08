@@ -48,10 +48,12 @@ import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.BrokerDesc;
 import com.starrocks.backup.BackupJobInfo.BackupIndexInfo;
 import com.starrocks.backup.BackupJobInfo.BackupPartitionInfo;
+import com.starrocks.backup.BackupJobInfo.BackupPhysicalPartitionInfo;
 import com.starrocks.backup.BackupJobInfo.BackupTableInfo;
 import com.starrocks.backup.BackupJobInfo.BackupTabletInfo;
 import com.starrocks.backup.RestoreFileMapping.IdChain;
 import com.starrocks.backup.Status.ErrCode;
+import com.starrocks.catalog.Column;
 import com.starrocks.catalog.DataProperty;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FsBroker;
@@ -59,26 +61,27 @@ import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
 import com.starrocks.catalog.MaterializedIndexMeta;
+import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.OlapTable.OlapTableState;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionInfo;
 import com.starrocks.catalog.PartitionKey;
-import com.starrocks.catalog.PartitionType;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Table;
-import com.starrocks.catalog.Table.TableType;
 import com.starrocks.catalog.Tablet;
 import com.starrocks.catalog.TabletMeta;
 import com.starrocks.common.Config;
-import com.starrocks.common.MarkedCountDownLatch;
 import com.starrocks.common.Pair;
 import com.starrocks.common.UserException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.util.DynamicPartitionUtil;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.common.util.concurrent.MarkedCountDownLatch;
 import com.starrocks.fs.HdfsUtil;
+import com.starrocks.metric.MetricRepo;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.task.AgentBatchTask;
 import com.starrocks.task.AgentTask;
@@ -93,7 +96,6 @@ import com.starrocks.thrift.TFinishTaskRequest;
 import com.starrocks.thrift.THdfsProperties;
 import com.starrocks.thrift.TStatusCode;
 import com.starrocks.thrift.TStorageMedium;
-import com.starrocks.thrift.TStorageType;
 import com.starrocks.thrift.TTaskType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -314,6 +316,10 @@ public class RestoreJob extends AbstractJob {
         return state == RestoreJobState.CANCELLED;
     }
 
+    public void setRepo(Repository repo) {
+        this.repo = repo;
+    }
+
     @Override
     public void run() {
         if (state == RestoreJobState.FINISHED || state == RestoreJobState.CANCELLED) {
@@ -392,7 +398,7 @@ public class RestoreJob extends AbstractJob {
                     status = new Status(ErrCode.NOT_FOUND, "table " + idChain.getTblId() + " has been dropped");
                     return;
                 }
-                Partition part = tbl.getPartition(idChain.getPartId());
+                PhysicalPartition part = tbl.getPhysicalPartition(idChain.getPartId());
                 if (part == null) {
                     status = new Status(ErrCode.NOT_FOUND, "partition " + idChain.getPartId() + " has been dropped");
                     return;
@@ -430,6 +436,7 @@ public class RestoreJob extends AbstractJob {
      * 6. make snapshot for all replicas for incremental download later.
      */
     private void checkAndPrepareMeta() {
+        MetricRepo.COUNTER_UNFINISHED_RESTORE_JOB.increase(1L);
         Database db = globalStateMgr.getDb(dbId);
         if (db == null) {
             status = new Status(ErrCode.NOT_FOUND, "database " + dbId + " does not exist");
@@ -454,8 +461,8 @@ public class RestoreJob extends AbstractJob {
                     continue;
                 }
 
-                if (!tbl.isOlapOrLakeTable()) {
-                    status = new Status(ErrCode.COMMON_ERROR, "Only support retore OLAP table: " + tbl.getName());
+                if (!tbl.isNativeTableOrMaterializedView()) {
+                    status = new Status(ErrCode.COMMON_ERROR, "Only support restore OLAP table: " + tbl.getName());
                     return;
                 }
 
@@ -486,8 +493,14 @@ public class RestoreJob extends AbstractJob {
                 Preconditions.checkNotNull(remoteTbl);
                 Table localTbl = db.getTable(jobInfo.getAliasByOriginNameIfSet(tblInfo.name));
                 if (localTbl != null) {
+                    if (localTbl instanceof OlapTable && localTbl.hasAutoIncrementColumn()) {
+                        // it must be !isReplay == true
+                        ((OlapTable) localTbl).sendDropAutoIncrementMapTask();
+                    }
+
+                    tblInfo.checkAndRecoverAutoIncrementId(localTbl);
                     // table already exist, check schema
-                    if (!localTbl.isOlapOrLakeTable()) {
+                    if (!localTbl.isNativeTableOrMaterializedView()) {
                         status = new Status(ErrCode.COMMON_ERROR,
                                 "Only support retore olap table: " + localTbl.getName());
                         return;
@@ -502,21 +515,66 @@ public class RestoreJob extends AbstractJob {
                         return;
                     }
                     LOG.debug("get intersect part names: {}, job: {}", intersectPartNames, this);
-                    if (localOlapTbl.getSignature(BackupHandler.SIGNATURE_VERSION, intersectPartNames)
-                            != remoteOlapTbl.getSignature(BackupHandler.SIGNATURE_VERSION, intersectPartNames)) {
+                    if (localOlapTbl.getSignature(BackupHandler.SIGNATURE_VERSION, intersectPartNames, true)
+                            != remoteOlapTbl.getSignature(BackupHandler.SIGNATURE_VERSION, intersectPartNames, true) ||
+                                localOlapTbl.getBaseSchema().size() != remoteOlapTbl.getBaseSchema().size()) {
+                        List<Pair<Integer, String>> localCheckSumList = localOlapTbl.getSignatureSequence(
+                                BackupHandler.SIGNATURE_VERSION, intersectPartNames);
+                        List<Pair<Integer, String>> remoteCheckSumList = remoteOlapTbl.getSignatureSequence(
+                                BackupHandler.SIGNATURE_VERSION, intersectPartNames);
+                        
+                        String errMsg = "";
+                        if (localCheckSumList.size() == remoteCheckSumList.size()) {
+                            for (int i = 0; i < localCheckSumList.size(); ++i) {
+                                int localCheckSum = ((Integer) localCheckSumList.get(i).first).intValue();
+                                int remoteCheckSum = ((Integer) remoteCheckSumList.get(i).first).intValue();
+                                if (localCheckSum != remoteCheckSum) {
+                                    errMsg = ((String) localCheckSumList.get(i).second);
+                                    break;
+                                }
+                            }
+                        }
+
                         status = new Status(ErrCode.COMMON_ERROR,
                                 "Table " + jobInfo.getAliasByOriginNameIfSet(tblInfo.name)
-                                        + " already exist but with different schema");
+                                        + " already exist but with different schema, errMsg: "
+                                        + errMsg);
                         return;
+                    }
+
+                    if (localOlapTbl.getKeysType() != remoteOlapTbl.getKeysType()) {
+                        status = new Status(ErrCode.COMMON_ERROR,
+                                "Table " + jobInfo.getAliasByOriginNameIfSet(tblInfo.name)
+                                        + " already exist but with different key type");
+                        return;
+                    }
+
+                    for (int i = 0; i < localOlapTbl.getBaseSchema().size(); ++i) {
+                        Column localColumn = localOlapTbl.getBaseSchema().get(i);
+                        Column remoteColumn = remoteOlapTbl.getBaseSchema().get(i);
+
+                        if (!localColumn.equals(remoteColumn)) {
+                            status = new Status(ErrCode.COMMON_ERROR,
+                                    "Table " + jobInfo.getAliasByOriginNameIfSet(tblInfo.name)
+                                            + " already exist but with different schema, column: " + localColumn.getName()
+                                            + " in existed table is different from the column in backup snapshot, column: "
+                                            + remoteColumn.getName());
+                            return;
+                        }
                     }
 
                     // Table with same name and has same schema. Check partition
                     for (BackupPartitionInfo backupPartInfo : tblInfo.partitions.values()) {
                         Partition localPartition = localOlapTbl.getPartition(backupPartInfo.name);
                         if (localPartition != null) {
+                            if (!backupPartInfo.subPartitions.isEmpty()) {
+                                status = new Status(ErrCode.COMMON_ERROR, "Partition " + backupPartInfo.name + " in table "
+                                        + localTbl.getName() + " is automatic bucket partition, can not be restored");
+                                return;
+                            }
                             // Partition already exist.
                             PartitionInfo localPartInfo = localOlapTbl.getPartitionInfo();
-                            if (localPartInfo.getType() == PartitionType.RANGE) {
+                            if (localPartInfo.isRangePartition()) {
                                 // If this is a range partition, check range
                                 RangePartitionInfo localRangePartInfo = (RangePartitionInfo) localPartInfo;
                                 RangePartitionInfo remoteRangePartInfo
@@ -546,7 +604,7 @@ public class RestoreJob extends AbstractJob {
                         } else {
                             // partitions does not exist
                             PartitionInfo localPartitionInfo = localOlapTbl.getPartitionInfo();
-                            if (localPartitionInfo.getType() == PartitionType.RANGE) {
+                            if (localPartitionInfo.isRangePartition()) {
                                 // Check if the partition range can be added to the table
                                 RangePartitionInfo localRangePartitionInfo = (RangePartitionInfo) localPartitionInfo;
                                 RangePartitionInfo remoteRangePartitionInfo
@@ -596,6 +654,8 @@ public class RestoreJob extends AbstractJob {
                         status = st;
                         return;
                     }
+
+                    tblInfo.checkAndRecoverAutoIncrementId((Table) remoteOlapTbl);
 
                     // DO NOT set remote table's new name here, cause we will still need the origin name later
                     // remoteOlapTbl.setName(jobInfo.getAliasByOriginNameIfSet(tblInfo.name));
@@ -718,7 +778,7 @@ public class RestoreJob extends AbstractJob {
 
             // add restored tables
             for (Table tbl : restoredTbls) {
-                if (!db.createTable(tbl)) {
+                if (!db.registerTableUnlocked(tbl)) {
                     status = new Status(ErrCode.COMMON_ERROR, "Table " + tbl.getName()
                             + " already exist in db: " + db.getOriginName());
                     return;
@@ -739,7 +799,7 @@ public class RestoreJob extends AbstractJob {
         try {
             for (IdChain idChain : fileMapping.getMapping().keySet()) {
                 OlapTable tbl = (OlapTable) db.getTable(idChain.getTblId());
-                Partition part = tbl.getPartition(idChain.getPartId());
+                PhysicalPartition part = tbl.getPhysicalPartition(idChain.getPartId());
                 MaterializedIndex index = part.getIndex(idChain.getIdxId());
                 LocalTablet tablet = (LocalTablet) index.getTablet(idChain.getTabletId());
                 Replica replica = tablet.getReplicaById(idChain.getReplicaId());
@@ -797,28 +857,35 @@ public class RestoreJob extends AbstractJob {
     protected void createReplicas(OlapTable localTbl, Partition restorePart) {
         Set<String> bfColumns = localTbl.getCopiedBfColumns();
         double bfFpp = localTbl.getBfFpp();
-        for (MaterializedIndex restoredIdx : restorePart.getMaterializedIndices(IndexExtState.VISIBLE)) {
-            MaterializedIndexMeta indexMeta = localTbl.getIndexMetaByIndexId(restoredIdx.getId());
-            TabletMeta tabletMeta = new TabletMeta(dbId, localTbl.getId(), restorePart.getId(),
-                    restoredIdx.getId(), indexMeta.getSchemaHash(), TStorageMedium.HDD);
-            for (Tablet restoreTablet : restoredIdx.getTablets()) {
-                GlobalStateMgr.getCurrentInvertedIndex().addTablet(restoreTablet.getId(), tabletMeta);
-                for (Replica restoreReplica : ((LocalTablet) restoreTablet).getImmutableReplicas()) {
-                    GlobalStateMgr.getCurrentInvertedIndex().addReplica(restoreTablet.getId(), restoreReplica);
-                    CreateReplicaTask task = new CreateReplicaTask(restoreReplica.getBackendId(), dbId,
-                            localTbl.getId(), restorePart.getId(), restoredIdx.getId(),
-                            restoreTablet.getId(), indexMeta.getShortKeyColumnCount(),
-                            indexMeta.getSchemaHash(), restoreReplica.getVersion(),
-                            indexMeta.getKeysType(), TStorageType.COLUMN,
-                            TStorageMedium.HDD /* all restored replicas will be saved to HDD */,
-                            indexMeta.getSchema(), bfColumns, bfFpp, null,
-                            localTbl.getCopiedIndexes(),
-                            localTbl.isInMemory(),
-                            localTbl.enablePersistentIndex(),
-                            localTbl.getPartitionInfo().getTabletType(restorePart.getId()),
-                            localTbl.getCompressionType(), indexMeta.getSortKeyIdxes());
-                    task.setInRestoreMode(true);
-                    batchTask.addTask(task);
+        for (PhysicalPartition physicalPartition : restorePart.getSubPartitions()) {
+            for (MaterializedIndex restoredIdx : physicalPartition.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                MaterializedIndexMeta indexMeta = localTbl.getIndexMetaByIndexId(restoredIdx.getId());
+                TabletMeta tabletMeta = new TabletMeta(dbId, localTbl.getId(), physicalPartition.getId(),
+                        restoredIdx.getId(), indexMeta.getSchemaHash(), TStorageMedium.HDD);
+                for (Tablet restoreTablet : restoredIdx.getTablets()) {
+                    GlobalStateMgr.getCurrentInvertedIndex().addTablet(restoreTablet.getId(), tabletMeta);
+                    for (Replica restoreReplica : ((LocalTablet) restoreTablet).getImmutableReplicas()) {
+                        GlobalStateMgr.getCurrentInvertedIndex().addReplica(restoreTablet.getId(), restoreReplica);
+                        LOG.info("tablet {} physical partition {} index {} replica {}",
+                                restoreTablet.getId(), physicalPartition.getId(), restoredIdx.getId(),
+                                restoreReplica.getId());
+                        CreateReplicaTask task = new CreateReplicaTask(restoreReplica.getBackendId(), dbId,
+                                localTbl.getId(), physicalPartition.getId(), restoredIdx.getId(),
+                                restoreTablet.getId(), indexMeta.getShortKeyColumnCount(),
+                                indexMeta.getSchemaHash(), indexMeta.getSchemaVersion(), restoreReplica.getVersion(),
+                                indexMeta.getKeysType(), indexMeta.getStorageType(),
+                                TStorageMedium.HDD /* all restored replicas will be saved to HDD */,
+                                indexMeta.getSchema(), bfColumns, bfFpp, null,
+                                localTbl.getCopiedIndexes(),
+                                localTbl.isInMemory(),
+                                localTbl.enablePersistentIndex(),
+                                localTbl.primaryIndexCacheExpireSec(),
+                                localTbl.getPartitionInfo().getTabletType(restorePart.getId()),
+                                localTbl.getCompressionType(), indexMeta.getSortKeyIdxes(),
+                                indexMeta.getSortKeyUniqueIds());
+                        task.setInRestoreMode(true);
+                        batchTask.addTask(task);
+                    }
                 }
             }
         }
@@ -826,13 +893,13 @@ public class RestoreJob extends AbstractJob {
 
     // reset remote partition.
     // reset all id in remote partition, but DO NOT modify any exist globalStateMgr objects.
-    private Partition resetPartitionForRestore(OlapTable localTbl, OlapTable remoteTbl, String partName,
+    public Partition resetPartitionForRestore(OlapTable localTbl, OlapTable remoteTbl, String partName,
                                                int restoreReplicationNum) {
         Preconditions.checkState(localTbl.getPartition(partName) == null);
         Partition remotePart = remoteTbl.getPartition(partName);
         Preconditions.checkNotNull(remotePart);
         PartitionInfo localPartitionInfo = localTbl.getPartitionInfo();
-        Preconditions.checkState(localPartitionInfo.getType() == PartitionType.RANGE);
+        Preconditions.checkState(localPartitionInfo.isRangePartition());
 
         // generate new partition id
         long newPartId = globalStateMgr.getNextId();
@@ -853,42 +920,86 @@ public class RestoreJob extends AbstractJob {
             }
         }
 
-        // save version info for creating replicas
-        long visibleVersion = remotePart.getVisibleVersion();
+        for (PhysicalPartition physicalPartition : remotePart.getSubPartitions()) {
+            // generate new physical partition id
+            if (physicalPartition.getId() != newPartId) {
+                remotePart.removeSubPartition(physicalPartition.getId());
 
-        // tablets
-        for (MaterializedIndex remoteIdx : remotePart.getMaterializedIndices(IndexExtState.VISIBLE)) {
-            int schemaHash = remoteTbl.getSchemaHashByIndexId(remoteIdx.getId());
-            int remotetabletSize = remoteIdx.getTablets().size();
-            remoteIdx.clearTabletsForRestore();
-            // generate new table
-            status = remoteTbl.createTabletsForRestore(remotetabletSize, remoteIdx, globalStateMgr, restoreReplicationNum,
-                    visibleVersion, schemaHash, remotePart.getId(), remotePart.getShardGroupId());
-            if (!status.ok()) {
-                return null;
+                long newPhysicalPartId = globalStateMgr.getNextId();
+                physicalPartition.setIdForRestore(newPhysicalPartId);
+                physicalPartition.setParentId(newPartId);
+                remotePart.addSubPartition(physicalPartition);
+            }
+            // save version info for creating replicas
+            long visibleVersion = physicalPartition.getVisibleVersion();
+
+            // tablets
+            for (MaterializedIndex remoteIdx : physicalPartition.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                int schemaHash = remoteTbl.getSchemaHashByIndexId(remoteIdx.getId());
+                int remotetabletSize = remoteIdx.getTablets().size();
+                remoteIdx.clearTabletsForRestore();
+                // generate new table
+                status = remoteTbl.createTabletsForRestore(remotetabletSize, remoteIdx, globalStateMgr, restoreReplicationNum,
+                        visibleVersion, schemaHash, physicalPartition.getId(), physicalPartition.getShardGroupId());
+                if (!status.ok()) {
+                    return null;
+                }
             }
         }
         return remotePart;
     }
 
-    // files in repo to files in local
     protected void genFileMapping(OlapTable localTbl, Partition localPartition, Long remoteTblId,
                                 BackupPartitionInfo backupPartInfo, boolean overwrite) {
+        if (localPartition.getSubPartitions().size() > 1) {
+            genFileMappingWithSubPartition(localTbl, localPartition, remoteTblId, backupPartInfo, overwrite);
+        } else {
+            genFileMappingWithPartition(localTbl, localPartition, remoteTblId, backupPartInfo, overwrite);
+        }
+    }
+
+    protected void genFileMappingWithPartition(OlapTable localTbl, Partition localPartition, Long remoteTblId,
+                                BackupPartitionInfo backupPartInfo, boolean overwrite) {
         for (MaterializedIndex localIdx : localPartition.getMaterializedIndices(IndexExtState.VISIBLE)) {
-            LOG.debug("get index id: {}, index name: {}", localIdx.getId(),
-                    localTbl.getIndexNameById(localIdx.getId()));
             BackupIndexInfo backupIdxInfo = backupPartInfo.getIdx(localTbl.getIndexNameById(localIdx.getId()));
             Preconditions.checkState(backupIdxInfo.tablets.size() == localIdx.getTablets().size());
             for (int i = 0; i < localIdx.getTablets().size(); i++) {
                 LocalTablet localTablet = (LocalTablet) localIdx.getTablets().get(i);
                 BackupTabletInfo backupTabletInfo = backupIdxInfo.tablets.get(i);
-                LOG.debug("get tablet mapping: {} to {}, index {}", backupTabletInfo.id, localTablet.getId(), i);
                 for (Replica localReplica : localTablet.getImmutableReplicas()) {
                     IdChain src = new IdChain(remoteTblId, backupPartInfo.id, backupIdxInfo.id, backupTabletInfo.id,
                             -1L /* no replica id */);
                     IdChain dest = new IdChain(localTbl.getId(), localPartition.getId(),
                             localIdx.getId(), localTablet.getId(), localReplica.getId());
                     fileMapping.putMapping(dest, src, overwrite);
+                    LOG.debug("tablet mapping: {} to {} file mapping: {} to {}",
+                            backupTabletInfo.id, localTablet.getId(), src, dest);
+                }
+            }
+        }
+    }
+
+    // files in repo to files in local
+    protected void genFileMappingWithSubPartition(OlapTable localTbl, Partition localPartition, Long remoteTblId,
+                                BackupPartitionInfo backupPartInfo, boolean overwrite) {
+        for (PhysicalPartition physicalPartition : localPartition.getSubPartitions()) {
+            BackupPhysicalPartitionInfo physicalPartitionInfo = backupPartInfo.subPartitions.get(
+                    physicalPartition.getBeforeRestoreId());
+            for (MaterializedIndex localIdx : physicalPartition.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                BackupIndexInfo backupIdxInfo = physicalPartitionInfo.getIdx(localTbl.getIndexNameById(localIdx.getId()));
+                Preconditions.checkState(backupIdxInfo.tablets.size() == localIdx.getTablets().size());
+                for (int i = 0; i < localIdx.getTablets().size(); i++) {
+                    LocalTablet localTablet = (LocalTablet) localIdx.getTablets().get(i);
+                    BackupTabletInfo backupTabletInfo = backupIdxInfo.tablets.get(i);
+                    for (Replica localReplica : localTablet.getImmutableReplicas()) {
+                        IdChain src = new IdChain(remoteTblId, physicalPartitionInfo.id, backupIdxInfo.id, backupTabletInfo.id,
+                                -1L /* no replica id */);
+                        IdChain dest = new IdChain(localTbl.getId(), physicalPartition.getId(),
+                                localIdx.getId(), localTablet.getId(), localReplica.getId());
+                        fileMapping.putMapping(dest, src, overwrite);
+                        LOG.debug("tablet mapping: {} to {} file mapping: {} to {}",
+                                backupTabletInfo.id, localTablet.getId(), src, dest);
+                    }
                 }
             }
         }
@@ -913,7 +1024,7 @@ public class RestoreJob extends AbstractJob {
 
             // restored tables
             for (Table restoreTbl : restoredTbls) {
-                db.createTable(restoreTbl);
+                db.registerTableUnlocked(restoreTbl);
                 // modify tablet inverted index
                 for (Partition restorePart : restoreTbl.getPartitions()) {
                     modifyInvertedIndex((OlapTable) restoreTbl, restorePart);
@@ -1025,7 +1136,7 @@ public class RestoreJob extends AbstractJob {
                             HdfsUtil.getTProperties(repo.getLocation(), brokerDesc, hdfsProperties);
                         } catch (UserException e) {
                             status = new Status(ErrCode.COMMON_ERROR, "Get properties from " + repo.getLocation() + " error.");
-                            return;    
+                            return;
                         }
                     }
                     // allot tasks
@@ -1067,8 +1178,10 @@ public class RestoreJob extends AbstractJob {
     protected void prepareDownloadTasks(List<SnapshotInfo> beSnapshotInfos, Database db, long beId, List<FsBroker> brokerAddrs,
                                         THdfsProperties hdfsProperties) {
         int totalNum = beSnapshotInfos.size();
-        // each backend allot at most 3 tasks
-        int batchNum = Math.min(totalNum, 3);
+        int batchNum = totalNum;
+        if (Config.max_download_task_per_be > 0) {
+            batchNum = Math.min(totalNum, Config.max_download_task_per_be);
+        }
         // each task contains several upload subtasks
         int taskNumPerBatch = Math.max(totalNum / batchNum, 1);
         LOG.debug("backend {} has {} batch, total {} tasks, {}",
@@ -1088,7 +1201,7 @@ public class RestoreJob extends AbstractJob {
                 }
                 OlapTable olapTbl = (OlapTable) tbl;
 
-                Partition part = olapTbl.getPartition(info.getPartitionId());
+                PhysicalPartition part = olapTbl.getPhysicalPartition(info.getPartitionId());
                 if (part == null) {
                     status = new Status(ErrCode.NOT_FOUND, "partition "
                             + info.getPartitionId() + " does not exist in restored table: "
@@ -1099,7 +1212,7 @@ public class RestoreJob extends AbstractJob {
                 MaterializedIndex idx = part.getIndex(info.getIndexId());
                 if (idx == null) {
                     status = new Status(ErrCode.NOT_FOUND,
-                            "index " + info.getIndexId() + " does not exist in partion " + part.getName()
+                            "index " + info.getIndexId() + " does not exist in partion " + part.getId()
                                     + "of restored table " + tbl.getName());
                     return;
                 }
@@ -1142,7 +1255,8 @@ public class RestoreJob extends AbstractJob {
                 // download to previously existing snapshot dir
                 String dest = snapshotInfo.getTabletPath();
                 srcToDest.put(src, dest);
-                LOG.debug("create download src path: {}, dest path: {}", src, dest);
+                LOG.debug("catalog id: {}, repo id: {}, repoTabletPath: {}, src: {}, dest: {}",
+                        catalogIds, repoIds, repoTabletPath, src, dest);
             }
             long signature = globalStateMgr.getNextId();
             DownloadTask task;
@@ -1207,6 +1321,7 @@ public class RestoreJob extends AbstractJob {
             if (!st.ok()) {
                 status = st;
             }
+            MetricRepo.COUNTER_UNFINISHED_RESTORE_JOB.increase(-1L);
             return;
         }
         LOG.info("waiting {} tablets to commit. {}", unfinishedSignatureToId.size(), this);
@@ -1233,7 +1348,7 @@ public class RestoreJob extends AbstractJob {
                 Map<Long, Long> map = restoredVersionInfo.rowMap().get(tblId);
                 for (Map.Entry<Long, Long> entry : map.entrySet()) {
                     long partId = entry.getKey();
-                    Partition part = olapTbl.getPartition(partId);
+                    PhysicalPartition part = olapTbl.getPhysicalPartition(partId);
                     if (part == null) {
                         continue;
                     }
@@ -1268,20 +1383,46 @@ public class RestoreJob extends AbstractJob {
 
             globalStateMgr.getEditLog().logRestoreJob(this);
 
-            // register table in DynamicPartitionScheduler after restore job finished
             db.readLock();
             try {
                 for (BackupTableInfo tblInfo : jobInfo.tables.values()) {
                     Table tbl = db.getTable(jobInfo.getAliasByOriginNameIfSet(tblInfo.name));
                     if (tbl == null) {
+                        LOG.warn("skip post actions after restore success, table name does not existed: %s",
+                                tblInfo.name);
                         continue;
                     }
-                    if (tbl.getType() != TableType.OLAP) {
+                    if (!tbl.isNativeTableOrMaterializedView()) {
                         continue;
                     }
-                    DynamicPartitionUtil.registerOrRemoveDynamicPartitionTable(db.getId(), (OlapTable) tbl);
-                    DynamicPartitionUtil.registerOrRemovePartitionTTLTable(db.getId(), (OlapTable) tbl);
+                    LOG.info("do post actions for table : {}", tbl.getName());
+
+                    // only for olap table
+                    if (tbl.isOlapTable()) {
+                        try {
+                            // register table in DynamicPartitionScheduler after restore job finished
+                            DynamicPartitionUtil.registerOrRemovePartitionScheduleInfo(db.getId(), (OlapTable) tbl);
+                        } catch (Exception e) {
+                            // no throw exceptions
+                            LOG.warn(String.format("register table %s for dynamic partition scheduler failed: ",
+                                    tbl.getName()), e);
+                        }
+                    }
+
+                    if (tbl.isMaterializedView()) {
+                        // rebuild materialized view after restore job finished
+                        MaterializedView mv = (MaterializedView) tbl;
+                        try {
+                            mv.doAfterRestore(db);
+                        } catch (Exception e) {
+                            // no throw exceptions
+                            LOG.warn(String.format("rebuild materialized view %s failed: ", mv.getName()), e);
+                        }
+                    }
                 }
+            } catch (Exception e) {
+                LOG.warn("Do post actions after restore success failed: ", e);
+                throw e;
             } finally {
                 db.readUnlock();
             }
@@ -1291,13 +1432,13 @@ public class RestoreJob extends AbstractJob {
         return Status.OK;
     }
 
-    protected void updateTablets(MaterializedIndex idx, Partition part) {
+    protected void updateTablets(MaterializedIndex idx, PhysicalPartition part) {
         for (Tablet tablet : idx.getTablets()) {
             for (Replica replica : ((LocalTablet) tablet).getImmutableReplicas()) {
-                if (!replica.checkVersionCatchUp(part.getVisibleVersion(), false)) {
-                    replica.updateRowCount(part.getVisibleVersion(),
-                            replica.getDataSize(), replica.getRowCount());
-                }
+                // force update all info for all replica
+                replica.updateForRestore(part.getVisibleVersion(),
+                        replica.getDataSize(), replica.getRowCount());
+                replica.setLastReportVersion(part.getVisibleVersion());
             }
         }
     }
@@ -1371,6 +1512,7 @@ public class RestoreJob extends AbstractJob {
 
         status = new Status(ErrCode.COMMON_ERROR, "user cancelled, current state: " + state.name());
         cancelInternal(false);
+        MetricRepo.COUNTER_UNFINISHED_RESTORE_JOB.increase(-1L);
         return Status.OK;
     }
 
@@ -1466,7 +1608,7 @@ public class RestoreJob extends AbstractJob {
                 continue;
             }
 
-            if (!tbl.isOlapOrLakeTable()) {
+            if (!tbl.isNativeTableOrMaterializedView()) {
                 continue;
             }
 

@@ -43,20 +43,33 @@ Status TabletScanner::init(RuntimeState* runtime_state, const TabletScannerParam
     _runtime_state = runtime_state;
     _skip_aggregation = params.skip_aggregation;
     _need_agg_finalize = params.need_agg_finalize;
+    _update_num_scan_range = params.update_num_scan_range;
 
     RETURN_IF_ERROR(Expr::clone_if_not_exists(runtime_state, &_pool, *params.conjunct_ctxs, &_conjunct_ctxs));
     RETURN_IF_ERROR(_get_tablet(params.scan_range));
+
+    auto tablet_schema_ptr = _tablet->tablet_schema();
+    _tablet_schema = TabletSchema::copy(tablet_schema_ptr);
+
+    // if column_desc come from fe, reset tablet schema
+    if (_parent->_olap_scan_node.__isset.columns_desc && !_parent->_olap_scan_node.columns_desc.empty() &&
+        _parent->_olap_scan_node.columns_desc[0].col_unique_id >= 0) {
+        _tablet_schema->clear_columns();
+        for (const auto& column_desc : _parent->_olap_scan_node.columns_desc) {
+            _tablet_schema->append_column(TabletColumn(column_desc));
+        }
+    }
+
     RETURN_IF_ERROR(_init_unused_output_columns(*params.unused_output_columns));
     RETURN_IF_ERROR(_init_return_columns());
     RETURN_IF_ERROR(_init_global_dicts());
     RETURN_IF_ERROR(_init_reader_params(params.key_ranges));
-    const TabletSchema& tablet_schema = _tablet->tablet_schema();
-    Schema child_schema = ChunkHelper::convert_schema(tablet_schema, _reader_columns);
+    Schema child_schema = ChunkHelper::convert_schema(_tablet_schema, _reader_columns);
     _reader = std::make_shared<TabletReader>(_tablet, Version(0, _version), std::move(child_schema));
     if (_reader_columns.size() == _scanner_columns.size()) {
         _prj_iter = _reader;
     } else {
-        Schema output_schema = ChunkHelper::convert_schema(tablet_schema, _scanner_columns);
+        Schema output_schema = ChunkHelper::convert_schema(_tablet_schema, _scanner_columns);
         _prj_iter = new_projection_iterator(output_schema, _reader);
     }
 
@@ -97,9 +110,9 @@ Status TabletScanner::open([[maybe_unused]] RuntimeState* runtime_state) {
     }
 }
 
-Status TabletScanner::close(RuntimeState* state) {
+void TabletScanner::close(RuntimeState* state) {
     if (_is_closed) {
-        return Status::OK();
+        return;
     }
     if (_prj_iter) {
         _prj_iter->close();
@@ -111,7 +124,6 @@ Status TabletScanner::close(RuntimeState* state) {
     // Reduce the memory usage if the the average string size is greater than 512.
     release_large_columns<BinaryColumn>(state->chunk_size() * 512);
     _is_closed = true;
-    return Status::OK();
 }
 
 Status TabletScanner::_get_tablet(const TInternalScanRange* scan_range) {
@@ -137,17 +149,18 @@ Status TabletScanner::_init_reader_params(const std::vector<OlapScanRange*>* key
     // we will not call agg object finalize method in scan node,
     // to avoid the unnecessary SerDe and improve query performance
     _params.need_agg_finalize = _need_agg_finalize;
-    _params.use_page_cache = !config::disable_storage_page_cache;
+    _params.use_page_cache = _runtime_state->use_page_cache();
+    auto parser = _pool.add(new PredicateParser(_tablet->tablet_schema()));
+    std::vector<PredicatePtr> preds;
+    RETURN_IF_ERROR(_parent->_conjuncts_manager.get_column_predicates(parser, &preds));
+
     // Improve for select * from table limit x, x is small
-    if (_parent->_limit != -1 && _parent->_limit < runtime_state()->chunk_size()) {
+    if (preds.empty() && _parent->_limit != -1 && _parent->_limit < runtime_state()->chunk_size()) {
         _params.chunk_size = _parent->_limit;
     } else {
         _params.chunk_size = runtime_state()->chunk_size();
     }
 
-    auto parser = _pool.add(new PredicateParser(_tablet->tablet_schema()));
-    std::vector<PredicatePtr> preds;
-    RETURN_IF_ERROR(_parent->_conjuncts_manager.get_column_predicates(parser, &preds));
     for (auto& p : preds) {
         if (parser->can_pushdown(p.get())) {
             _params.predicates.push_back(p.get());
@@ -157,8 +170,8 @@ Status TabletScanner::_init_reader_params(const std::vector<OlapScanRange*>* key
         _predicate_free_pool.emplace_back(std::move(p));
     }
 
-    ConjunctivePredicatesRewriter not_pushdown_predicate_rewriter(_predicates, *_params.global_dictmaps);
-    not_pushdown_predicate_rewriter.rewrite_predicate(&_pool);
+    GlobalDictPredicatesRewriter not_pushdown_predicate_rewriter(_predicates, *_params.global_dictmaps);
+    RETURN_IF_ERROR(not_pushdown_predicate_rewriter.rewrite_predicate(&_pool));
 
     // Range
     for (auto key_range : *key_ranges) {
@@ -179,11 +192,11 @@ Status TabletScanner::_init_reader_params(const std::vector<OlapScanRange*>* key
     if (_skip_aggregation) {
         _reader_columns = _scanner_columns;
     } else {
-        for (size_t i = 0; i < _tablet->num_key_columns(); i++) {
+        for (size_t i = 0; i < _tablet_schema->num_key_columns(); i++) {
             _reader_columns.push_back(i);
         }
         for (auto index : _scanner_columns) {
-            if (!_tablet->tablet_schema().column(index).is_key()) {
+            if (!_tablet_schema->column(index).is_key()) {
                 _reader_columns.push_back(index);
             }
         }
@@ -200,7 +213,7 @@ Status TabletScanner::_init_return_columns() {
         if (!slot->is_materialized()) {
             continue;
         }
-        int32_t index = _tablet->field_index(slot->col_name());
+        int32_t index = _tablet_schema->field_index(slot->col_name());
         if (index < 0) {
             auto msg = strings::Substitute("Invalid column name: $0", slot->col_name());
             LOG(WARNING) << msg;
@@ -222,7 +235,7 @@ Status TabletScanner::_init_return_columns() {
 
 Status TabletScanner::_init_unused_output_columns(const std::vector<std::string>& unused_output_columns) {
     for (const auto& col_name : unused_output_columns) {
-        int32_t index = _tablet->field_index(col_name);
+        int32_t index = _tablet_schema->field_index(col_name);
         if (index < 0) {
             auto msg = strings::Substitute("Invalid column name: $0", col_name);
             LOG(WARNING) << msg;
@@ -246,7 +259,7 @@ Status TabletScanner::_init_global_dicts() {
         auto iter = global_dict_map.find(slot->id());
         if (iter != global_dict_map.end()) {
             auto& dict_map = iter->second.first;
-            int32_t index = _tablet->field_index(slot->col_name());
+            int32_t index = _tablet_schema->field_index(slot->col_name());
             DCHECK(index >= 0);
             global_dict->emplace(index, const_cast<GlobalDictMap*>(&dict_map));
         }
@@ -275,7 +288,7 @@ Status TabletScanner::get_chunk(RuntimeState* state, Chunk* chunk) {
             SCOPED_TIMER(_expr_filter_timer);
             size_t nrows = chunk->num_rows();
             _selection.resize(nrows);
-            _predicates.evaluate(chunk, _selection.data(), 0, nrows);
+            RETURN_IF_ERROR(_predicates.evaluate(chunk, _selection.data(), 0, nrows));
             chunk->filter(_selection);
             DCHECK_CHUNK(chunk);
         }
@@ -337,6 +350,7 @@ void TabletScanner::update_counter() {
 
     COUNTER_UPDATE(_parent->_get_rowsets_timer, _reader->stats().get_rowsets_ns);
     COUNTER_UPDATE(_parent->_get_delvec_timer, _reader->stats().get_delvec_ns);
+    COUNTER_UPDATE(_parent->_get_delta_column_group_timer, _reader->stats().get_delta_column_group_ns);
     COUNTER_UPDATE(_parent->_seg_init_timer, _reader->stats().segment_init_ns);
 
     int64_t cond_evaluate_ns = 0;

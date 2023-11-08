@@ -19,29 +19,30 @@ import com.starrocks.analysis.Expr;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.qe.ShowResultSetMetaData;
+import com.starrocks.sql.parser.NodePosition;
 
 // Show warehouse statement.
 public class ShowWarehousesStmt extends ShowStmt {
-    private static final String WH_COL = "Warehouse";
     private static final ShowResultSetMetaData META_DATA =
             ShowResultSetMetaData.builder()
-                    .addColumn(new Column(WH_COL, ScalarType.createVarchar(256)))
+                    .addColumn(new Column("Id", ScalarType.createVarchar(20)))
+                    .addColumn(new Column("Warehouse", ScalarType.createVarchar(256)))
                     .addColumn(new Column("State", ScalarType.createVarchar(20)))
-                    .addColumn(new Column("Size", ScalarType.createVarchar(20)))
-                    .addColumn(new Column("MinCluster", ScalarType.createVarchar(20)))
-                    .addColumn(new Column("MaxCluster", ScalarType.createVarchar(20)))
                     .addColumn(new Column("ClusterCount", ScalarType.createVarchar(20)))
-                    .addColumn(new Column("TotalPending", ScalarType.createVarchar(20)))
-                    .addColumn(new Column("TotalRunning", ScalarType.createVarchar(20)))
                     .build();
     private final String pattern;
     private Expr where;
 
     public ShowWarehousesStmt(String pattern) {
-        this.pattern = pattern;
+        this(pattern, null, NodePosition.ZERO);
     }
 
     public ShowWarehousesStmt(String pattern, Expr where) {
+        this(pattern, where, NodePosition.ZERO);
+    }
+
+    public ShowWarehousesStmt(String pattern, Expr where, NodePosition pos) {
+        super(pos);
         this.pattern = pattern;
         this.where = where;
     }

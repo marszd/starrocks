@@ -43,7 +43,7 @@ UNPARTITIONED
 5:Project
 |  <slot 22> : 22: P_TYPE
 |  <slot 29> : 34: multiply
-|  <slot 34> : 34: multiply
+|  <slot 34> : clone(34: multiply)
 |  common expressions:
 |  <slot 33> : 1.0 - 7: L_DISCOUNT
 |  <slot 34> : 6: L_EXTENDEDPRICE * 33: subtract
@@ -63,7 +63,6 @@ rollup: part
 tabletRatio=10/10
 cardinality=20000000
 avgRowSize=33.0
-numNodes=0
 
 PLAN FRAGMENT 2
 OUTPUT EXPRS:
@@ -87,6 +86,5 @@ rollup: lineitem
 tabletRatio=20/20
 cardinality=6653465
 avgRowSize=28.0
-numNodes=0
 [end]
 

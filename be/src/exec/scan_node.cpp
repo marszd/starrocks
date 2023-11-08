@@ -49,6 +49,20 @@ const std::string ScanNode::_s_scanner_thread_total_wallclock_time = "ScannerThr
 
 const string ScanNode::_s_num_scanner_threads_started = "NumScannerThreadsStarted";
 
+Status ScanNode::init(const TPlanNode& tnode, RuntimeState* state) {
+    RETURN_IF_ERROR(ExecNode::init(tnode, state));
+    const TQueryOptions& options = state->query_options();
+    if (options.__isset.io_tasks_per_scan_operator) {
+        _io_tasks_per_scan_operator = options.io_tasks_per_scan_operator;
+    }
+    double mem_ratio = config::scan_use_query_mem_ratio;
+    if (options.__isset.scan_use_query_mem_ratio) {
+        mem_ratio = options.scan_use_query_mem_ratio;
+    }
+    _mem_limit = state->query_mem_tracker_ptr()->limit() * mem_ratio;
+    return Status::OK();
+}
+
 Status ScanNode::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(ExecNode::prepare(state));
 
@@ -95,6 +109,9 @@ StatusOr<pipeline::MorselQueueFactoryPtr> ScanNode::convert_scan_range_to_morsel
         const std::map<int32_t, std::vector<TScanRangeParams>>& scan_ranges_per_driver_seq, int node_id,
         int pipeline_dop, bool enable_tablet_internal_parallel,
         TTabletInternalParallelMode::type tablet_internal_parallel_mode) {
+    // if scan range is empty, we don't have to check for per-bucket-optimize
+    // if we enable per-bucket-optimize, each scan_operator should be assign scan range by FE planner
+    DCHECK(global_scan_ranges.empty() || !output_chunk_by_bucket() || !scan_ranges_per_driver_seq.empty());
     if (scan_ranges_per_driver_seq.empty()) {
         ASSIGN_OR_RETURN(auto morsel_queue,
                          convert_scan_range_to_morsel_queue(global_scan_ranges, node_id, pipeline_dop,
@@ -126,8 +143,13 @@ StatusOr<pipeline::MorselQueueFactoryPtr> ScanNode::convert_scan_range_to_morsel
             queue_per_driver_seq.emplace(dop, std::move(queue));
         }
 
-        return std::make_unique<pipeline::IndividualMorselQueueFactory>(std::move(queue_per_driver_seq),
-                                                                        /*could_local_shuffle*/ false);
+        if (output_chunk_by_bucket()) {
+            return std::make_unique<pipeline::BucketSequenceMorselQueueFactory>(std::move(queue_per_driver_seq),
+                                                                                /*could_local_shuffle*/ false);
+        } else {
+            return std::make_unique<pipeline::IndividualMorselQueueFactory>(std::move(queue_per_driver_seq),
+                                                                            /*could_local_shuffle*/ false);
+        }
     }
 }
 

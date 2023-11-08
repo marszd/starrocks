@@ -41,8 +41,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.starrocks.analysis.StringLiteral;
-import com.starrocks.analysis.UserIdentity;
-import com.starrocks.authentication.AuthenticationManager;
+import com.starrocks.authentication.AuthenticationMgr;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.DiskInfo;
 import com.starrocks.catalog.OlapTable;
@@ -51,35 +50,43 @@ import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ClientPool;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.FeConstants;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.Pair;
 import com.starrocks.common.StarRocksFEMetaVersion;
 import com.starrocks.common.io.DataOutputBuffer;
 import com.starrocks.common.io.Writable;
+import com.starrocks.common.profile.Timer;
+import com.starrocks.common.profile.Tracers;
+import com.starrocks.common.util.LogUtil;
 import com.starrocks.connector.hive.ReplayMetadataMgr;
+import com.starrocks.ha.FrontendNodeType;
 import com.starrocks.journal.JournalEntity;
+import com.starrocks.journal.JournalInconsistentException;
 import com.starrocks.journal.JournalTask;
 import com.starrocks.meta.MetaContext;
 import com.starrocks.persist.EditLog;
 import com.starrocks.planner.PlanFragment;
+import com.starrocks.privilege.PrivilegeBuiltinConstants;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.DefaultCoordinator;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.qe.VariableMgr;
+import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.Explain;
 import com.starrocks.sql.InsertPlanner;
-import com.starrocks.sql.PlannerProfile;
 import com.starrocks.sql.StatementPlanner;
 import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.CreateMaterializedViewStatement;
 import com.starrocks.sql.ast.CreateViewStmt;
+import com.starrocks.sql.ast.DmlStmt;
 import com.starrocks.sql.ast.InsertStmt;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SelectRelation;
-import com.starrocks.sql.ast.SetVar;
 import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.SystemVariable;
+import com.starrocks.sql.ast.TableRelation;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.sql.common.SqlDigestBuilder;
 import com.starrocks.sql.optimizer.LogicalPlanPrinter;
 import com.starrocks.sql.optimizer.OptExpression;
@@ -101,6 +108,7 @@ import com.starrocks.system.Backend;
 import com.starrocks.system.BackendCoreStat;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.thrift.TResultSinkType;
+import com.starrocks.thrift.TUniqueId;
 import org.apache.commons.codec.binary.Hex;
 import org.junit.Assert;
 
@@ -154,15 +162,15 @@ public class UtFrameUtils {
             "DISTRIBUTED BY HASH(`table_id`, `column_name`, `db_id`) BUCKETS 10\n" +
             "PROPERTIES (\n" +
             "\"replication_num\" = \"1\",\n" +
-            "\"in_memory\" = \"false\",\n" +
-            "\"storage_format\" = \"DEFAULT\"\n" +
+            "\"in_memory\" = \"false\"\n" +
             ");";
 
     // Help to create a mocked ConnectContext.
     public static ConnectContext createDefaultCtx() {
         ConnectContext ctx = new ConnectContext(null);
         ctx.setCurrentUserIdentity(UserIdentity.ROOT);
-        ctx.setQualifiedUser(AuthenticationManager.ROOT_USER);
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+        ctx.setQualifiedUser(AuthenticationMgr.ROOT_USER);
         ctx.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
         ctx.setThreadLocalInfo();
         ctx.setDumpInfo(new MockDumpInfo());
@@ -236,10 +244,7 @@ public class UtFrameUtils {
             ClientPool.heartbeatPool = new MockGenericPool.HeatBeatPool("heartbeat");
             ClientPool.backendPool = new MockGenericPool.BackendThriftPool("backend");
 
-            boolean oldRunningUnitTest = FeConstants.runningUnitTest;
-            FeConstants.runningUnitTest = true;
             startFEServer("fe/mocked/test/" + UUID.randomUUID().toString() + "/", startBDB);
-            FeConstants.runningUnitTest = oldRunningUnitTest;
 
             addMockBackend(10001);
 
@@ -259,11 +264,21 @@ public class UtFrameUtils {
         createMinStarRocksCluster(false);
     }
 
+    public static Backend addMockBackend(int backendId, String host, int beThriftPort) throws Exception {
+        // start be
+        MockedBackend backend = new MockedBackend(host, beThriftPort);
+        // add be
+        return addMockBackend(backend, backendId);
+    }
+
     public static Backend addMockBackend(int backendId) throws Exception {
         // start be
         MockedBackend backend = new MockedBackend("127.0.0.1");
-
         // add be
+        return addMockBackend(backend, backendId);
+    }
+
+    private static Backend addMockBackend(MockedBackend backend, int backendId) {
         Backend be = new Backend(backendId, backend.getHost(), backend.getHeartBeatPort());
         Map<String, DiskInfo> disks = Maps.newHashMap();
         DiskInfo diskInfo1 = new DiskInfo(backendId + "/path1");
@@ -357,7 +372,7 @@ public class UtFrameUtils {
     public static Pair<CreateMaterializedViewStatement, ExecPlan> planMVMaintenance(ConnectContext connectContext,
                                                                                     String sql)
             throws DdlException, CloneNotSupportedException {
-        connectContext.setDumpInfo(new QueryDumpInfo(connectContext.getSessionVariable()));
+        connectContext.setDumpInfo(new QueryDumpInfo(connectContext));
 
         List<StatementBase> statements =
                 com.starrocks.sql.parser.SqlParser.parse(sql, connectContext.getSessionVariable().getSqlMode());
@@ -374,8 +389,8 @@ public class UtFrameUtils {
                 if (optHints != null) {
                     SessionVariable sessionVariable = (SessionVariable) oldSessionVariable.clone();
                     for (String key : optHints.keySet()) {
-                        VariableMgr.setVar(sessionVariable, new SetVar(key, new StringLiteral(optHints.get(key))),
-                                true);
+                        VariableMgr.setSystemVariable(sessionVariable,
+                                new SystemVariable(key, new StringLiteral(optHints.get(key))), true);
                     }
                     connectContext.setSessionVariable(sessionVariable);
                 }
@@ -391,13 +406,18 @@ public class UtFrameUtils {
         }
     }
 
-    public static Pair<String, ExecPlan> getPlanAndFragment(ConnectContext connectContext, String originStmt)
-            throws Exception {
-        connectContext.setDumpInfo(new QueryDumpInfo(connectContext.getSessionVariable()));
+    private interface GetPlanHook<R> {
+        R apply(ConnectContext context, StatementBase statementBase, ExecPlan execPlan) throws Exception;
+    }
+
+    private static <R> R buildPlan(ConnectContext connectContext, String originStmt,
+                                   GetPlanHook<R> returnedSupplier) throws Exception {
+        connectContext.setDumpInfo(new QueryDumpInfo(connectContext));
+        originStmt = LogUtil.removeLineSeparator(originStmt);
 
         List<StatementBase> statements;
-        try (PlannerProfile.ScopedTimer ignored = PlannerProfile.getScopedTimer("Parser")) {
-            statements = SqlParser.parse(originStmt, connectContext.getSessionVariable().getSqlMode());
+        try (Timer ignored = Tracers.watchScope("Parser")) {
+            statements = SqlParser.parse(originStmt, connectContext.getSessionVariable());
         }
         connectContext.getDumpInfo().setOriginStmt(originStmt);
         SessionVariable oldSessionVariable = connectContext.getSessionVariable();
@@ -412,26 +432,88 @@ public class UtFrameUtils {
                 if (optHints != null) {
                     SessionVariable sessionVariable = (SessionVariable) oldSessionVariable.clone();
                     for (String key : optHints.keySet()) {
-                        VariableMgr.setVar(sessionVariable, new SetVar(key, new StringLiteral(optHints.get(key))),
-                                true);
+                        VariableMgr.setSystemVariable(sessionVariable,
+                                new SystemVariable(key, new StringLiteral(optHints.get(key))), true);
                     }
                     connectContext.setSessionVariable(sessionVariable);
                 }
             }
 
             ExecPlan execPlan;
-            try (PlannerProfile.ScopedTimer ignored = PlannerProfile.getScopedTimer("Planner")) {
+            try (Timer ignored = Tracers.watchScope("Planner")) {
                 execPlan = StatementPlanner.plan(statementBase, connectContext);
             }
 
             testView(connectContext, originStmt, statementBase);
 
             validatePlanConnectedness(execPlan);
-            return new Pair<>(LogicalPlanPrinter.print(execPlan.getPhysicalPlan()), execPlan);
+            return returnedSupplier.apply(connectContext, statementBase, execPlan);
         } finally {
             // before returning we have to restore session variable.
             connectContext.setSessionVariable(oldSessionVariable);
         }
+    }
+
+    public static Pair<String, ExecPlan> getPlanAndFragment(ConnectContext connectContext, String originStmt)
+            throws Exception {
+        return buildPlan(connectContext, originStmt,
+                (context, statementBase, execPlan) -> new Pair<>(printPhysicalPlan(execPlan.getPhysicalPlan()),
+                        execPlan));
+    }
+
+    public static DefaultCoordinator startScheduling(ConnectContext connectContext, String originStmt) throws Exception {
+        return buildPlan(connectContext, originStmt,
+                (context, statementBase, execPlan) -> {
+                    DefaultCoordinator scheduler = createScheduler(context, statementBase, execPlan);
+
+                    scheduler.startScheduling();
+
+                    return scheduler;
+                });
+    }
+
+    public static Pair<String, DefaultCoordinator> getPlanAndStartScheduling(ConnectContext connectContext, String originStmt)
+            throws Exception {
+        return buildPlan(connectContext, originStmt,
+                (context, statementBase, execPlan) -> {
+                    DefaultCoordinator scheduler = createScheduler(context, statementBase, execPlan);
+
+                    scheduler.startSchedulingWithoutDeploy();
+                    String plan = scheduler.getSchedulerExplain();
+
+                    return Pair.create(plan, scheduler);
+                });
+    }
+
+    public static DefaultCoordinator getScheduler(ConnectContext connectContext, String originStmt) throws Exception {
+        return buildPlan(connectContext, originStmt, UtFrameUtils::createScheduler);
+    }
+
+    private static DefaultCoordinator createScheduler(ConnectContext context, StatementBase statementBase, ExecPlan execPlan) {
+        context.setExecutionId(new TUniqueId(1, 2));
+        DefaultCoordinator scheduler;
+        if (statementBase instanceof DmlStmt) {
+            if (statementBase instanceof InsertStmt) {
+                scheduler = new DefaultCoordinator.Factory().createInsertScheduler(context,
+                        execPlan.getFragments(), execPlan.getScanNodes(),
+                        execPlan.getDescTbl().toThrift());
+            } else {
+                throw new RuntimeException("can only handle insert DML");
+            }
+        } else {
+            scheduler = new DefaultCoordinator.Factory().createQueryScheduler(context,
+                    execPlan.getFragments(), execPlan.getScanNodes(), execPlan.getDescTbl().toThrift());
+        }
+
+        return scheduler;
+    }
+
+    public static String printPhysicalPlan(OptExpression execPlan) {
+        return LogicalPlanPrinter.print(execPlan, isPrintPlanTableNames());
+    }
+
+    public static boolean isPrintPlanTableNames() {
+        return false;
     }
 
     private static void testView(ConnectContext connectContext, String originStmt, StatementBase statementBase)
@@ -441,7 +523,7 @@ public class UtFrameUtils {
             String viewName = "view" + INDEX.getAndIncrement();
             String createView = "create view " + viewName + " as " + originStmt;
             CreateViewStmt createTableStmt;
-            try (PlannerProfile.ScopedTimer ignored = PlannerProfile.getScopedTimer("Test View")) {
+            try (Timer ignored = Tracers.watchScope("Test View")) {
                 createTableStmt = (CreateViewStmt) UtFrameUtils.parseStmtWithNewParser(createView, connectContext);
                 try {
                     StatementBase viewStatement =
@@ -462,6 +544,11 @@ public class UtFrameUtils {
 
     public static String printPlan(ExecPlan plan) {
         return Explain.toString(plan.getPhysicalPlan(), plan.getOutputColumns());
+    }
+
+    public static String explainLogicalPlan(ConnectContext ctx, String sql) throws Exception {
+        Pair<String, ExecPlan> planAndExplain = getPlanAndFragment(ctx, sql);
+        return printPlan(planAndExplain.second);
     }
 
     public static String getStmtDigest(ConnectContext connectContext, String originStmt) throws Exception {
@@ -502,11 +589,12 @@ public class UtFrameUtils {
         // mock replay external table info
         if (!replayDumpInfo.getHmsTableMap().isEmpty()) {
             ReplayMetadataMgr replayMetadataMgr = new ReplayMetadataMgr(
-                    connectContext.getGlobalStateMgr().getLocalMetastore(),
-                    connectContext.getGlobalStateMgr().getConnectorMgr(),
+                    GlobalStateMgr.getCurrentState().getLocalMetastore(),
+                    GlobalStateMgr.getCurrentState().getConnectorMgr(),
+                    GlobalStateMgr.getCurrentState().getResourceMgr(),
                     replayDumpInfo.getHmsTableMap(),
                     replayDumpInfo.getTableStatisticsMap());
-            connectContext.getGlobalStateMgr().setMetadataMgr(replayMetadataMgr);
+            GlobalStateMgr.getCurrentState().setMetadataMgr(replayMetadataMgr);
         }
 
         // create table
@@ -559,13 +647,8 @@ public class UtFrameUtils {
         // mock table row count
         for (Map.Entry<String, Map<String, Long>> entry : replayDumpInfo.getPartitionRowCountMap().entrySet()) {
             String dbName = entry.getKey().split("\\.")[0];
-            OlapTable replayTable = (OlapTable) connectContext.getGlobalStateMgr().getDb("" + dbName)
+            OlapTable replayTable = (OlapTable) GlobalStateMgr.getCurrentState().getDb("" + dbName)
                     .getTable(entry.getKey().split("\\.")[1]);
-
-            // Should disable Dynamic Partition in replay dump test
-            if (replayTable.getTableProperty() != null) {
-                replayTable.getTableProperty().getDynamicPartitionProperty().disable();
-            }
 
             for (Map.Entry<String, Long> partitionEntry : entry.getValue().entrySet()) {
                 setPartitionStatistics(replayTable, partitionEntry.getKey(), partitionEntry.getValue());
@@ -575,7 +658,7 @@ public class UtFrameUtils {
         for (Map.Entry<String, Map<String, ColumnStatistic>> entry : replayDumpInfo.getTableStatisticsMap()
                 .entrySet()) {
             String dbName = entry.getKey().split("\\.")[0];
-            Table replayTable = connectContext.getGlobalStateMgr().getDb("" + dbName)
+            Table replayTable = GlobalStateMgr.getCurrentState().getDb("" + dbName)
                     .getTable(entry.getKey().split("\\.")[1]);
             for (Map.Entry<String, ColumnStatistic> columnStatisticEntry : entry.getValue().entrySet()) {
                 GlobalStateMgr.getCurrentStatisticStorage()
@@ -598,36 +681,57 @@ public class UtFrameUtils {
         }
     }
 
-    private static Pair<String, ExecPlan> getQueryExecPlan(QueryStatement statement, ConnectContext connectContext) {
+    private static Pair<String, ExecPlan> getQueryExecPlan(QueryStatement statement, ConnectContext connectContext)
+            throws Exception {
+        Map<String, String> optHints = null;
+        SessionVariable sessionVariableBackup = connectContext.getSessionVariable();
+        if (statement.getQueryRelation() instanceof SelectRelation) {
+            SelectRelation selectRelation = (SelectRelation) statement.getQueryRelation();
+            optHints = selectRelation.getSelectList().getOptHints();
+        }
+
+        if (optHints != null) {
+            SessionVariable sessionVariable = (SessionVariable) sessionVariableBackup.clone();
+            for (String key : optHints.keySet()) {
+                VariableMgr.setSystemVariable(sessionVariable,
+                        new SystemVariable(key, new StringLiteral(optHints.get(key))), true);
+            }
+            connectContext.setSessionVariable(sessionVariable);
+        }
+
         ColumnRefFactory columnRefFactory = new ColumnRefFactory();
 
-        PlannerProfile.ScopedTimer t = PlannerProfile.getScopedTimer("Transformer");
-        LogicalPlan logicalPlan = new RelationTransformer(columnRefFactory, connectContext)
-                .transform((statement).getQueryRelation());
-        t.close();
+        LogicalPlan logicalPlan;
+        try (Timer t = Tracers.watchScope("Transformer")) {
+            logicalPlan = new RelationTransformer(columnRefFactory, connectContext)
+                    .transform((statement).getQueryRelation());
 
-        t = PlannerProfile.getScopedTimer("Optimizer");
-        Optimizer optimizer = new Optimizer();
-        OptExpression optimizedPlan = optimizer.optimize(
-                connectContext,
-                logicalPlan.getRoot(),
-                new PhysicalPropertySet(),
-                new ColumnRefSet(logicalPlan.getOutputColumn()),
-                columnRefFactory);
-        t.close();
+        }
 
-        t = PlannerProfile.getScopedTimer("Builder");
-        ExecPlan execPlan = PlanFragmentBuilder
-                .createPhysicalPlan(optimizedPlan, connectContext,
-                        logicalPlan.getOutputColumn(), columnRefFactory, new ArrayList<>(),
-                        TResultSinkType.MYSQL_PROTOCAL, true);
-        t.close();
+        OptExpression optimizedPlan;
+        try (Timer t = Tracers.watchScope("Optimizer")) {
+            Optimizer optimizer = new Optimizer();
+            optimizedPlan = optimizer.optimize(
+                    connectContext,
+                    logicalPlan.getRoot(),
+                    new PhysicalPropertySet(),
+                    new ColumnRefSet(logicalPlan.getOutputColumn()),
+                    columnRefFactory);
+        }
+
+        ExecPlan execPlan;
+        try (Timer t = Tracers.watchScope("Builder")) {
+            execPlan = PlanFragmentBuilder
+                    .createPhysicalPlan(optimizedPlan, connectContext,
+                            logicalPlan.getOutputColumn(), columnRefFactory, new ArrayList<>(),
+                            TResultSinkType.MYSQL_PROTOCAL, true);
+        }
 
         return new Pair<>(LogicalPlanPrinter.print(optimizedPlan), execPlan);
     }
 
     private static Pair<String, ExecPlan> getInsertExecPlan(InsertStmt statement, ConnectContext connectContext) {
-        PlannerProfile.ScopedTimer t = PlannerProfile.getScopedTimer("Planner");
+        Timer t = Tracers.watchScope("Planner");
         ExecPlan execPlan = new InsertPlanner().plan(statement, connectContext);
         t.close();
         return new Pair<>(LogicalPlanPrinter.print(execPlan.getPhysicalPlan()), execPlan);
@@ -636,15 +740,21 @@ public class UtFrameUtils {
     public static Pair<String, ExecPlan> getNewPlanAndFragmentFromDump(ConnectContext connectContext,
                                                                        QueryDumpInfo replayDumpInfo) throws Exception {
         String replaySql = initMockEnv(connectContext, replayDumpInfo);
+        replaySql = LogUtil.removeLineSeparator(replaySql);
         Map<String, Database> dbs = null;
         try {
-            PlannerProfile.ScopedTimer st = PlannerProfile.getScopedTimer("Parse");
-            StatementBase statementBase = com.starrocks.sql.parser.SqlParser.parse(replaySql,
-                    connectContext.getSessionVariable()).get(0);
-            st.close();
-            PlannerProfile.ScopedTimer st1 = PlannerProfile.getScopedTimer("Anazlye");
-            com.starrocks.sql.analyzer.Analyzer.analyze(statementBase, connectContext);
-            st1.close();
+            StatementBase statementBase;
+            try (Timer st = Tracers.watchScope("Parse")) {
+                statementBase = com.starrocks.sql.parser.SqlParser.parse(replaySql,
+                        connectContext.getSessionVariable()).get(0);
+                if (statementBase instanceof QueryStatement) {
+                    replaceTableCatalogName(statementBase);
+                }
+            }
+
+            try (Timer st1 = Tracers.watchScope("Analyze")) {
+                com.starrocks.sql.analyzer.Analyzer.analyze(statementBase, connectContext);
+            }
 
             dbs = AnalyzerUtils.collectAllDatabase(connectContext, statementBase);
             lock(dbs);
@@ -660,6 +770,17 @@ public class UtFrameUtils {
         } finally {
             unLock(dbs);
             tearMockEnv();
+        }
+    }
+
+    private static void replaceTableCatalogName(StatementBase statementBase) {
+        List<TableRelation> tableRelations = AnalyzerUtils.collectTableRelations(statementBase);
+        for (TableRelation tableRelation : tableRelations) {
+            if (tableRelation.getName().getCatalog() != null) {
+                String catalogName = tableRelation.getName().getCatalog();
+                tableRelation.getName().setCatalog(
+                        CatalogMgr.ResourceMappingCatalog.getResourceMappingCatalogName(catalogName, "hive"));
+            }
         }
     }
 
@@ -724,9 +845,8 @@ public class UtFrameUtils {
         private DataOutputBuffer buffer;
         private static final int OUTPUT_BUFFER_INIT_SIZE = 128;
 
-        protected static void setUpImageVersion() {
+        public static void setUpImageVersion() {
             MetaContext metaContext = new MetaContext();
-            metaContext.setMetaVersion(FeMetaVersion.VERSION_CURRENT);
             metaContext.setStarRocksMetaVersion(StarRocksFEMetaVersion.VERSION_CURRENT);
             metaContext.setThreadLocalInfo();
             isSetup.set(true);
@@ -765,6 +885,7 @@ public class UtFrameUtils {
         protected static synchronized void setUp() {
             assert (fakeJournalWriter == null);
             GlobalStateMgr.getCurrentState().setEditLog(new EditLog(masterJournalQueue));
+            GlobalStateMgr.getCurrentState().setFrontendNodeType(FrontendNodeType.LEADER);
 
             // simulate the process of master journal synchronizing to the follower
             fakeJournalWriter = new Thread(new Runnable() {
@@ -816,6 +937,25 @@ public class UtFrameUtils {
             }
         }
 
+        public static synchronized void replayJournalToEnd() throws InterruptedException, IOException {
+            int count = followerJournalQueue.size();
+            while (!followerJournalQueue.isEmpty()) {
+                DataOutputBuffer buffer = followerJournalQueue.take().getBuffer();
+                JournalEntity je = new JournalEntity();
+                try (DataInputStream dis = new DataInputStream(
+                        new ByteArrayInputStream(buffer.getData(), 0, buffer.getLength()))) {
+                    je.readFields(dis);
+                    EditLog.loadJournal(GlobalStateMgr.getCurrentState(), je);
+                    // System.out.println("replayed journal type: " + je.getOpCode());
+                } catch (JournalInconsistentException e) {
+                    System.err.println("load journal failed, type: " + je.getOpCode() + " , error: " + e.getMessage());
+                    e.printStackTrace();
+                    Assert.fail();
+                }
+            }
+            System.out.println("replayed " + count + " journal(s) from begin to end");
+        }
+
         protected static synchronized void tearDown() {
             if (fakeJournalWriter != null) {
                 try {
@@ -832,7 +972,8 @@ public class UtFrameUtils {
     public static ConnectContext initCtxForNewPrivilege(UserIdentity userIdentity) throws Exception {
         ConnectContext ctx = new ConnectContext(null);
         ctx.setCurrentUserIdentity(userIdentity);
-        ctx.setQualifiedUser(userIdentity.getQualifiedUser());
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+        ctx.setQualifiedUser(userIdentity.getUser());
         GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
         globalStateMgr.initAuth(true);
         ctx.setGlobalStateMgr(globalStateMgr);

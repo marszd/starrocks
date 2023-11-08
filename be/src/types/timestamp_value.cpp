@@ -32,6 +32,12 @@ static const char* s_day_name[] = {"Monday", "Tuesday",  "Wednesday", "Thursday"
                                    "Friday", "Saturday", "Sunday",    nullptr};
 static const char* s_ab_day_name[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", nullptr};
 
+TimestampValue TimestampValue::create_from_unixtime(int64_t ts, const cctz::time_zone& ctz) {
+    TimestampValue value;
+    value.from_unixtime(ts, ctz);
+    return value;
+}
+
 bool TimestampValue::from_timestamp_literal(uint64_t timestamp) {
     uint64_t date = timestamp / 1000000;
     uint64_t time = timestamp % 1000000;
@@ -816,17 +822,23 @@ bool TimestampValue::from_unixtime(int64_t second, const std::string& timezone) 
     if (!TimezoneUtils::find_cctz_time_zone(timezone, ctz)) {
         return false;
     }
-    return from_unixtime(second, ctz);
+    from_unixtime(second, ctz);
+    return true;
 }
 
-bool TimestampValue::from_unixtime(int64_t second, const cctz::time_zone& ctz) {
+void TimestampValue::from_unixtime(int64_t second, const cctz::time_zone& ctz) {
     static const cctz::time_point<cctz::sys_seconds> epoch =
             std::chrono::time_point_cast<cctz::sys_seconds>(std::chrono::system_clock::from_time_t(0));
     cctz::time_point<cctz::sys_seconds> t = epoch + cctz::seconds(second);
 
     const auto tp = cctz::convert(t, ctz);
     from_timestamp(tp.year(), tp.month(), tp.day(), tp.hour(), tp.minute(), tp.second(), 0);
-    return true;
+}
+
+void TimestampValue::from_unixtime(int64_t second, int64_t microsecond, const cctz::time_zone& ctz) {
+    from_unixtime(second, ctz);
+    _timestamp += microsecond;
+    return;
 }
 
 void TimestampValue::from_unix_second(int64_t second) {

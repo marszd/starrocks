@@ -12,22 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.transaction;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.Tablet;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.catalog.TabletMeta;
+import com.starrocks.common.Config;
 import com.starrocks.common.NoAliveBackendException;
-import com.starrocks.lake.LakeTable;
+import com.starrocks.lake.CommitRateLimiter;
 import com.starrocks.lake.Utils;
+import com.starrocks.lake.compaction.CompactionMgr;
 import com.starrocks.proto.AbortTxnRequest;
 import com.starrocks.rpc.BrpcProxy;
 import com.starrocks.rpc.LakeService;
@@ -38,30 +40,47 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import javax.validation.constraints.NotNull;
 
 public class LakeTableTxnStateListener implements TransactionStateListener {
     private static final Logger LOG = LogManager.getLogger(LakeTableTxnStateListener.class);
     private final DatabaseTransactionMgr dbTxnMgr;
-    private final LakeTable table;
+    // lake table or lake materialized view
+    private final OlapTable table;
 
     private Set<Long> dirtyPartitionSet;
+    private Set<String> invalidDictCacheColumns;
+    private Map<String, Long> validDictCacheColumns;
+    private final CompactionMgr compactionMgr;
 
-    public LakeTableTxnStateListener(DatabaseTransactionMgr dbTxnMgr, LakeTable table) {
-        this.dbTxnMgr = dbTxnMgr;
-        this.table = table;
+    public LakeTableTxnStateListener(@NotNull DatabaseTransactionMgr dbTxnMgr, @NotNull OlapTable table) {
+        this.dbTxnMgr = Objects.requireNonNull(dbTxnMgr, "dbTxnMgr is null");
+        this.table = Objects.requireNonNull(table, "table is null");
+        this.compactionMgr = GlobalStateMgr.getCurrentState().getCompactionMgr();
+        Preconditions.checkState(this.table.isCloudNativeTableOrMaterializedView(),
+                "expect LakeTable or LakeMaterializedView but real type is " + this.table.getClass().getName());
+    }
+
+    @Override
+    public String getTableName() {
+        return table.getName();
     }
 
     @Override
     public void preCommit(TransactionState txnState, List<TabletCommitInfo> finishedTablets,
-            List<TabletFailInfo> failedTablets) throws TransactionException {
+                          List<TabletFailInfo> failedTablets) throws TransactionException {
         Preconditions.checkState(txnState.getTransactionStatus() != TransactionStatus.COMMITTED);
         if (table.getState() == OlapTable.OlapTableState.RESTORE) {
             throw new TransactionCommitFailedException("Cannot write RESTORE state table \"" + table.getName() + "\"");
         }
         dirtyPartitionSet = Sets.newHashSet();
+        invalidDictCacheColumns = Sets.newHashSet();
+        validDictCacheColumns = Maps.newHashMap();
+
         Set<Long> finishedTabletsOfThisTable = Sets.newHashSet();
 
         TabletInvertedIndex tabletInvertedIndex = dbTxnMgr.getGlobalStateMgr().getTabletInvertedIndex();
@@ -76,21 +95,51 @@ public class LakeTableTxnStateListener implements TransactionStateListener {
             if (tabletMeta.getTableId() != table.getId()) {
                 continue;
             }
-            if (table.getPartition(tabletMeta.getPartitionId()) == null) {
+            if (table.getPhysicalPartition(tabletMeta.getPartitionId()) == null) {
                 // this can happen when partitionId == -1 (tablet being dropping) or partition really not exist.
                 continue;
             }
             dirtyPartitionSet.add(tabletMeta.getPartitionId());
+
+            // Invalid column set should union
+            invalidDictCacheColumns.addAll(finishedTablets.get(i).getInvalidDictCacheColumns());
+
+            // Valid column set should intersect and remove all invalid columns
+            // Only need to add valid column set once
+            if (validDictCacheColumns.isEmpty() &&
+                    !finishedTablets.get(i).getValidDictCacheColumns().isEmpty()) {
+                TabletCommitInfo tabletCommitInfo = finishedTablets.get(i);
+                List<Long> validDictCollectedVersions = tabletCommitInfo.getValidDictCollectedVersions();
+                List<String> validDictCacheColumns = tabletCommitInfo.getValidDictCacheColumns();
+                for (int j = 0; j < validDictCacheColumns.size(); j++) {
+                    long version = 0;
+                    // validDictCollectedVersions != validDictCacheColumns means be has not upgrade
+                    if (validDictCollectedVersions.size() == validDictCacheColumns.size()) {
+                        version = validDictCollectedVersions.get(j);
+                    }
+                    this.validDictCacheColumns.put(validDictCacheColumns.get(i), version);
+                }
+            }
+            if (i == tabletMetaList.size() - 1) {
+                validDictCacheColumns.entrySet().removeIf(entry -> invalidDictCacheColumns.contains(entry.getKey()));
+            }
+
             finishedTabletsOfThisTable.add(finishedTablets.get(i).getTabletId());
+        }
+
+        if (enableIngestSlowdown()) {
+            long currentTimeMs = System.currentTimeMillis();
+            new CommitRateLimiter(compactionMgr, txnState, table.getId()).check(dirtyPartitionSet, currentTimeMs);
         }
 
         List<Long> unfinishedTablets = null;
         for (Long partitionId : dirtyPartitionSet) {
-            Partition partition = table.getPartition(partitionId);
+            PhysicalPartition partition = table.getPhysicalPartition(partitionId);
             List<MaterializedIndex> allIndices = txnState.getPartitionLoadedTblIndexes(table.getId(), partition);
             for (MaterializedIndex index : allIndices) {
                 Optional<Tablet> unfinishedTablet =
-                        index.getTablets().stream().filter(t -> !finishedTabletsOfThisTable.contains(t.getId())).findAny();
+                        index.getTablets().stream().filter(t -> !finishedTabletsOfThisTable.contains(t.getId()))
+                                .findAny();
                 if (!unfinishedTablet.isPresent()) {
                     continue;
                 }
@@ -109,13 +158,35 @@ public class LakeTableTxnStateListener implements TransactionStateListener {
 
     @Override
     public void preWriteCommitLog(TransactionState txnState) {
-        Preconditions.checkState(txnState.getTransactionStatus() == TransactionStatus.COMMITTED);
+        Preconditions.checkState(txnState.getTransactionStatus() == TransactionStatus.COMMITTED
+                || txnState.getTransactionStatus() == TransactionStatus.PREPARED);
         TableCommitInfo tableCommitInfo = new TableCommitInfo(table.getId());
+        boolean isFirstPartition = true;
         for (long partitionId : dirtyPartitionSet) {
-            Partition partition = table.getPartition(partitionId);
-            long version = partition.getNextVersion();
-            PartitionCommitInfo partitionCommitInfo = new PartitionCommitInfo(partitionId, version, 0);
+            PhysicalPartition partition = table.getPhysicalPartition(partitionId);
+            PartitionCommitInfo partitionCommitInfo;
+            long version = -1;
+            if (txnState.getTransactionStatus() == TransactionStatus.COMMITTED) {
+                version = partition.getNextVersion();
+            }
+            if (isFirstPartition) {
+                List<String> validDictCacheColumnNames = Lists.newArrayList();
+                List<Long> validDictCacheColumnVersions = Lists.newArrayList();
+
+                validDictCacheColumns.forEach((name, dictVersion) -> {
+                    validDictCacheColumnNames.add(name);
+                    validDictCacheColumnVersions.add(dictVersion);
+                });
+
+                partitionCommitInfo = new PartitionCommitInfo(partitionId, version, 0,
+                        Lists.newArrayList(invalidDictCacheColumns),
+                        validDictCacheColumnNames,
+                        validDictCacheColumnVersions);
+            } else {
+                partitionCommitInfo = new PartitionCommitInfo(partitionId, version, 0);
+            }
             tableCommitInfo.addPartitionCommitInfo(partitionCommitInfo);
+            isFirstPartition = false;
         }
         txnState.putIdToTableCommitInfo(table.getId(), tableCommitInfo);
     }
@@ -165,5 +236,9 @@ public class LakeTableTxnStateListener implements TransactionStateListener {
                 LOG.error(e);
             }
         }
+    }
+
+    static boolean enableIngestSlowdown() {
+        return Config.lake_enable_ingest_slowdown;
     }
 }

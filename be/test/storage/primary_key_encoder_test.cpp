@@ -36,6 +36,7 @@ static unique_ptr<Schema> create_key_schema(const vector<LogicalType>& types) {
         auto fd = new Field(i, name, types[i], false);
         fd->set_is_key(true);
         fd->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+        fd->set_uid(i);
         fields.emplace_back(fd);
         sort_key_idxes[i] = i;
     }
@@ -166,6 +167,35 @@ TEST(PrimaryKeyEncoderTest, testEncodeCompositeLimit) {
         tmp.set_uint8(1);
         pchunk->columns()[3]->append_datum(tmp);
         EXPECT_TRUE(PrimaryKeyEncoder::encode_exceed_limit(*sc, *pchunk, 0, n, 128));
+    }
+}
+
+TEST(PrimaryKeyEncoderTest, testEncodeVarcharLimit) {
+    auto sc = create_key_schema({TYPE_VARCHAR});
+    const int n = 2;
+    {
+        auto pchunk = ChunkHelper::new_chunk(*sc, n);
+        Datum tmp;
+        string tmpstr("slice00000");
+        tmp.set_slice(tmpstr);
+        pchunk->columns()[0]->append_datum(tmp);
+        tmpstr = "slice000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+                 "0000"
+                 "00000000000000000000000000000000000";
+        tmp.set_slice(tmpstr);
+        pchunk->columns()[0]->append_datum(tmp);
+        EXPECT_TRUE(PrimaryKeyEncoder::encode_exceed_limit(*sc, *pchunk, 0, n, 128));
+    }
+    {
+        auto pchunk = ChunkHelper::new_chunk(*sc, n);
+        Datum tmp;
+        string tmpstr("slice00000");
+        tmp.set_slice(tmpstr);
+        pchunk->columns()[0]->append_datum(tmp);
+        tmpstr = "slice00000000000000000000000000000000000";
+        tmp.set_slice(tmpstr);
+        pchunk->columns()[0]->append_datum(tmp);
+        EXPECT_FALSE(PrimaryKeyEncoder::encode_exceed_limit(*sc, *pchunk, 0, n, 128));
     }
 }
 

@@ -28,6 +28,7 @@
 #include "exec/pipeline/fragment_context.h"
 #include "gen_cpp/BackendService.h"
 #include "runtime/current_thread.h"
+#include "runtime/query_statistics.h"
 #include "runtime/runtime_state.h"
 #include "util/brpc_stub_cache.h"
 #include "util/defer_op.h"
@@ -37,13 +38,10 @@
 namespace starrocks::pipeline {
 
 using PTransmitChunkParamsPtr = std::shared_ptr<PTransmitChunkParams>;
-
-// ChunksDataRef holds reference to chunks' data and is released after sent by brpc,
-// so that it is valid that brpc IO::buf refers to the c_str of data chunks' data.
-struct ChunksDataRef {
-    ChunksDataRef(int64_t bytes) : data_bytes(bytes) {}
-    std::vector<std::shared_ptr<string>> data_buffer;
-    int64_t data_bytes;
+struct ClosureContext {
+    TUniqueId instance_id;
+    int64_t sequence;
+    int64_t send_timestamp;
 };
 
 struct TransmitChunkInfo {
@@ -54,14 +52,8 @@ struct TransmitChunkInfo {
     doris::PBackendService_Stub* brpc_stub;
     PTransmitChunkParamsPtr params;
     butil::IOBuf attachment;
-    std::shared_ptr<ChunksDataRef> chunks_data_ref;
-};
-
-struct ClosureContext {
-    TUniqueId instance_id;
-    int64_t sequence;
-    int64_t send_timestamp;
-    std::shared_ptr<ChunksDataRef> chunks_data_ref;
+    int64_t attachment_physical_bytes;
+    const TNetworkAddress brpc_addr;
 };
 
 // TimeTrace is introduced to estimate time more accurately.
@@ -110,7 +102,7 @@ private:
     using Mutex = bthread::Mutex;
 
     void _update_network_time(const TUniqueId& instance_id, const int64_t send_timestamp,
-                              const int64_t receive_timestamp);
+                              const int64_t receiver_post_process_time);
     // Update the discontinuous acked window, here are the invariants:
     // all acks received with sequence from [0, _max_continuous_acked_seqs[x]]
     // not all the acks received with sequence from [_max_continuous_acked_seqs[x]+1, _request_seqs[x]]
@@ -119,7 +111,10 @@ private:
 
     // Try to send rpc if buffer is not empty and channel is not busy
     // And we need to put this function and other extra works(pre_works) together as an atomic operation
-    Status _try_to_send_rpc(const TUniqueId& instance_id, const std::function<void()>& pre_works);
+    [[nodiscard]] Status _try_to_send_rpc(const TUniqueId& instance_id, const std::function<void()>& pre_works);
+
+    // send by rpc or http
+    Status _send_rpc(DisposableClosure<PTransmitChunkResult, ClosureContext>* closure, const TransmitChunkInfo& req);
 
     // Roughly estimate network time which is defined as the time between sending a and receiving a packet,
     // and the processing time of both sides are excluded
@@ -128,6 +123,8 @@ private:
     // `accumulated_network_time / average_concurrency`
     // And we just pick the maximum accumulated_network_time among all destination
     int64_t _network_time();
+
+    void _try_to_merge_query_statistics(TransmitChunkInfo& request);
 
     FragmentContext* _fragment_ctx;
     MemTracker* const _mem_tracker;
@@ -160,7 +157,9 @@ private:
     phmap::flat_hash_map<int64_t, int32_t> _num_finished_rpcs;
     phmap::flat_hash_map<int64_t, int32_t> _num_in_flight_rpcs;
     phmap::flat_hash_map<int64_t, TimeTrace> _network_times;
+    phmap::flat_hash_map<int64_t, std::shared_ptr<QueryStatistics>> _eos_query_stats;
     phmap::flat_hash_map<int64_t, std::unique_ptr<Mutex>> _mutexes;
+    phmap::flat_hash_map<int64_t, TNetworkAddress> _dest_addrs;
 
     // True means that SinkBuffer needn't input chunk and send chunk anymore,
     // but there may be still in-flight RPC running.
@@ -179,7 +178,6 @@ private:
     std::atomic<int64_t> _rpc_cumulative_time = 0;
 
     // RuntimeProfile counters
-    std::atomic_bool _is_profile_updated = false;
     std::atomic<int64_t> _bytes_enqueued = 0;
     std::atomic<int64_t> _request_enqueued = 0;
     std::atomic<int64_t> _bytes_sent = 0;
@@ -193,6 +191,7 @@ private:
     // Non-atomic type is enough because the concurrency inconsistency is acceptable
     int64_t _first_send_time = -1;
     int64_t _last_receive_time = -1;
+    int64_t _rpc_http_min_size = 0;
 };
 
 } // namespace starrocks::pipeline

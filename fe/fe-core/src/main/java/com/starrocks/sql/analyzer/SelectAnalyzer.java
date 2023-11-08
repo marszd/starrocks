@@ -19,6 +19,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Streams;
 import com.starrocks.analysis.AnalyticExpr;
+import com.starrocks.analysis.CastExpr;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.GroupByClause;
@@ -41,6 +42,7 @@ import com.starrocks.sql.ast.SelectListItem;
 import com.starrocks.sql.common.StarRocksPlannerException;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -181,20 +183,12 @@ public class SelectAnalyzer {
                     .collect(Collectors.toList());
 
             Scope sourceScopeForOrder = new Scope(RelationId.anonymous(), new RelationFields(sourceForOrderFields));
-            sourceAndOutputScope = new Scope(outputScope.getRelationId(), outputScope.getRelationFields());
-            sourceAndOutputScope.setParent(sourceScopeForOrder);
-            analyzeState.setOrderScope(sourceAndOutputScope);
+            computeAndAssignOrderScope(analyzeState, sourceScopeForOrder, outputScope);
             analyzeState.setOrderSourceExpressions(orderSourceExpressions);
         }
 
         if (limitElement != null && limitElement.hasLimit()) {
-            if (limitElement.getOffset() > 0 && orderByElements.isEmpty()) {
-                // The offset can only be processed in sort,
-                // so when there is no order by, we manually set offset to 0
-                analyzeState.setLimit(new LimitElement(0, limitElement.getLimit()));
-            } else {
-                analyzeState.setLimit(new LimitElement(limitElement.getOffset(), limitElement.getLimit()));
-            }
+            analyzeState.setLimit(new LimitElement(limitElement.getOffset(), limitElement.getLimit()));
         }
     }
 
@@ -254,9 +248,11 @@ public class SelectAnalyzer {
 
                 if (item.getExpr() instanceof SlotRef) {
                     outputFields.add(new Field(name, item.getExpr().getType(),
-                            ((SlotRef) item.getExpr()).getTblNameWithoutAnalyzed(), item.getExpr()));
+                            ((SlotRef) item.getExpr()).getTblNameWithoutAnalyzed(), item.getExpr(),
+                            true, item.getExpr().isNullable()));
                 } else {
-                    outputFields.add(new Field(name, item.getExpr().getType(), null, item.getExpr()));
+                    outputFields.add(new Field(name, item.getExpr().getType(), null, item.getExpr(),
+                            true, item.getExpr().isNullable()));
                 }
 
                 // outputExprInOrderByScope is used to record which expressions in outputExpression are to be
@@ -340,11 +336,16 @@ public class SelectAnalyzer {
                 // but should be parsed in sourceScope
                 analyzeExpression(expression, analyzeState, orderByScope.getParent());
             } else {
+                ExpressionAnalyzer expressionAnalyzer = new ExpressionAnalyzer(session);
+                expressionAnalyzer.analyzeWithoutUpdateState(expression, analyzeState, orderByScope);
+                List<Expr> aggregations = Lists.newArrayList();
+                expression.collectAll(e -> e.isAggregate(), aggregations);
+                aggregations.forEach(e -> analyzeExpression(e, analyzeState, orderByScope.getParent()));
                 analyzeExpression(expression, analyzeState, orderByScope);
             }
 
             if (!expression.getType().canOrderBy()) {
-                throw new SemanticException(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+                throw new SemanticException(Type.NOT_SUPPORT_ORDER_ERROR_MSG);
             }
 
             orderByElement.setExpr(expression);
@@ -393,8 +394,12 @@ public class SelectAnalyzer {
         AnalyzerUtils.verifyNoWindowFunctions(predicate, "WHERE");
         AnalyzerUtils.verifyNoGroupingFunctions(predicate, "WHERE");
 
-        if (!predicate.getType().matchesType(Type.BOOLEAN) && !predicate.getType().matchesType(Type.NULL)) {
-            throw new SemanticException("WHERE clause must evaluate to a boolean: actual type %s", predicate.getType());
+        if (predicate.getType().isBoolean() || predicate.getType().isNull()) {
+            // do nothing
+        } else if (!session.getSessionVariable().isEnableStrictType() && Type.canCastTo(predicate.getType(), Type.BOOLEAN)) {
+            predicate = new CastExpr(Type.BOOLEAN, predicate);
+        } else {
+            throw new SemanticException("WHERE clause %s can not be converted to boolean type", predicate.toSql());
         }
 
         analyzeState.setPredicate(predicate);
@@ -417,15 +422,17 @@ public class SelectAnalyzer {
     }
 
     private List<FunctionCallExpr> analyzeAggregations(AnalyzeState analyzeState, Scope sourceScope,
-                                                       List<Expr> outputAndOrderByExpressions) {
+                                                          List<Expr> outputAndOrderByExpressions) {
         List<FunctionCallExpr> aggregations = Lists.newArrayList();
         TreeNode.collect(outputAndOrderByExpressions, Expr.isAggregatePredicate()::apply, aggregations);
         aggregations.forEach(e -> analyzeExpression(e, analyzeState, sourceScope));
 
-        if (aggregations.stream().filter(FunctionCallExpr::isDistinct).count() > 1) {
-            for (FunctionCallExpr agg : aggregations) {
-                if (agg.isDistinct() && agg.getChildren().size() > 0 && agg.getChild(0).getType().isArrayType()) {
-                    throw new SemanticException("No matching function with signature: multi_distinct_count(ARRAY)");
+        for (FunctionCallExpr agg : aggregations) {
+            if (agg.isDistinct() && agg.getChildren().size() > 0) {
+                Type[] args = agg.getChildren().stream().map(Expr::getType).toArray(Type[]::new);
+                if (Arrays.stream(args).anyMatch(t -> (t.isJsonType() || t.isComplexType()) && !t.canGroupBy())) {
+                    throw new SemanticException(agg.toSql() + " can't rewrite distinct to group by on (" +
+                            Arrays.stream(args).map(Type::toSql).collect(Collectors.joining(",")) + ")");
                 }
             }
         }
@@ -456,7 +463,7 @@ public class SelectAnalyzer {
                     }
 
                     if (!groupingExpr.getType().canGroupBy()) {
-                        throw new SemanticException(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+                        throw new SemanticException(Type.NOT_SUPPORT_GROUP_BY_ERROR_MSG);
                     }
 
                     if (analyzeState.getColumnReferences().get(groupingExpr) == null) {
@@ -534,11 +541,12 @@ public class SelectAnalyzer {
         if (havingClause != null) {
             Expr predicate = pushNegationToOperands(havingClause);
 
+            RewriteAliasVisitor visitor = new RewriteAliasVisitor(sourceScope, outputScope, outputExprs, session);
+            predicate = predicate.accept(visitor, null);
+
             AnalyzerUtils.verifyNoWindowFunctions(predicate, "HAVING");
             AnalyzerUtils.verifyNoGroupingFunctions(predicate, "HAVING");
 
-            RewriteAliasVisitor visitor = new RewriteAliasVisitor(sourceScope, outputScope, outputExprs, session);
-            predicate = predicate.accept(visitor, null);
             analyzeExpression(predicate, analyzeState, sourceScope);
 
             if (!predicate.getType().matchesType(Type.BOOLEAN) && !predicate.getType().matchesType(Type.NULL)) {
@@ -551,7 +559,7 @@ public class SelectAnalyzer {
 
     // If alias is same with table column name, we directly use table name.
     // otherwise, we use output expression according to the alias
-    private static class RewriteAliasVisitor extends AstVisitor<Expr, Void> {
+    public static class RewriteAliasVisitor extends AstVisitor<Expr, Void> {
         private final Scope sourceScope;
         private final Scope outputScope;
         private final List<Expr> outputExprs;

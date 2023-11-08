@@ -43,8 +43,8 @@ import com.starrocks.common.Pair;
 import com.starrocks.common.TreeNode;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
-import com.starrocks.system.BackendCoreStat;
 import com.starrocks.thrift.TCacheParam;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.thrift.TGlobalDict;
@@ -56,9 +56,14 @@ import org.apache.commons.collections.CollectionUtils;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.Deque;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -151,8 +156,14 @@ public class PlanFragment extends TreeNode<PlanFragment> {
 
     private TCacheParam cacheParam = null;
     private boolean hasOlapTableSink = false;
+    private boolean hasIcebergTableSink = false;
+    private boolean hasHiveTableSink = false;
+    private boolean hasTableFunctionTableSink = false;
+
     private boolean forceSetTableSinkDop = false;
     private boolean forceAssignScanRangesPerDriverSeq = false;
+
+    private boolean useRuntimeAdaptiveDop = false;
 
     /**
      * C'tor for fragment with specific partition; the output is by default broadcast.
@@ -191,6 +202,26 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         return getPlanRoot().canUsePipeLine() && getSink().canUsePipeLine();
     }
 
+    public boolean canUseRuntimeAdaptiveDop() {
+        return getPlanRoot().canUseRuntimeAdaptiveDop() && getSink().canUseRuntimeAdaptiveDop();
+    }
+
+    public void enableAdaptiveDop() {
+        useRuntimeAdaptiveDop = true;
+        // Constrict DOP as the power of two to make the strategy of decrement DOP easy.
+        // After decreasing DOP from old_dop to new_dop, chunks from the i-th input driver is passed
+        // to the j-th output driver, where j=i%new_dop.
+        pipelineDop = Utils.computeMaxLEPower2(pipelineDop);
+    }
+
+    public void disableRuntimeAdaptiveDop() {
+        useRuntimeAdaptiveDop = false;
+    }
+
+    public boolean isUseRuntimeAdaptiveDop() {
+        return useRuntimeAdaptiveDop;
+    }
+
     /**
      * Assign ParallelExecNum by PARALLEL_FRAGMENT_EXEC_INSTANCE_NUM in SessionVariable for synchronous request
      * Assign ParallelExecNum by default value for Asynchronous request
@@ -203,6 +234,15 @@ public class PlanFragment extends TreeNode<PlanFragment> {
             } else {
                 this.parallelExecNum = ConnectContext.get().getSessionVariable().getParallelExecInstanceNum();
                 this.pipelineDop = 1;
+            }
+        }
+    }
+
+    public void limitMaxPipelineDop(int maxPipelineDop) {
+        if (pipelineDop > maxPipelineDop) {
+            pipelineDop = maxPipelineDop;
+            if (useRuntimeAdaptiveDop) {
+                pipelineDop = Utils.computeMaxLEPower2(pipelineDop);
             }
         }
     }
@@ -230,12 +270,40 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         this.pipelineDop = dop;
     }
 
+    public boolean hasTableSink() {
+        return hasIcebergTableSink() || hasOlapTableSink() || hasHiveTableSink() || hasTableFunctionTableSink();
+    }
+
     public boolean hasOlapTableSink() {
         return this.hasOlapTableSink;
     }
 
     public void setHasOlapTableSink() {
         this.hasOlapTableSink = true;
+    }
+
+    public boolean hasIcebergTableSink() {
+        return this.hasIcebergTableSink;
+    }
+
+    public void setHasIcebergTableSink() {
+        this.hasIcebergTableSink = true;
+    }
+
+    public boolean hasHiveTableSink() {
+        return this.hasHiveTableSink;
+    }
+
+    public void setHasHiveTableSink() {
+        this.hasHiveTableSink = true;
+    }
+
+    public boolean hasTableFunctionTableSink() {
+        return this.hasTableFunctionTableSink;
+    }
+
+    public void setHasTableFunctionTableSink() {
+        this.hasTableFunctionTableSink = true;
     }
 
     public boolean forceSetTableSinkDop() {
@@ -315,14 +383,6 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         }
     }
 
-    /**
-     * Return the number of nodes on which the plan fragment will execute.
-     * invalid: -1
-     */
-    public int getNumNodes() {
-        return dataPartition == DataPartition.UNPARTITIONED ? 1 : planRoot.getNumNodes();
-    }
-
     public int getParallelExecNum() {
         return parallelExecNum;
     }
@@ -376,7 +436,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         return result;
     }
 
-    private List<TGlobalDict> dictToThrift(List<Pair<Integer, ColumnDict>> dicts) {
+    public List<TGlobalDict> dictToThrift(List<Pair<Integer, ColumnDict>> dicts) {
         List<TGlobalDict> result = Lists.newArrayList();
         for (Pair<Integer, ColumnDict> dictPair : dicts) {
             TGlobalDict globalDict = new TGlobalDict();
@@ -387,8 +447,28 @@ public class PlanFragment extends TreeNode<PlanFragment> {
                 strings.add(kv.getKey());
                 integers.add(kv.getValue());
             }
+            globalDict.setVersion(dictPair.second.getCollectedVersionTime());
             globalDict.setStrings(strings);
             globalDict.setIds(integers);
+            result.add(globalDict);
+        }
+        return result;
+    }
+
+    // normalize dicts of the fragment, it is different from dictToThrift in three points:
+    // 1. SlotIds must be replaced by remapped SlotIds;
+    // 2. dict should be sorted according to its corresponding remapped SlotIds;
+    public List<TGlobalDict> normalizeDicts(List<Pair<Integer, ColumnDict>> dicts, FragmentNormalizer normalizer) {
+        List<TGlobalDict> result = Lists.newArrayList();
+        // replace slot id with the remapped slot id, sort dicts according to remapped slot ids.
+        List<Pair<Integer, ColumnDict>> sortedDicts =
+                dicts.stream().map(p -> Pair.create(normalizer.remapSlotId(p.first), p.second))
+                        .sorted(Comparator.comparingInt(p -> p.first)).collect(Collectors.toList());
+
+        for (Pair<Integer, ColumnDict> dictPair : sortedDicts) {
+            TGlobalDict globalDict = new TGlobalDict();
+            globalDict.setColumnId(dictPair.first);
+            globalDict.setVersion(dictPair.second.getCollectedVersionTime());
             result.add(globalDict);
         }
         return result;
@@ -406,7 +486,7 @@ public class PlanFragment extends TreeNode<PlanFragment> {
 
         }
 
-        str.append(outputBuilder.toString());
+        str.append(outputBuilder);
         str.append("\n");
         str.append("  PARTITION: ").append(dataPartition.getExplainString(explainLevel)).append("\n");
         if (sink != null) {
@@ -481,12 +561,20 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         dest.addChild(this);
     }
 
+    public void clearDestination() {
+        this.destNode = null;
+    }
+
     public DataPartition getDataPartition() {
         return dataPartition;
     }
 
     public void setOutputPartition(DataPartition outputPartition) {
         this.outputPartition = outputPartition;
+    }
+
+    public void clearOutputPartition() {
+        this.outputPartition = DataPartition.UNPARTITIONED;
     }
 
     public PlanNode getPlanRoot() {
@@ -534,12 +622,12 @@ public class PlanFragment extends TreeNode<PlanFragment> {
     }
 
     public void collectProbeRuntimeFilters(PlanNode root) {
-        if (root instanceof ExchangeNode) {
-            return;
-        }
-
         for (RuntimeFilterDescription description : root.getProbeRuntimeFilters()) {
             probeRuntimeFilters.put(description.getFilterId(), description);
+        }
+
+        if (root instanceof ExchangeNode) {
+            return;
         }
 
         for (PlanNode node : root.getChildren()) {
@@ -621,14 +709,66 @@ public class PlanFragment extends TreeNode<PlanFragment> {
         this.cacheParam = cacheParam;
     }
 
-    public PlanNode getLeftMostLeafNode() {
-        PlanNode node = planRoot;
-        while (!node.getChildren().isEmpty()) {
+    public Map<PlanNodeId, ScanNode> collectScanNodes() {
+        Map<PlanNodeId, ScanNode> scanNodes = Maps.newHashMap();
+        Queue<PlanNode> queue = Lists.newLinkedList();
+        queue.add(planRoot);
+        while (!queue.isEmpty()) {
+            PlanNode node = queue.poll();
+
             if (node instanceof ExchangeNode) {
-                break;
+                continue;
             }
+            if (node instanceof ScanNode) {
+                scanNodes.put(node.getId(), (ScanNode) node);
+            }
+
+            queue.addAll(node.getChildren());
+        }
+
+        return scanNodes;
+    }
+
+    public boolean isUnionFragment() {
+        Deque<PlanNode> dq = new LinkedList<>();
+        dq.offer(planRoot);
+
+        while (!dq.isEmpty()) {
+            PlanNode nd = dq.poll();
+
+            if (nd instanceof UnionNode) {
+                return true;
+            }
+            if (!(nd instanceof ExchangeNode)) {
+                dq.addAll(nd.getChildren());
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Returns the leftmost node of the fragment.
+     */
+    public PlanNode getLeftMostNode() {
+        PlanNode node = planRoot;
+        while (!node.getChildren().isEmpty() && !(node instanceof ExchangeNode)) {
             node = node.getChild(0);
         }
         return node;
+    }
+
+    public void reset() {
+        // Do nothing.
+    }
+
+    public void disablePhysicalPropertyOptimize() {
+        forEachNode(planRoot, PlanNode::disablePhysicalPropertyOptimize);
+    }
+
+    private void forEachNode(PlanNode root, Consumer<PlanNode> consumer) {
+        consumer.accept(root);
+        for (PlanNode child : root.getChildren()) {
+            forEachNode(child, consumer);
+        }
     }
 }

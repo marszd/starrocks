@@ -2,7 +2,7 @@
 
 ## Description
 
-Queries an element that can be located by the `json_path` expression in a JSON object and returns a JSON value. The arrow function `->` is more compact and easier to use than the JSON_QUERY function.
+Queries an element that can be located by the `json_path` expression in a JSON object and returns a JSON value. The arrow function `->` is more compact and easier to use than the [json_query](json_query.md) function.
 
 ## Syntax
 
@@ -26,7 +26,7 @@ Returns a JSON value.
 
 Example 1: Query an element that can be located by the `'$.a.b'` expression in the specified JSON object.
 
-```Plain%20Text
+```plaintext
 mysql> SELECT parse_json('{"a": {"b": 1}}') -> '$.a.b';
 
        -> 1
@@ -36,7 +36,7 @@ Example 2: Use nested arrow functions to query an element. The arrow function in
 
 > In this example, the root element $ is omitted from the `json_path` expression.
 
-```Plain%20Text
+```plaintext
 mysql> SELECT parse_json('{"a": {"b": 1}}')->'a'->'b';
 
        -> 1
@@ -46,7 +46,7 @@ Example 3: Query an element that can be located by the `'a'` expression in the s
 
 > In this example, the root element $ is omitted from the `json_path` expression.
 
-```Plain%20Text
+```plaintext
 mysql> SELECT parse_json('{"a": "b"}') -> 'a';
 
        -> "b"

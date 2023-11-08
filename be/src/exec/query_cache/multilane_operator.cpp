@@ -21,7 +21,8 @@
 namespace starrocks::query_cache {
 MultilaneOperator::MultilaneOperator(pipeline::OperatorFactory* factory, int32_t driver_sequence, size_t num_lanes,
                                      pipeline::Operators&& processors, bool can_passthrough)
-        : pipeline::Operator(factory, factory->id(), factory->get_raw_name(), factory->plan_node_id(), driver_sequence),
+        : pipeline::Operator(factory, factory->id(), factory->get_raw_name(), factory->plan_node_id(), true,
+                             driver_sequence),
           _num_lanes(num_lanes),
           _can_passthrough(can_passthrough) {
     DCHECK_EQ(processors.size(), _num_lanes);
@@ -315,7 +316,8 @@ pipeline::OperatorPtr MultilaneOperatorFactory::create(int32_t degree_of_paralle
     pipeline::Operators processors;
     processors.reserve(_num_lanes);
     for (auto i = 0; i < _num_lanes; ++i) {
-        processors.push_back(_factory->create(degree_of_parallelism * _num_lanes, driver_sequence * _num_lanes + i));
+        processors.push_back(
+                _factory->create(degree_of_parallelism * _num_lanes, i * degree_of_parallelism + driver_sequence));
     }
     auto op = std::make_shared<MultilaneOperator>(this, driver_sequence, _num_lanes, std::move(processors),
                                                   _can_passthrough);

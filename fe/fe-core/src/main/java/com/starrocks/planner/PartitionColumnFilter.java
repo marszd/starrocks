@@ -39,6 +39,8 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Range;
 import com.starrocks.analysis.InPredicate;
 import com.starrocks.analysis.LiteralExpr;
+import com.starrocks.connector.PartitionUtil;
+import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.PartitionValue;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.PartitionKey;
@@ -50,9 +52,9 @@ import java.util.List;
 
 public class PartitionColumnFilter {
     private static final Logger LOG = LogManager.getLogger(PartitionColumnFilter.class);
-    public LiteralExpr lowerBound;
+    private LiteralExpr lowerBound;
+    private LiteralExpr upperBound;
     public boolean lowerBoundInclusive;
-    public LiteralExpr upperBound;
     public boolean upperBoundInclusive;
     // InPredicate
     // planner and TestUT use
@@ -121,6 +123,30 @@ public class PartitionColumnFilter {
         }
     }
 
+    public LiteralExpr getLowerBound() {
+        return lowerBound;
+    }
+
+    public LiteralExpr getUpperBound() {
+        return upperBound;
+    }
+
+    public LiteralExpr getLowerBound(boolean isConvertToDate) throws SemanticException {
+        if (isConvertToDate) {
+            return PartitionUtil.convertToDateLiteral(lowerBound);
+        } else {
+            return lowerBound;
+        }
+    }
+
+    public LiteralExpr getUpperBound(boolean isConvertToDate) throws SemanticException {
+        if (isConvertToDate) {
+            return PartitionUtil.convertToDateLiteral(upperBound);
+        } else {
+            return upperBound;
+        }
+    }
+
     public Range<PartitionKey> getRange(List<Column> columns) {
         LOG.info("range is " + toString());
         BoundType lowerType = lowerBoundInclusive ? BoundType.CLOSED : BoundType.OPEN;
@@ -165,5 +191,4 @@ public class PartitionColumnFilter {
         }
         return str;
     }
-};
-/* vim: set ts=4 sw=4 sts=4 tw=100 noet: */
+}

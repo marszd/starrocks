@@ -37,7 +37,6 @@ package com.starrocks.http;
 import com.starrocks.common.Config;
 import com.starrocks.http.action.BackendAction;
 import com.starrocks.http.action.HaAction;
-import com.starrocks.http.action.HelpAction;
 import com.starrocks.http.action.IndexAction;
 import com.starrocks.http.action.LogAction;
 import com.starrocks.http.action.QueryAction;
@@ -51,6 +50,7 @@ import com.starrocks.http.meta.ColocateMetaService;
 import com.starrocks.http.meta.GlobalDictMetaService;
 import com.starrocks.http.meta.MetaService.CheckAction;
 import com.starrocks.http.meta.MetaService.DumpAction;
+import com.starrocks.http.meta.MetaService.DumpStarMgrAction;
 import com.starrocks.http.meta.MetaService.ImageAction;
 import com.starrocks.http.meta.MetaService.InfoAction;
 import com.starrocks.http.meta.MetaService.JournalIdAction;
@@ -61,6 +61,8 @@ import com.starrocks.http.rest.BootstrapFinishAction;
 import com.starrocks.http.rest.CancelStreamLoad;
 import com.starrocks.http.rest.CheckDecommissionAction;
 import com.starrocks.http.rest.ConnectionAction;
+import com.starrocks.http.rest.ExecuteSqlAction;
+import com.starrocks.http.rest.FeatureAction;
 import com.starrocks.http.rest.GetDdlStmtAction;
 import com.starrocks.http.rest.GetLoadInfoAction;
 import com.starrocks.http.rest.GetLogFileAction;
@@ -80,11 +82,13 @@ import com.starrocks.http.rest.ShowDataAction;
 import com.starrocks.http.rest.ShowMetaInfoAction;
 import com.starrocks.http.rest.ShowProcAction;
 import com.starrocks.http.rest.ShowRuntimeInfoAction;
+import com.starrocks.http.rest.StopFeAction;
 import com.starrocks.http.rest.StorageTypeCheckAction;
 import com.starrocks.http.rest.TableQueryPlanAction;
 import com.starrocks.http.rest.TableRowCountAction;
 import com.starrocks.http.rest.TableSchemaAction;
 import com.starrocks.http.rest.TransactionLoadAction;
+import com.starrocks.http.rest.TriggerAction;
 import com.starrocks.leader.MetaHelper;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
@@ -152,17 +156,18 @@ public class HttpServer {
         QueryProfileAction.registerAction(controller);
         SessionAction.registerAction(controller);
         VariableAction.registerAction(controller);
-        HelpAction.registerAction(controller);
         StaticResourceAction.registerAction(controller);
         HaAction.registerAction(controller);
 
         // rest action
         HealthAction.registerAction(controller);
+        FeatureAction.registerAction(controller);
         MetricsAction.registerAction(controller);
         ShowMetaInfoAction.registerAction(controller);
         ShowProcAction.registerAction(controller);
         ShowRuntimeInfoAction.registerAction(controller);
         GetLogFileAction.registerAction(controller);
+        TriggerAction.registerAction(controller);
         GetSmallFileAction.registerAction(controller);
         RowCountAction.registerAction(controller);
         CheckDecommissionAction.registerAction(controller);
@@ -171,12 +176,16 @@ public class HttpServer {
         ColocateMetaService.ColocateMetaAction.registerAction(controller);
         ColocateMetaService.MarkGroupStableAction.registerAction(controller);
         ColocateMetaService.MarkGroupUnstableAction.registerAction(controller);
+        ColocateMetaService.UpdateGroupAction.registerAction(controller);
         GlobalDictMetaService.ForbitTableAction.registerAction(controller);
         ProfileAction.registerAction(controller);
         QueryDetailAction.registerAction(controller);
         ConnectionAction.registerAction(controller);
         ShowDataAction.registerAction(controller);
         QueryDumpAction.registerAction(controller);
+        // for stop FE
+        StopFeAction.registerAction(controller);
+        ExecuteSqlAction.registerAction(controller);
 
         // meta service action
         File imageDir = MetaHelper.getLeaderImageDir();
@@ -187,6 +196,7 @@ public class HttpServer {
         JournalIdAction.registerAction(controller, imageDir);
         CheckAction.registerAction(controller, imageDir);
         DumpAction.registerAction(controller, imageDir);
+        DumpStarMgrAction.registerAction(controller, imageDir);
         RoleAction.registerAction(controller, imageDir);
 
         // external usage

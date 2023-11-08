@@ -38,9 +38,12 @@ import com.google.common.collect.Maps;
 import com.starrocks.catalog.MvId;
 import com.starrocks.common.UserException;
 import com.starrocks.common.util.DebugUtil;
+import com.starrocks.qe.scheduler.Coordinator;
 import com.starrocks.thrift.TBatchReportExecStatusParams;
 import com.starrocks.thrift.TBatchReportExecStatusResult;
 import com.starrocks.thrift.TNetworkAddress;
+import com.starrocks.thrift.TReportAuditStatisticsParams;
+import com.starrocks.thrift.TReportAuditStatisticsResult;
 import com.starrocks.thrift.TReportExecStatusParams;
 import com.starrocks.thrift.TReportExecStatusResult;
 import com.starrocks.thrift.TStatus;
@@ -52,12 +55,16 @@ import org.apache.logging.log4j.Logger;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 public final class QeProcessorImpl implements QeProcessor {
 
     private static final Logger LOG = LogManager.getLogger(QeProcessorImpl.class);
-    private Map<TUniqueId, QueryInfo> coordinatorMap;
+    private static final long ONE_MINUTE = 60 * 1000L;
+    private final Map<TUniqueId, QueryInfo> coordinatorMap = Maps.newConcurrentMap();
+    private final Map<TUniqueId, Long> monitorQueryMap = Maps.newConcurrentMap();
+    private final AtomicLong lastCheckTime = new AtomicLong();
 
     public static final QeProcessor INSTANCE;
 
@@ -66,7 +73,6 @@ public final class QeProcessorImpl implements QeProcessor {
     }
 
     private QeProcessorImpl() {
-        coordinatorMap = Maps.newConcurrentMap();
     }
 
     @Override
@@ -97,12 +103,41 @@ public final class QeProcessorImpl implements QeProcessor {
         if (result != null) {
             throw new UserException("queryId " + queryId + " already exists");
         }
+        scanMonitorQueries();
+    }
+
+    private void scanMonitorQueries() {
+        long now = System.currentTimeMillis();
+        long lastCheckTime = this.lastCheckTime.get();
+        if (now - lastCheckTime > ONE_MINUTE && this.lastCheckTime.compareAndSet(lastCheckTime, now)) {
+            for (Map.Entry<TUniqueId, Long> entry : monitorQueryMap.entrySet()) {
+                if (now > entry.getValue()) {
+                    LOG.warn("monitor expired, query id = {}", DebugUtil.printId(entry.getKey()));
+                    unregisterQuery(entry.getKey());
+                    monitorQueryMap.remove(entry.getKey());
+                }
+            }
+        }
+    }
+
+    @Override
+    public void monitorQuery(TUniqueId queryId, long expireTime) {
+        monitorQueryMap.put(queryId, expireTime);
+    }
+
+    @Override
+    public void unMonitorQuery(TUniqueId queryId) {
+        monitorQueryMap.remove(queryId);
     }
 
     @Override
     public void unregisterQuery(TUniqueId queryId) {
-        if (coordinatorMap.remove(queryId) != null) {
-            LOG.info("deregister query id {}", DebugUtil.printId(queryId));
+        QueryInfo info = coordinatorMap.remove(queryId);
+        if (info != null) {
+            if (info.getCoord() != null) {
+                info.getCoord().onFinished();
+            }
+            LOG.info("deregister query id = {}", DebugUtil.printId(queryId));
         }
     }
 
@@ -168,7 +203,39 @@ public final class QeProcessorImpl implements QeProcessor {
     }
 
     @Override
-    public TBatchReportExecStatusResult batchReportExecStatus(TBatchReportExecStatusParams paramsList, TNetworkAddress beAddr) {
+    public TReportAuditStatisticsResult reportAuditStatistics(TReportAuditStatisticsParams params,
+                                                              TNetworkAddress beAddr) {
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("reportAuditStatistics(): fragment_instance_id={}, query_id={}, ip: {}",
+                    DebugUtil.printId(params.fragment_instance_id), DebugUtil.printId(params.query_id), beAddr);
+            LOG.debug("params: {}", params);
+        }
+        final TReportAuditStatisticsResult result = new TReportAuditStatisticsResult();
+        final QueryInfo info = coordinatorMap.get(params.query_id);
+        if (info == null) {
+            LOG.info("reportAuditStatistics() failed, query does not exist, fragment_instance_id={}, query_id={},",
+                    DebugUtil.printId(params.fragment_instance_id), DebugUtil.printId(params.query_id));
+            result.setStatus(new TStatus(TStatusCode.NOT_FOUND));
+            result.status.addToError_msgs("query id " + DebugUtil.printId(params.query_id) + " not found");
+            return result;
+        }
+        try {
+            info.getCoord().updateAuditStatistics(params);
+        } catch (Exception e) {
+            LOG.warn("reportAuditStatistics() failed, fragment_instance_id={}, query_id={}, error: {}",
+                    DebugUtil.printId(params.fragment_instance_id), DebugUtil.printId(params.query_id), e.getMessage(),
+                    e);
+            result.setStatus(new TStatus(TStatusCode.INTERNAL_ERROR));
+            result.status.addToError_msgs(e.getMessage());
+            return result;
+        }
+        result.setStatus(new TStatus(TStatusCode.OK));
+        return result;
+    }
+
+    @Override
+    public TBatchReportExecStatusResult batchReportExecStatus(TBatchReportExecStatusParams paramsList,
+                                                              TNetworkAddress beAddr) {
         TBatchReportExecStatusResult resultList = new TBatchReportExecStatusResult();
         Iterator<TReportExecStatusParams> iters = paramsList.getParams_listIterator();
         while (iters.hasNext()) {
@@ -206,6 +273,11 @@ public final class QeProcessorImpl implements QeProcessor {
         }
 
         return resultList;
+    }
+
+    @Override
+    public long getCoordinatorCount() {
+        return coordinatorMap.size();
     }
 
     public static final class QueryInfo {

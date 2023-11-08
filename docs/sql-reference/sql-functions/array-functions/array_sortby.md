@@ -37,7 +37,7 @@ array_sortby(<lambda function>, array0 [, array1...])
 
 - `array0`: the array you want to sort. It must be an array, array expression, or `null`. Elements in the array must be sortable.
 - `array1`: the sorting array used to sort `array0`. It must be an array, array expression, or `null`.
-- `lambda function`：the lambda expression used to generate the sorting array.
+- `lambda function`: the lambda expression used to generate the sorting array.
 
 ## Return value
 
@@ -64,10 +64,9 @@ CREATE TABLE `test_array` (
 ) ENGINE=OLAP
 DUPLICATE KEY(`c1`)
 COMMENT "OLAP"
-DISTRIBUTED BY HASH(`c1`) BUCKETS 2
+DISTRIBUTED BY HASH(`c1`)
 PROPERTIES (
-"replication_num" = "1",
-"in_memory" = "false",
+"replication_num" = "3",
 "storage_format" = "DEFAULT",
 "enable_persistent_index" = "false",
 "compression" = "LZ4"

@@ -38,7 +38,6 @@
 #include <sstream>
 
 #include "column/column.h"
-#include "exec/broker_writer.h"
 #include "exec/plain_text_builder.h"
 #include "exprs/expr.h"
 #include "fs/fs_broker.h"
@@ -175,7 +174,7 @@ Status ExportSink::send_chunk(RuntimeState* state, Chunk* chunk) {
     Status status = _file_builder->add_chunk(chunk);
     if (!status.ok()) {
         Status status;
-        close(state, status);
+        (void)close(state, status);
     }
     return status;
 }

@@ -34,14 +34,13 @@
 
 package com.starrocks.alter;
 
-import com.google.common.base.Preconditions;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.OlapTable.OlapTableState;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.common.Config;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.TraceManager;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
@@ -55,6 +54,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
+import java.util.Optional;
 
 /*
  * Version 2 of AlterJob, for replacing the old version of AlterJob.
@@ -79,7 +79,7 @@ public abstract class AlterJobV2 implements Writable {
 
     public enum JobType {
         // DECOMMISSION_BACKEND is for compatible with older versions of metadata
-        ROLLUP, SCHEMA_CHANGE, DECOMMISSION_BACKEND
+        ROLLUP, SCHEMA_CHANGE, DECOMMISSION_BACKEND, OPTIMIZE
     }
 
     @SerializedName(value = "type")
@@ -135,6 +135,10 @@ public abstract class AlterJobV2 implements Writable {
         return jobState;
     }
 
+    public void setJobState(JobState jobState) {
+        this.jobState = jobState;
+    }
+
     public JobType getType() {
         return type;
     }
@@ -167,6 +171,10 @@ public abstract class AlterJobV2 implements Writable {
         return finishedTimeMs;
     }
 
+    public void setFinishedTimeMs(long finishedTimeMs) {
+        this.finishedTimeMs = finishedTimeMs;
+    }
+
     /**
      * The keyword 'synchronized' only protects 2 methods:
      * run() and cancel()
@@ -184,21 +192,27 @@ public abstract class AlterJobV2 implements Writable {
         }
 
         try {
-            switch (jobState) {
-                case PENDING:
-                    runPendingJob();
+            while (true) {
+                JobState prevState = jobState;
+                switch (prevState) {
+                    case PENDING:
+                        runPendingJob();
+                        break;
+                    case WAITING_TXN:
+                        runWaitingTxnJob();
+                        break;
+                    case RUNNING:
+                        runRunningJob();
+                        break;
+                    case FINISHED_REWRITING:
+                        runFinishedRewritingJob();
+                        break;
+                    default:
+                        break;
+                }
+                if (jobState == prevState) {
                     break;
-                case WAITING_TXN:
-                    runWaitingTxnJob();
-                    break;
-                case RUNNING:
-                    runRunningJob();
-                    break;
-                case FINISHED_REWRITING:
-                    runFinishedRewritingJob();
-                    break;
-                default:
-                    break;
+                } // else: handle the new state
             }
         } catch (AlterCancelException e) {
             cancelImpl(e.getMessage());
@@ -264,21 +278,8 @@ public abstract class AlterJobV2 implements Writable {
     public abstract void replay(AlterJobV2 replayedJob);
 
     public static AlterJobV2 read(DataInput in) throws IOException {
-        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_86) {
-            JobType type = JobType.valueOf(Text.readString(in));
-            switch (type) {
-                case ROLLUP:
-                    return RollupJobV2.read(in);
-                case SCHEMA_CHANGE:
-                    return SchemaChangeJobV2.read(in);
-                default:
-                    Preconditions.checkState(false);
-                    return null;
-            }
-        } else {
-            String json = Text.readString(in);
-            return GsonUtils.GSON.fromJson(json, AlterJobV2.class);
-        }
+        String json = Text.readString(in);
+        return GsonUtils.GSON.fromJson(json, AlterJobV2.class);
     }
 
     @Override
@@ -311,5 +312,30 @@ public abstract class AlterJobV2 implements Writable {
         createTimeMs = in.readLong();
         finishedTimeMs = in.readLong();
         timeoutMs = in.readLong();
+    }
+
+    public abstract Optional<Long> getTransactionId();
+
+
+    /**
+     * Schema change will build a new MaterializedIndexMeta, we need rebuild it(add extra original meta)
+     * into it from original index meta. Otherwise, some necessary metas will be lost after fe restart.
+     *
+     * @param orgIndexMeta  : index meta before schema change.
+     * @param indexMeta     : new index meta after schema change.
+     */
+    protected void rebuildMaterializedIndexMeta(MaterializedIndexMeta orgIndexMeta,
+                                                MaterializedIndexMeta indexMeta) {
+        indexMeta.setViewDefineSql(orgIndexMeta.getViewDefineSql());
+        indexMeta.setColocateMVIndex(orgIndexMeta.isColocateMVIndex());
+        indexMeta.setDefineStmt(orgIndexMeta.getDefineStmt());
+        if (indexMeta.getDefineStmt() != null) {
+            try {
+                indexMeta.gsonPostProcess();
+            } catch (IOException e) {
+                LOG.warn("rebuild defined stmt of index meta {}(org)/{}(new) failed :",
+                        orgIndexMeta.getIndexId(), indexMeta.getIndexId(), e);
+            }
+        }
     }
 }

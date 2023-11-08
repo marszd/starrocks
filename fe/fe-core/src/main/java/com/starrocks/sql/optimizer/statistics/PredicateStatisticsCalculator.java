@@ -108,7 +108,30 @@ public class PredicateStatisticsCalculator {
             // 1. compute the inPredicate children column statistics
             ColumnStatistic inColumnStatistic = getExpressionStatistic(firstChild);
             List<ColumnStatistic> otherChildrenColumnStatisticList =
-                    otherChildrenList.stream().map(this::getExpressionStatistic).collect(Collectors.toList());
+                    otherChildrenList.stream().distinct().map(this::getExpressionStatistic).collect(Collectors.toList());
+
+            // using ndv to estimate string col inPredicate
+            if (!predicate.isNotIn() && firstChild.getType().getPrimitiveType().isCharFamily()
+                    && firstChild.isColumnRef()
+                    && !inColumnStatistic.isUnknown()) {
+                selectivity = Math.min(otherChildrenList.size() / inColumnStatistic.getDistinctValuesCount(), 1);
+
+                double rowCount = Math.max(1, statistics.getOutputRowCount() * selectivity);
+
+                // only columnRefOperator could add column statistic to statistics.
+                ColumnRefOperator childOpt = (ColumnRefOperator) firstChild;
+                ColumnStatistic newInColumnStatistic =
+                        ColumnStatistic.builder()
+                                .setDistinctValuesCount(Math.min(inColumnStatistic.getDistinctValuesCount(),
+                                        otherChildrenList.size()))
+                                .setAverageRowSize(inColumnStatistic.getAverageRowSize())
+                                .setNullsFraction(0)
+                                .build();
+
+                Statistics inStatistics = Statistics.buildFrom(statistics).setOutputRowCount(rowCount).
+                        addColumnStatistic(childOpt, newInColumnStatistic).build();
+                return StatisticsEstimateUtils.adjustStatisticsByRowCount(inStatistics, rowCount);
+            }
 
             double columnMaxVal = inColumnStatistic.getMaxValue();
             double columnMinVal = inColumnStatistic.getMinValue();
@@ -212,7 +235,6 @@ public class PredicateStatisticsCalculator {
             if (!checkNeedEvalEstimate(predicate)) {
                 return statistics;
             }
-            Preconditions.checkState(predicate.getChildren().size() == 2);
             ScalarOperator leftChild = predicate.getChild(0);
             ScalarOperator rightChild = predicate.getChild(1);
             Preconditions.checkState(!(leftChild.isConstantRef() && rightChild.isConstantRef()),
@@ -279,15 +301,12 @@ public class PredicateStatisticsCalculator {
             }
 
             if (predicate.isAnd()) {
-                Preconditions.checkState(predicate.getChildren().size() == 2);
                 Statistics leftStatistics = predicate.getChild(0).accept(this, null);
                 Statistics andStatistics =
                         predicate.getChild(1).accept(new BaseCalculatingVisitor(leftStatistics), null);
                 return StatisticsEstimateUtils.adjustStatisticsByRowCount(andStatistics,
                         andStatistics.getOutputRowCount());
             } else if (predicate.isOr()) {
-                Preconditions.checkState(predicate.getChildren().size() == 2);
-
                 List<ScalarOperator> disjunctive = Utils.extractDisjunctive(predicate);
                 Statistics cumulativeStatistics = disjunctive.get(0).accept(this, null);
                 double rowCount = cumulativeStatistics.getOutputRowCount();
@@ -305,7 +324,6 @@ public class PredicateStatisticsCalculator {
 
                 return StatisticsEstimateUtils.adjustStatisticsByRowCount(cumulativeStatistics, rowCount);
             } else {
-                Preconditions.checkState(predicate.getChildren().size() == 1);
                 Statistics inputStatistics = predicate.getChild(0).accept(this, null);
                 double rowCount = Math.max(0, statistics.getOutputRowCount() - inputStatistics.getOutputRowCount());
                 return StatisticsEstimateUtils.adjustStatisticsByRowCount(
@@ -339,7 +357,6 @@ public class PredicateStatisticsCalculator {
 
         private ScalarOperator getChildForCastOperator(ScalarOperator operator) {
             if (operator instanceof CastOperator) {
-                Preconditions.checkState(operator.getChildren().size() == 1);
                 operator = getChildForCastOperator(operator.getChild(0));
             }
             return operator;
@@ -362,15 +379,12 @@ public class PredicateStatisticsCalculator {
             }
 
             if (predicate.isAnd()) {
-                Preconditions.checkState(predicate.getChildren().size() == 2);
                 Statistics leftStatistics = predicate.getChild(0).accept(this, null);
                 Statistics andStatistics = predicate.getChild(1)
                         .accept(new LargeOrCalculatingVisitor(leftStatistics), null);
                 return StatisticsEstimateUtils.adjustStatisticsByRowCount(andStatistics,
                         andStatistics.getOutputRowCount());
             } else if (predicate.isOr()) {
-                Preconditions.checkState(predicate.getChildren().size() == 2);
-
                 List<ScalarOperator> disjunctive = Utils.extractDisjunctive(predicate);
                 Statistics baseStatistics = disjunctive.get(0).accept(this, null);
                 double rowCount = baseStatistics.getOutputRowCount();
@@ -386,7 +400,6 @@ public class PredicateStatisticsCalculator {
 
                 return StatisticsEstimateUtils.adjustStatisticsByRowCount(baseStatistics, rowCount);
             } else {
-                Preconditions.checkState(predicate.getChildren().size() == 1);
                 Statistics inputStatistics = predicate.getChild(0).accept(this, null);
                 double rowCount = Math.max(0, statistics.getOutputRowCount() - inputStatistics.getOutputRowCount());
                 return StatisticsEstimateUtils.adjustStatisticsByRowCount(

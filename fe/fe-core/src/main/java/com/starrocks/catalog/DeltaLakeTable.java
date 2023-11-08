@@ -22,6 +22,7 @@ import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.connector.delta.DeltaUtils;
+import com.starrocks.server.CatalogMgr;
 import com.starrocks.thrift.TColumn;
 import com.starrocks.thrift.TDeltaLakeTable;
 import com.starrocks.thrift.THdfsPartition;
@@ -43,14 +44,19 @@ public class DeltaLakeTable extends Table {
     private DeltaLog deltaLog;
     public static final String PARTITION_NULL_VALUE = "null";
 
+    public DeltaLakeTable() {
+        super(TableType.DELTALAKE);
+    }
+
     public DeltaLakeTable(long id, String catalogName, String dbName, String tableName, List<Column> schema,
-                          List<String> partitionNames, DeltaLog deltaLog) {
+                          List<String> partitionNames, DeltaLog deltaLog, long createTime) {
         super(id, tableName, TableType.DELTALAKE, schema);
         this.catalogName = catalogName;
         this.dbName = dbName;
         this.tableName = tableName;
         this.partColumnNames = partitionNames;
         this.deltaLog = deltaLog;
+        this.createTime = createTime;
     }
 
     @Override
@@ -66,6 +72,7 @@ public class DeltaLakeTable extends Table {
         return deltaLog.getPath().toString();
     }
 
+    @Override
     public String getCatalogName() {
         return catalogName;
     }
@@ -76,6 +83,15 @@ public class DeltaLakeTable extends Table {
 
     public String getTableName() {
         return tableName;
+    }
+
+    @Override
+    public String getUUID() {
+        if (CatalogMgr.isExternalCatalog(catalogName)) {
+            return String.join(".", catalogName, dbName, tableName, Long.toString(createTime));
+        } else {
+            return Long.toString(id);
+        }
     }
 
     public List<Column> getPartitionColumns() {

@@ -21,6 +21,7 @@
 #include "column/column_helper.h"
 #include "column/column_viewer.h"
 #include "exprs/string_functions.h"
+#include "util/utf8.h"
 
 namespace starrocks {
 
@@ -39,6 +40,16 @@ struct SplitState {
     const void* (*find_delimiter)(const void* big, size_t big_len, const void* little, size_t little_len);
 };
 
+static inline std::vector<std::string> split_utf8_characters(const Slice& str) {
+    std::vector<std::string> chars;
+    for (int i = 0; i < str.size;) {
+        auto char_size = UTF8_BYTE_LENGTH_TABLE[static_cast<unsigned char>(str.data[i])];
+        chars.emplace_back(str.data + i, char_size);
+        i += char_size;
+    }
+    return chars;
+}
+
 Status StringFunctions::split_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope) {
     if (scope != FunctionContext::FRAGMENT_LOCAL) {
         return Status::OK();
@@ -50,11 +61,12 @@ Status StringFunctions::split_prepare(FunctionContext* context, FunctionContext:
     if (context->is_notnull_constant_column(0) && context->is_notnull_constant_column(1)) {
         Slice haystack = ColumnHelper::get_const_value<TYPE_VARCHAR>(context->get_constant_column(0));
         Slice delimiter = ColumnHelper::get_const_value<TYPE_VARCHAR>(context->get_constant_column(1));
-        std::vector<std::string> const_split_strings =
-                strings::Split(StringPiece(haystack.get_data(), haystack.get_size()),
-                               StringPiece(delimiter.get_data(), delimiter.get_size()));
-
-        state->const_split_strings = const_split_strings;
+        if (delimiter.empty() && !validate_ascii_fast(haystack.data, haystack.size)) {
+            state->const_split_strings = split_utf8_characters(haystack);
+        } else {
+            state->const_split_strings = strings::Split(StringPiece(haystack.get_data(), haystack.get_size()),
+                                                        StringPiece(delimiter.get_data(), delimiter.get_size()));
+        }
     } else if (context->is_notnull_constant_column(1)) {
         Slice delimiter = ColumnHelper::get_const_value<TYPE_VARCHAR>(context->get_constant_column(1));
 
@@ -118,7 +130,7 @@ StatusOr<ColumnPtr> StringFunctions::split(FunctionContext* context, const starr
     } else if (columns[1]->is_constant()) {
         Slice delimiter = state->delimiter;
 
-        if (delimiter.size == 0) {
+        if (delimiter.size == 0) { // split each character
             std::vector<Slice> v;
             v.reserve(haystack_columns->byte_size());
             array_binary_column->reserve(haystack_columns->byte_size(), haystack_columns->get_bytes().size());
@@ -127,11 +139,12 @@ StatusOr<ColumnPtr> StringFunctions::split(FunctionContext* context, const starr
                 array_offsets->append(offset);
                 Slice haystack = string_viewer.value(row);
 
-                for (int h = 0; h < haystack.size; ++h) {
-                    v.emplace_back(Slice(haystack.data + h, 1));
+                for (int h = 0; h < haystack.size;) {
+                    auto char_size = UTF8_BYTE_LENGTH_TABLE[static_cast<unsigned char>(haystack.data[h])];
+                    v.emplace_back(Slice(haystack.data + h, char_size));
+                    h += char_size;
+                    ++offset;
                 }
-
-                offset += haystack.size;
             }
             array_offsets->append(offset);
 
@@ -176,7 +189,8 @@ StatusOr<ColumnPtr> StringFunctions::split(FunctionContext* context, const starr
     } else {
         array_binary_column->reserve(row_nums * 5, haystack_columns->get_bytes().size() * sizeof(uint8_t));
 
-        auto result_array = ArrayColumn::create(BinaryColumn::create(), UInt32Column::create());
+        auto result_array = ArrayColumn::create(NullableColumn::create(BinaryColumn::create(), NullColumn::create()),
+                                                UInt32Column::create());
         NullColumnPtr null_array = NullColumn::create();
         for (int row = 0; row < row_nums; ++row) {
             array_offsets->append(offset);
@@ -184,19 +198,27 @@ StatusOr<ColumnPtr> StringFunctions::split(FunctionContext* context, const starr
             if (string_viewer.is_null(row) || delimiter_viewer.is_null(row)) {
                 null_array->append(1);
                 continue;
-            } else {
-                null_array->append(0);
             }
+            null_array->append(0);
 
             Slice str = string_viewer.value(row);
             Slice delimiter = delimiter_viewer.value(row);
-            std::vector<std::string> split_string =
-                    strings::Split(StringPiece(str.get_data(), str.get_size()),
-                                   StringPiece(delimiter.get_data(), delimiter.get_size()));
-            for (auto& i : split_string) {
-                array_binary_column->append(Slice(i.c_str()));
+            if (delimiter.size == 0) { // split each character
+                for (auto h = 0; h < str.size;) {
+                    auto char_size = UTF8_BYTE_LENGTH_TABLE[static_cast<unsigned char>(str.data[h])];
+                    array_binary_column->append(Slice(str.data + h, char_size));
+                    h += char_size;
+                    ++offset;
+                }
+            } else {
+                std::vector<std::string> split_string =
+                        strings::Split(StringPiece(str.get_data(), str.get_size()),
+                                       StringPiece(delimiter.get_data(), delimiter.get_size()));
+                for (auto& i : split_string) {
+                    array_binary_column->append(Slice(i.c_str()));
+                }
+                offset += split_string.size();
             }
-            offset += split_string.size();
         }
         array_offsets->append(offset);
         result_array = ArrayColumn::create(NullableColumn::create(array_binary_column, NullColumn::create(offset, 0)),

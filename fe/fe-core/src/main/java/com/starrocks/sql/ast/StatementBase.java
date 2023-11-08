@@ -37,34 +37,64 @@ package com.starrocks.sql.ast;
 import com.google.common.base.Preconditions;
 import com.starrocks.analysis.ParseNode;
 import com.starrocks.analysis.RedirectStatus;
+import com.starrocks.common.profile.Tracers;
 import com.starrocks.qe.OriginStatement;
+import com.starrocks.sql.parser.NodePosition;
 
 public abstract class StatementBase implements ParseNode {
+
+    private final NodePosition pos;
+
+    protected StatementBase(NodePosition pos) {
+        this.pos = pos;
+    }
 
     public enum ExplainLevel {
         NORMAL,
         LOGICAL,
+        ANALYZE,
         // True if the describe_stmt print verbose information, if `isVerbose` is true, `isExplain` must be set to true.
         VERBOSE,
         // True if the describe_stmt print costs information, if `isCosts` is true, `isExplain` must be set to true.
         COST,
-        OPTIMIZER
+        OPTIMIZER,
+        REWRITE,
+        SCHEDULER
     }
 
     private ExplainLevel explainLevel;
 
+    private Tracers.Mode traceMode;
+
+    private String traceModule;
+
     // True if this QueryStmt is the top level query from an EXPLAIN <query>
     protected boolean isExplain = false;
 
-    private OriginStatement origStmt;
+    // Original statement to further usage, eg: enable_sql_blacklist.
+    protected OriginStatement origStmt;
 
     public void setIsExplain(boolean isExplain, ExplainLevel explainLevel) {
         this.isExplain = isExplain;
         this.explainLevel = explainLevel;
     }
 
+    public void setIsTrace(Tracers.Mode mode, String module) {
+        this.isExplain = true;
+        this.traceMode = mode;
+        this.traceModule = module;
+    }
+
     public boolean isExplain() {
         return isExplain;
+    }
+
+    public Tracers.Mode getTraceMode() {
+        return traceMode;
+    }
+
+    public String getTraceModule() {
+        return traceModule;
     }
 
     public ExplainLevel getExplainLevel() {
@@ -90,5 +120,10 @@ public abstract class StatementBase implements ParseNode {
     // if the stmt contains some information which need to be encrypted in audit log
     public boolean needAuditEncryption() {
         return false;
+    }
+
+    @Override
+    public NodePosition getPos() {
+        return pos;
     }
 }

@@ -42,11 +42,11 @@ std::string to_http_path(const std::string& token, const std::string& file_name)
 
 TReportExecStatusParams ExecStateReporter::create_report_exec_status_params(QueryContext* query_ctx,
                                                                             FragmentContext* fragment_ctx,
+                                                                            RuntimeProfile* profile,
                                                                             const Status& status, bool done) {
     TReportExecStatusParams params;
     auto* runtime_state = fragment_ctx->runtime_state();
     DCHECK(runtime_state != nullptr);
-    auto* profile = runtime_state->runtime_profile();
     DCHECK(profile != nullptr);
     auto* exec_env = fragment_ctx->runtime_state()->exec_env();
     DCHECK(exec_env != nullptr);
@@ -66,7 +66,7 @@ TReportExecStatusParams ExecStateReporter::create_report_exec_status_params(Quer
             runtime_state->update_report_load_status(&params);
             params.__set_load_type(runtime_state->query_options().load_job_type);
         }
-        if (query_ctx->is_report_profile()) {
+        if (query_ctx->enable_profile()) {
             profile->to_thrift(&params.profile);
             params.__isset.profile = true;
         }
@@ -77,21 +77,24 @@ TReportExecStatusParams ExecStateReporter::create_report_exec_status_params(Quer
                 params.delta_urls.push_back(to_http_path(exec_env->token(), it));
             }
         }
-        if (runtime_state->num_rows_load_from_sink() > 0 || runtime_state->num_rows_load_filtered() > 0) {
+        if (runtime_state->num_rows_load_sink() > 0 || runtime_state->num_rows_load_filtered() > 0 ||
+            runtime_state->num_rows_load_unselected() > 0) {
             params.__isset.load_counters = true;
-            // TODO(zc)
             static std::string s_dpp_normal_all = "dpp.norm.ALL";
             static std::string s_dpp_abnormal_all = "dpp.abnorm.ALL";
             static std::string s_unselected_rows = "unselected.rows";
             static std::string s_loaded_bytes = "loaded.bytes";
 
-            params.load_counters.emplace(s_dpp_normal_all, std::to_string(runtime_state->num_rows_load_sink_success()));
+            params.load_counters.emplace(s_dpp_normal_all, std::to_string(runtime_state->num_rows_load_sink()));
             params.load_counters.emplace(s_dpp_abnormal_all, std::to_string(runtime_state->num_rows_load_filtered()));
             params.load_counters.emplace(s_unselected_rows, std::to_string(runtime_state->num_rows_load_unselected()));
-            params.load_counters.emplace(s_loaded_bytes, std::to_string(runtime_state->num_bytes_load_from_sink()));
+            params.load_counters.emplace(s_loaded_bytes, std::to_string(runtime_state->num_bytes_load_sink()));
         }
         if (!runtime_state->get_error_log_file_path().empty()) {
             params.__set_tracking_url(to_load_error_http_path(runtime_state->get_error_log_file_path()));
+        }
+        if (!runtime_state->get_rejected_record_file_path().empty()) {
+            params.__set_rejected_record_path(runtime_state->get_rejected_record_file_path());
         }
         if (!runtime_state->export_output_files().empty()) {
             params.__isset.export_files = true;
@@ -102,6 +105,13 @@ TReportExecStatusParams ExecStateReporter::create_report_exec_status_params(Quer
             params.commitInfos.reserve(runtime_state->tablet_commit_infos().size());
             for (auto& info : runtime_state->tablet_commit_infos()) {
                 params.commitInfos.push_back(info);
+            }
+        }
+        if (!runtime_state->sink_commit_infos().empty()) {
+            params.__isset.sink_commit_infos = true;
+            params.sink_commit_infos.reserve(runtime_state->sink_commit_infos().size());
+            for (auto& info : runtime_state->sink_commit_infos()) {
+                params.sink_commit_infos.push_back(info);
             }
         }
 
@@ -134,18 +144,26 @@ Status ExecStateReporter::report_exec_status(const TReportExecStatusParams& para
     TReportExecStatusResult res;
     Status rpc_status;
 
-    VLOG_ROW << "debug: reportExecStatus params is " << apache::thrift::ThriftDebugString(params).c_str();
     try {
         try {
             coord->reportExecStatus(res, params);
         } catch (TTransportException& e) {
-            LOG(WARNING) << "Retrying ReportExecStatus: " << e.what();
-            rpc_status = coord.reopen();
+            TTransportException::TTransportExceptionType type = e.getType();
+            if (type != TTransportException::TTransportExceptionType::TIMED_OUT) {
+                // if not TIMED_OUT, retry
+                rpc_status = coord.reopen();
 
-            if (!rpc_status.ok()) {
+                if (!rpc_status.ok()) {
+                    return rpc_status;
+                }
+                coord->reportExecStatus(res, params);
+            } else {
+                std::stringstream msg;
+                msg << "ReportExecStatus() to " << fe_addr << " failed:\n" << e.what();
+                LOG(WARNING) << msg.str();
+                rpc_status = Status::InternalError(msg.str());
                 return rpc_status;
             }
-            coord->reportExecStatus(res, params);
         }
 
         rpc_status = Status(res.status);
@@ -154,6 +172,7 @@ Status ExecStateReporter::report_exec_status(const TReportExecStatusParams& para
         msg << "ReportExecStatus() to " << fe_addr << " failed:\n" << e.what();
         LOG(WARNING) << msg.str();
         rpc_status = Status::InternalError(msg.str());
+        return rpc_status;
     }
     return rpc_status;
 }
@@ -237,18 +256,25 @@ Status ExecStateReporter::report_epoch(const TMVMaintenanceTasks& params, ExecEn
     TMVReportEpochResponse res;
     Status rpc_status;
 
-    VLOG_ROW << "debug: report_epoch params is " << apache::thrift::ThriftDebugString(params).c_str();
     try {
         try {
             coord->mvReport(res, params);
         } catch (TTransportException& e) {
-            LOG(WARNING) << "Retrying mvReport: " << e.what();
-            rpc_status = coord.reopen();
+            TTransportException::TTransportExceptionType type = e.getType();
+            if (type != TTransportException::TTransportExceptionType::TIMED_OUT) {
+                // if not TIMED_OUT, retry
+                rpc_status = coord.reopen();
 
-            if (!rpc_status.ok()) {
-                return rpc_status;
+                if (!rpc_status.ok()) {
+                    return rpc_status;
+                }
+                coord->mvReport(res, params);
+            } else {
+                std::stringstream msg;
+                msg << "mvReport() to " << fe_addr << " failed:\n" << e.what();
+                LOG(WARNING) << msg.str();
+                rpc_status = Status::InternalError(msg.str());
             }
-            coord->mvReport(res, params);
         }
 
         rpc_status = Status::OK();
@@ -274,7 +300,8 @@ ExecStateReporter::ExecStateReporter() {
 }
 
 void ExecStateReporter::submit(std::function<void()>&& report_task) {
-    _thread_pool->submit_func(std::move(report_task));
+    auto st = _thread_pool->submit_func(std::move(report_task));
+    st.permit_unchecked_error();
 }
 
 } // namespace starrocks::pipeline

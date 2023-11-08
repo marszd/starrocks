@@ -52,7 +52,6 @@ TEST(TabletMetaTest, test_create) {
 
     TTabletSchema& schema = request.tablet_schema;
     schema.__set_schema_hash(12345);
-    schema.__set_is_in_memory(false);
     schema.__set_keys_type(TKeysType::DUP_KEYS);
     schema.__set_short_key_column_count(1);
 
@@ -138,7 +137,6 @@ TEST(TabletMetaTest, test_create) {
     const TabletSchema& tablet_schema = tablet_meta->tablet_schema();
     ASSERT_EQ(3, tablet_schema.num_columns());
     ASSERT_EQ(KeysType::DUP_KEYS, tablet_schema.keys_type());
-    ASSERT_EQ(false, tablet_schema.is_in_memory());
 
     const TabletColumn& c0 = tablet_schema.column(0);
     const TabletColumn& c1 = tablet_schema.column(1);
@@ -229,32 +227,6 @@ TEST(TabletMetaTest, test_create) {
     ASSERT_TRUE(binlog_config_ptr->binlog_enable);
     ASSERT_EQ(12323, binlog_config_ptr->binlog_ttl_second);
     ASSERT_EQ(23724, binlog_config_ptr->binlog_max_size);
-}
-
-TEST(TabletMetaTest, test_config_binlog) {
-    TabletMetaSharedPtr tablet_meta = TabletMeta::create();
-    std::shared_ptr<BinlogConfig> binlog_config_ptr = tablet_meta->get_binlog_config();
-    ASSERT_TRUE(binlog_config_ptr == nullptr);
-
-    // test configuration with pb
-    BinlogConfig binlog_config;
-    binlog_config.update(3, true, 823, 984);
-    tablet_meta->set_binlog_config(binlog_config);
-    binlog_config_ptr = tablet_meta->get_binlog_config();
-    ASSERT_EQ(3, binlog_config_ptr->version);
-    ASSERT_TRUE(binlog_config_ptr->binlog_enable);
-    ASSERT_EQ(823, binlog_config_ptr->binlog_ttl_second);
-    ASSERT_EQ(984, binlog_config_ptr->binlog_max_size);
-
-    // test lower version would not override the configuration
-    BinlogConfig binlog_config1;
-    binlog_config1.update(2, true, 323, 475);
-    tablet_meta->set_binlog_config(binlog_config1);
-    binlog_config_ptr = tablet_meta->get_binlog_config();
-    ASSERT_EQ(3, binlog_config_ptr->version);
-    ASSERT_TRUE(binlog_config_ptr->binlog_enable);
-    ASSERT_EQ(823, binlog_config_ptr->binlog_ttl_second);
-    ASSERT_EQ(984, binlog_config_ptr->binlog_max_size);
 }
 
 TEST(TabletMetaTest, test_init_from_pb) {

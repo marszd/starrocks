@@ -14,6 +14,7 @@
 
 #include "formats/csv/nullable_converter.h"
 
+#include "column/adaptive_nullable_column.h"
 #include "column/nullable_column.h"
 #include "common/logging.h"
 
@@ -43,7 +44,24 @@ Status NullableConverter::write_quoted_string(OutputStream* os, const Column& co
     }
 }
 
-bool NullableConverter::read_string(Column* column, Slice s, const Options& options) const {
+bool NullableConverter::read_string_for_adaptive_null_column(Column* column, Slice s, const Options& options) const {
+    auto* nullable_column = down_cast<AdaptiveNullableColumn*>(column);
+
+    if (s == "\\N") {
+        return nullable_column->append_nulls(1);
+    }
+    auto* data = nullable_column->mutable_begin_append_not_default_value();
+    if (_base_converter->read_string(data, s, options)) {
+        nullable_column->finish_append_one_not_default_value();
+        return true;
+    } else if (options.invalid_field_as_null) {
+        return nullable_column->append_nulls(1);
+    } else {
+        return false;
+    }
+}
+
+bool NullableConverter::read_string(Column* column, const Slice& s, const Options& options) const {
     auto* nullable = down_cast<NullableColumn*>(column);
     auto* data = nullable->data_column().get();
 
@@ -59,7 +77,7 @@ bool NullableConverter::read_string(Column* column, Slice s, const Options& opti
     }
 }
 
-bool NullableConverter::read_quoted_string(Column* column, Slice s, const Options& options) const {
+bool NullableConverter::read_quoted_string(Column* column, const Slice& s, const Options& options) const {
     auto* nullable = down_cast<NullableColumn*>(column);
     auto* data = nullable->data_column().get();
 

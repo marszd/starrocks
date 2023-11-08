@@ -35,13 +35,13 @@
 package com.starrocks.mysql.privilege;
 
 import com.google.common.base.Preconditions;
-import com.starrocks.analysis.UserIdentity;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.sql.ast.UserIdentity;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -68,7 +68,7 @@ public abstract class PrivTable implements Writable {
             if (compareByHost != 0) {
                 return compareByHost;
             }
-            return o2.getQualifiedUser().compareTo(o1.getQualifiedUser());
+            return o2.getUser().compareTo(o1.getUser());
         }
     });
 
@@ -228,7 +228,7 @@ public abstract class PrivTable implements Writable {
 
     public boolean doesUsernameExist(String qualifiedUsername) {
         for (UserIdentity userIdentity : map.keySet()) {
-            if (userIdentity.getQualifiedUser().equals(qualifiedUsername)) {
+            if (userIdentity.getUser().equals(qualifiedUsername)) {
                 return true;
             }
         }
@@ -260,7 +260,7 @@ public abstract class PrivTable implements Writable {
 
             return privTable;
         } catch (ClassNotFoundException | InstantiationException | IllegalAccessException | NoSuchMethodException
-                | SecurityException | IllegalArgumentException | InvocationTargetException e) {
+                 | SecurityException | IllegalArgumentException | InvocationTargetException e) {
             throw new IOException("failed read PrivTable", e);
         }
     }
@@ -311,7 +311,7 @@ public abstract class PrivTable implements Writable {
      * return a iterator to all the entries that match currentUser
      */
     public Iterator<PrivEntry> getReadOnlyIteratorByUser(UserIdentity currentUser) {
-        return getReadOnlyIteratorByUser(currentUser.getQualifiedUser(), currentUser.getHost());
+        return getReadOnlyIteratorByUser(currentUser.getUser(), currentUser.getHost());
     }
 
     /**

@@ -88,14 +88,22 @@ public class CTEUtils {
             LogicalCTEProduceOperator produce = (LogicalCTEProduceOperator) expression.getOp();
 
             // costs
-            if (context.getCteContext().isForceCTE(produce.getCteId())) {
-                OptExpression opt = root.extractLogicalTree();
-                calculateStatistics(opt, context);
-                context.getCteContext().addCTEStatistics(produce.getCteId(), opt.getStatistics());
-            }
+            OptExpression opt = root.extractLogicalTree();
+            calculateStatistics(opt, context);
+            context.getCteContext().addCTEStatistics(produce.getCteId(), opt.getStatistics());
         }
     }
 
+    // Collect statistics of CTEProduceOperator outside of memo, used by only by table pruning features.
+    public static void collectForceCteStatisticsOutsideMemo(OptExpression root, OptimizerContext context) {
+        root.getInputs().forEach(input -> collectForceCteStatisticsOutsideMemo(input, context));
+        if (OperatorType.LOGICAL_CTE_ANCHOR.equals(root.getOp().getOpType())) {
+            Preconditions.checkState(root.getInputs().get(0).getOp() instanceof LogicalCTEProduceOperator);
+            LogicalCTEProduceOperator produce = (LogicalCTEProduceOperator) root.getInputs().get(0).getOp();
+            calculateStatistics(root.inputAt(0), context);
+            context.getCteContext().addCTEStatistics(produce.getCteId(), root.inputAt(0).getStatistics());
+        }
+    }
     private static void calculateStatistics(OptExpression expr, OptimizerContext context) {
         // don't ask cte consume children
         if (expr.getOp().getOpType() != OperatorType.LOGICAL_CTE_CONSUME) {

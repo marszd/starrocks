@@ -26,34 +26,39 @@ PARTITION: UNPARTITIONED
 
 RESULT SINK
 
-12:MERGING-EXCHANGE
+13:MERGING-EXCHANGE
 
 PLAN FRAGMENT 1
 OUTPUT EXPRS:
 PARTITION: HASH_PARTITIONED: 20: count
 
 STREAM DATA SINK
-EXCHANGE ID: 12
+EXCHANGE ID: 13
 UNPARTITIONED
 
-11:SORT
+12:SORT
 |  order by: <slot 21> 21: count DESC, <slot 20> 20: count DESC
 |  offset: 0
 |
-10:AGGREGATE (update finalize)
-|  output: count(*)
+11:AGGREGATE (merge finalize)
+|  output: count(21: count)
 |  group by: 20: count
 |
-9:EXCHANGE
+10:EXCHANGE
 
 PLAN FRAGMENT 2
 OUTPUT EXPRS:
 PARTITION: HASH_PARTITIONED: 11: O_CUSTKEY
 
 STREAM DATA SINK
-EXCHANGE ID: 09
+EXCHANGE ID: 10
 HASH_PARTITIONED: 20: count
 
+9:AGGREGATE (update serialize)
+|  STREAMING
+|  output: count(*)
+|  group by: 20: count
+|
 8:Project
 |  <slot 20> : 20: count
 |
@@ -90,7 +95,6 @@ rollup: customer
 tabletRatio=10/10
 cardinality=15000000
 avgRowSize=8.0
-numNodes=0
 
 PLAN FRAGMENT 4
 OUTPUT EXPRS:
@@ -113,6 +117,5 @@ rollup: orders
 tabletRatio=10/10
 cardinality=112500000
 avgRowSize=95.0
-numNodes=0
 [end]
 

@@ -149,7 +149,6 @@ public class OrderByTest extends PlanTestBase {
                 "     tabletList=\n" +
                 "     cardinality=1\n" +
                 "     avgRowSize=3.0\n" +
-                "     numNodes=0\n" +
                 "     limit: 10");
 
         sql = "select * from (select max(v5) from t1) tmp order by null limit 10;";
@@ -375,32 +374,32 @@ public class OrderByTest extends PlanTestBase {
 
         sql = "select v1, v2, sum(v1) over(partition by v1 + 1) as v from t0 order by v";
         plan = getFragmentPlan(sql);
-        assertContains(plan, "6:SORT\n" +
+        assertContains(plan, "5:SORT\n" +
                 "  |  order by: <slot 8> 8: sum(4: v1) ASC\n" +
                 "  |  offset: 0\n" +
                 "  |  \n" +
-                "  5:Project\n" +
+                "  4:Project\n" +
                 "  |  <slot 4> : 4: v1\n" +
                 "  |  <slot 5> : 5: v2\n" +
                 "  |  <slot 8> : 8: sum(4: v1)\n" +
                 "  |  \n" +
-                "  4:ANALYTIC\n" +
+                "  3:ANALYTIC\n" +
                 "  |  functions: [, sum(4: v1), ]\n" +
                 "  |  partition by: 7: expr");
 
         sql = "select v1, v2, sum(v1) over(partition by v1 + 1) as v from t0 order by avg(v1) over(partition by v1 + 1)";
         plan = getFragmentPlan(sql);
-        assertContains(plan, "6:SORT\n" +
+        assertContains(plan, "5:SORT\n" +
                 "  |  order by: <slot 9> 9: avg(4: v1) ASC\n" +
                 "  |  offset: 0\n" +
                 "  |  \n" +
-                "  5:Project\n" +
+                "  4:Project\n" +
                 "  |  <slot 4> : 4: v1\n" +
                 "  |  <slot 5> : 5: v2\n" +
                 "  |  <slot 8> : 8: sum(4: v1)\n" +
                 "  |  <slot 9> : 9: avg(4: v1)\n" +
                 "  |  \n" +
-                "  4:ANALYTIC\n" +
+                "  3:ANALYTIC\n" +
                 "  |  functions: [, sum(4: v1), ], [, avg(4: v1), ]");
 
         sql = "select v1, v2, sum(v1) over(partition by v1 + 1) as v from t0 order by 2";
@@ -409,46 +408,36 @@ public class OrderByTest extends PlanTestBase {
 
         sql = "select v1, v2, sum(v1) over(partition by v1 + 1) as v from t0 order by 3";
         plan = getFragmentPlan(sql);
-        assertContains(plan, "6:SORT\n" +
+        assertContains(plan, "5:SORT\n" +
                 "  |  order by: <slot 8> 8: sum(4: v1) ASC\n" +
                 "  |  offset: 0\n" +
                 "  |  \n" +
-                "  5:Project\n" +
+                "  4:Project\n" +
                 "  |  <slot 4> : 4: v1\n" +
                 "  |  <slot 5> : 5: v2\n" +
                 "  |  <slot 8> : 8: sum(4: v1)\n" +
                 "  |  \n" +
-                "  4:ANALYTIC\n" +
+                "  3:ANALYTIC\n" +
                 "  |  functions: [, sum(4: v1), ]\n" +
                 "  |  partition by: 7: expr");
 
         sql = "select avg(v1) over(partition by sum(v2) + 1) as v from t0 group by v1 order by v";
         plan = getFragmentPlan(sql);
-        assertContains(plan, " 7:SORT\n" +
+        assertContains(plan, " 6:SORT\n" +
                 "  |  order by: <slot 9> 9: avg(1: v1) ASC\n" +
                 "  |  offset: 0\n" +
                 "  |  \n" +
-                "  6:Project\n" +
+                "  5:Project\n" +
                 "  |  <slot 9> : 9: avg(1: v1)\n" +
                 "  |  \n" +
-                "  5:ANALYTIC\n" +
+                "  4:ANALYTIC\n" +
                 "  |  functions: [, avg(1: v1), ]\n" +
                 "  |  partition by: 8: expr\n" +
                 "  |  \n" +
-                "  4:SORT\n" +
+                "  3:SORT\n" +
                 "  |  order by: <slot 8> 8: expr ASC\n" +
                 "  |  offset: 0\n" +
                 "  |  \n" +
-                "  3:EXCHANGE\n" +
-                "\n" +
-                "PLAN FRAGMENT 2\n" +
-                " OUTPUT EXPRS:\n" +
-                "  PARTITION: RANDOM\n" +
-                "\n" +
-                "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 03\n" +
-                "    HASH_PARTITIONED: 8: expr\n" +
-                "\n" +
                 "  2:Project\n" +
                 "  |  <slot 1> : 1: v1\n" +
                 "  |  <slot 8> : 4: sum + 1\n" +
@@ -459,64 +448,44 @@ public class OrderByTest extends PlanTestBase {
 
         sql = "select v1, avg(v1) over(partition by sum(v2) + 1) as v from t0 group by v1 order by 2,1";
         plan = getFragmentPlan(sql);
-        assertContains(plan, "7:SORT\n" +
+        assertContains(plan, "6:SORT\n" +
                 "  |  order by: <slot 9> 9: avg(1: v1) ASC, <slot 1> 1: v1 ASC\n" +
                 "  |  offset: 0\n" +
                 "  |  \n" +
-                "  6:Project\n" +
+                "  5:Project\n" +
                 "  |  <slot 1> : 1: v1\n" +
                 "  |  <slot 9> : 9: avg(1: v1)\n" +
                 "  |  \n" +
-                "  5:ANALYTIC\n" +
+                "  4:ANALYTIC\n" +
                 "  |  functions: [, avg(1: v1), ]\n" +
                 "  |  partition by: 8: expr\n" +
                 "  |  \n" +
-                "  4:SORT\n" +
+                "  3:SORT\n" +
                 "  |  order by: <slot 8> 8: expr ASC\n" +
                 "  |  offset: 0\n" +
                 "  |  \n" +
-                "  3:EXCHANGE\n" +
-                "\n" +
-                "PLAN FRAGMENT 2\n" +
-                " OUTPUT EXPRS:\n" +
-                "  PARTITION: RANDOM\n" +
-                "\n" +
-                "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 03\n" +
-                "    HASH_PARTITIONED: 8: expr\n" +
-                "\n" +
                 "  2:Project\n" +
                 "  |  <slot 1> : 1: v1\n" +
                 "  |  <slot 8> : 4: sum + 1");
 
         sql = "select avg(v1) over(partition by sum(v2) + 1) as v from t0 group by v1 order by v1";
         plan = getFragmentPlan(sql);
-        assertContains(plan, " 7:SORT\n" +
+        assertContains(plan, " 6:SORT\n" +
                 "  |  order by: <slot 1> 1: v1 ASC\n" +
                 "  |  offset: 0\n" +
                 "  |  \n" +
-                "  6:Project\n" +
+                "  5:Project\n" +
                 "  |  <slot 1> : 1: v1\n" +
                 "  |  <slot 9> : 9: avg(1: v1)\n" +
                 "  |  \n" +
-                "  5:ANALYTIC\n" +
+                "  4:ANALYTIC\n" +
                 "  |  functions: [, avg(1: v1), ]\n" +
                 "  |  partition by: 8: expr\n" +
                 "  |  \n" +
-                "  4:SORT\n" +
+                "  3:SORT\n" +
                 "  |  order by: <slot 8> 8: expr ASC\n" +
                 "  |  offset: 0\n" +
                 "  |  \n" +
-                "  3:EXCHANGE\n" +
-                "\n" +
-                "PLAN FRAGMENT 2\n" +
-                " OUTPUT EXPRS:\n" +
-                "  PARTITION: RANDOM\n" +
-                "\n" +
-                "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 03\n" +
-                "    HASH_PARTITIONED: 8: expr\n" +
-                "\n" +
                 "  2:Project\n" +
                 "  |  <slot 1> : 1: v1\n" +
                 "  |  <slot 8> : 4: sum + 1\n" +
@@ -548,6 +517,87 @@ public class OrderByTest extends PlanTestBase {
         plan = getVerboseExplain(sql);
         assertContains(plan, "  1:TOP-N\n" +
                 "  |  order by: [1, VARCHAR, false] ASC, [2, SMALLINT, false] ASC\n" +
+                "  |  build runtime filters:\n" +
+                "  |  - filter_id = 0, build_expr = (<slot 1> 1: t1a), remote = false");
+
+        // no order by column case
+        sql = "SELECT a, b FROM ( SELECT t1a AS a, t1b AS b, row_number() OVER() AS rn FROM" +
+                " test_all_type_not_null ) tb_rn WHERE rn>=10 and rn<19;";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "runtime filters");
+
+        sql = "SELECT a, b FROM ( SELECT t1a AS a, t1b AS b, row_number() OVER( partition by t1a) AS rn FROM" +
+                " test_all_type_not_null ) tb_rn WHERE rn<19;";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "runtime filters");
+
+        // no order by column pattern 2
+        sql = "select * from test_all_type_not_null limit 1000,200";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "runtime filters");
+
+        // order by null case
+        sql = "select * from test_all_type_not_null order by null + 1 limit 1";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "runtime filters");
+    }
+
+    @Test
+    public void testGroupByOrderBy() throws Exception {
+        String sql = "select v2,v3,v2 from t0 group by 1,2,3 order by 1,2,3";
+        String plan = getFragmentPlan(sql);
+
+        assertContains(plan, "2:SORT\n" +
+                "  |  order by: <slot 2> 2: v2 ASC, <slot 3> 3: v3 ASC");
+    }
+
+    @Test
+    public void testTopNFilterWithProject() throws Exception {
+        String sql;
+        String plan;
+
+        // project passthrough good case
+        sql = "select t1a, t1b from test_all_type_not_null where t1f < 10 order by t1a limit 10";
+        plan = getVerboseExplain(sql);
+        assertContains(plan, "  2:TOP-N\n" +
+                "  |  order by: [1, VARCHAR, false] ASC\n" +
+                "  |  build runtime filters:\n" +
+                "  |  - filter_id = 0, build_expr = (<slot 1> 1: t1a), remote = false");
+
+        // Hash join probe good case
+        sql = "select l.t1a, l.t1b from test_all_type_not_null l join test_all_type_not_null r " +
+                "on l.t1a=r.t1a order by l.t1a limit 10";
+        plan = getVerboseExplain(sql);
+        assertContains(plan, "  5:TOP-N\n" +
+                "  |  order by: [1, VARCHAR, false] ASC\n" +
+                "  |  build runtime filters:\n" +
+                "  |  - filter_id = 1, build_expr = (<slot 1> 1: t1a), remote = false");
+        assertContains(plan, "     probe runtime filters:\n" +
+                "     - filter_id = 0, probe_expr = (1: t1a)\n" +
+                "     - filter_id = 1, probe_expr = (1: t1a)");
+
+        // sort/Bucket AGG order by good case
+        sql = "select count(*) from test_all_type_not_null group by t1a order by t1a limit 10;";
+        plan = getVerboseExplain(sql);
+        assertContains(plan, "     probe runtime filters:\n" +
+                "     - filter_id = 0, probe_expr = (1: t1a)");
+
+        // shouldn't generate filter for agg column
+        sql = "select count(*) cnt from test_all_type_not_null group by t1a order by cnt limit 10;";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "runtime filters");
+
+        // shouldn't generate filter for window function
+        sql = "select row_number() over (partition by t1b) from test_all_type_not_null order by t1a limit 1;";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "runtime filters");
+
+        // partition by column case
+        // but we have not implements streaming sort in BE
+        sql = "select row_number() over (partition by t1a) from test_all_type_not_null order by t1a limit 1;";
+        plan = getVerboseExplain(sql);
+        assertContains(plan, "  3:TOP-N\n" +
+                "  |  order by: [1, VARCHAR, false] ASC\n" +
                 "  |  build runtime filters:\n" +
                 "  |  - filter_id = 0, build_expr = (<slot 1> 1: t1a), remote = false");
     }

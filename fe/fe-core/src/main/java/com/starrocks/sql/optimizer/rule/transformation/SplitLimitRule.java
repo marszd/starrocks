@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.rule.transformation;
 
-import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
@@ -49,10 +47,9 @@ public class SplitLimitRule extends TransformationRule {
     @Override
     public List<OptExpression> transform(OptExpression input, OptimizerContext context) {
         LogicalLimitOperator limit = (LogicalLimitOperator) input.getOp();
-        Preconditions.checkState(!limit.hasOffset());
 
-        LogicalLimitOperator global = LogicalLimitOperator.global(limit.getLimit());
-        LogicalLimitOperator local = LogicalLimitOperator.local(limit.getLimit());
+        LogicalLimitOperator global = LogicalLimitOperator.global(limit.getLimit(), limit.getOffset());
+        LogicalLimitOperator local = LogicalLimitOperator.local(limit.getLimit() + limit.getOffset());
 
         return Lists.newArrayList(OptExpression.create(global, OptExpression.create(local, input.getInputs())));
     }

@@ -15,7 +15,7 @@
 
 package com.starrocks.sql.optimizer.dump;
 
-import com.clearspring.analytics.util.Lists;
+import com.google.common.collect.Lists;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonDeserializationContext;
 import com.google.gson.JsonDeserializer;
@@ -29,9 +29,9 @@ import java.lang.reflect.Type;
 import java.util.List;
 
 public class HiveTableDumpInfo implements HiveMetaStoreTableDumpInfo {
-    private List<String> partitionNames;
-    private List<String> partColumnNames;
-    private List<String> dataColumnNames;
+    private List<String> partitionNames = Lists.newArrayList();
+    private List<String> partColumnNames = Lists.newArrayList();
+    private List<String> dataColumnNames = Lists.newArrayList();
     private double rowCount;
     private static final String TYPE = "hive";
 

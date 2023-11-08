@@ -17,7 +17,7 @@ package com.starrocks.sql.optimizer.rewrite.scalar;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
-import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSet;
 import com.starrocks.sql.optimizer.operator.OperatorType;
@@ -27,6 +27,8 @@ import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriteContext;
 
 import java.util.Map;
+
+import static com.starrocks.sql.optimizer.operator.scalar.ScalarOperatorUtil.findArithmeticFunction;
 
 public class ArithmeticCommutativeRule extends BottomUpScalarOperatorRewriteRule {
     // Don't support DIVIDE, because DIVIDE will use double type, Double is not efficient and will lose precision
@@ -75,6 +77,9 @@ public class ArithmeticCommutativeRule extends BottomUpScalarOperatorRewriteRule
             if (!LEFT_COMMUTATIVE_MAP.containsKey(functionName)) {
                 return predicate;
             }
+            if (s2.isConstantNull() && predicate.getBinaryType() == BinaryType.EQ_FOR_NULL) {
+                return predicate;
+            }
             String fnName = LEFT_COMMUTATIVE_MAP.get(functionName);
             Function fn = findArithmeticFunction(call, fnName);
             CallOperator n = new CallOperator(fnName, fn.getReturnType(), Lists.newArrayList(result, s2), fn);
@@ -94,6 +99,9 @@ public class ArithmeticCommutativeRule extends BottomUpScalarOperatorRewriteRule
             if (!RIGHT_COMMUTATIVE_MAP.containsKey(functionName)) {
                 return predicate;
             }
+            if (s1.isConstantNull() && predicate.getBinaryType() == BinaryType.EQ_FOR_NULL) {
+                return predicate;
+            }
             String fnName = RIGHT_COMMUTATIVE_MAP.get(functionName);
             Function fn = findArithmeticFunction(call, fnName);
 
@@ -107,9 +115,5 @@ public class ArithmeticCommutativeRule extends BottomUpScalarOperatorRewriteRule
         }
 
         return predicate;
-    }
-
-    private Function findArithmeticFunction(CallOperator call, String fnName) {
-        return Expr.getBuiltinFunction(fnName, call.getFunction().getArgs(), Function.CompareMode.IS_IDENTICAL);
     }
 }

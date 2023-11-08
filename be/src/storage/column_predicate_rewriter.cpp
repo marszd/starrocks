@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <utility>
 
 #include "column/binary_column.h"
@@ -35,6 +36,7 @@
 #include "simd/simd.h"
 #include "storage/column_expr_predicate.h"
 #include "storage/column_predicate.h"
+#include "storage/range.h"
 #include "storage/rowset/column_reader.h"
 #include "storage/rowset/scalar_column_iterator.h"
 
@@ -77,7 +79,7 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
             int code = _column_iterators[cid]->dict_lookup(value.get_slice());
             if (code < 0) {
                 // predicate always false, clear scan range, this will make `get_next` return EOF directly.
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
                 continue;
             }
             auto ptr = new_column_eq_predicate(get_type_info(kDictCodeType), cid, std::to_string(code));
@@ -113,7 +115,7 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
             }
             if (codewords.empty()) {
                 // predicate always false, clear scan range.
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
                 continue;
             }
             std::vector<std::string> str_codewords;
@@ -153,7 +155,7 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
             i = pool->add(ptr);
         }
         if (PredicateType::kGE == pred->type() || PredicateType::kGT == pred->type()) {
-            _get_segment_dict(&sorted_dicts, _column_iterators[cid].get());
+            RETURN_IF_ERROR(_get_segment_dict(&sorted_dicts, _column_iterators[cid].get()));
             // use non-padding string value.
             auto value = pred->values()[0].get_slice().to_string();
             auto iter = std::lower_bound(
@@ -175,12 +177,12 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
                 auto ptr = new_column_in_predicate(get_type_info(kDictCodeType), cid, str_codewords);
                 i = pool->add(ptr);
             } else {
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
                 continue;
             }
         }
         if (PredicateType::kLE == pred->type() || PredicateType::kLT == pred->type()) {
-            _get_segment_dict(&sorted_dicts, _column_iterators[cid].get());
+            RETURN_IF_ERROR(_get_segment_dict(&sorted_dicts, _column_iterators[cid].get()));
             // use non-padding string value.
             auto value = pred->values()[0].get_slice().to_string();
             auto iter = std::lower_bound(
@@ -203,7 +205,7 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
                 auto ptr = new_column_in_predicate(get_type_info(kDictCodeType), cid, str_codewords);
                 i = pool->add(ptr);
             } else {
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
                 continue;
             }
         }
@@ -217,14 +219,15 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
         if (PredicateType::kExpr == pred->type()) {
             if (!load_seg_dict_vec) {
                 load_seg_dict_vec = true;
-                _get_segment_dict_vec(_column_iterators[cid].get(), &dict_column, &code_column, field->is_nullable());
+                RETURN_IF_ERROR(_get_segment_dict_vec(_column_iterators[cid].get(), &dict_column, &code_column,
+                                                      field->is_nullable()));
             }
 
             ColumnPredicate* ptr;
             ASSIGN_OR_RETURN(bool non_empty,
                              _rewrite_expr_predicate(pool, pred, dict_column, code_column, field->is_nullable(), &ptr));
             if (!non_empty) {
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
             } else {
                 i = pool->add(ptr);
             }
@@ -242,10 +245,11 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
 // This function is only used to rewrite the LE/LT/GE/GT condition.
 // For the greater than or less than condition,
 // you need to get the values of all ordered dictionaries and rewrite them as `InList` expressions
-void ColumnPredicateRewriter::_get_segment_dict(std::vector<std::pair<std::string, int>>* dicts, ColumnIterator* iter) {
+Status ColumnPredicateRewriter::_get_segment_dict(std::vector<std::pair<std::string, int>>* dicts,
+                                                  ColumnIterator* iter) {
     // We already loaded dicts, no need to do once more.
     if (!dicts->empty()) {
-        return;
+        return Status::OK();
     }
     auto column_iterator = down_cast<ScalarColumnIterator*>(iter);
     auto dict_size = column_iterator->dict_size();
@@ -253,7 +257,7 @@ void ColumnPredicateRewriter::_get_segment_dict(std::vector<std::pair<std::strin
     std::iota(dict_codes, dict_codes + dict_size, 0);
 
     auto column = BinaryColumn::create();
-    column_iterator->decode_dict_codes(dict_codes, dict_size, column.get());
+    RETURN_IF_ERROR(column_iterator->decode_dict_codes(dict_codes, dict_size, column.get()));
 
     for (int i = 0; i < dict_size; ++i) {
         dicts->emplace_back(column->get_slice(i).to_string(), dict_codes[i]);
@@ -261,17 +265,18 @@ void ColumnPredicateRewriter::_get_segment_dict(std::vector<std::pair<std::strin
 
     std::sort(dicts->begin(), dicts->end(),
               [](const auto& e1, const auto& e2) { return e1.first.compare(e2.first) < 0; });
+    return Status::OK();
 }
 
-void ColumnPredicateRewriter::_get_segment_dict_vec(ColumnIterator* iter, ColumnPtr* dict_column,
-                                                    ColumnPtr* code_column, bool field_nullable) {
+Status ColumnPredicateRewriter::_get_segment_dict_vec(ColumnIterator* iter, ColumnPtr* dict_column,
+                                                      ColumnPtr* code_column, bool field_nullable) {
     auto column_iterator = down_cast<ScalarColumnIterator*>(iter);
     auto dict_size = column_iterator->dict_size();
     int dict_codes[dict_size];
     std::iota(dict_codes, dict_codes + dict_size, 0);
 
     auto dict_col = BinaryColumn::create();
-    column_iterator->decode_dict_codes(dict_codes, dict_size, dict_col.get());
+    RETURN_IF_ERROR(column_iterator->decode_dict_codes(dict_codes, dict_size, dict_col.get()));
 
     if (field_nullable) {
         // create nullable column with NULL at last.
@@ -292,6 +297,7 @@ void ColumnPredicateRewriter::_get_segment_dict_vec(ColumnIterator* iter, Column
         code_buf[i] = dict_codes[i];
     }
     *code_column = code_col;
+    return Status::OK();
 }
 
 StatusOr<bool> ColumnPredicateRewriter::_rewrite_expr_predicate(ObjectPool* pool, const ColumnPredicate* raw_pred,
@@ -302,7 +308,25 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_expr_predicate(ObjectPool* pool
     size_t value_size = raw_dict_column->size();
     std::vector<uint8_t> selection(value_size);
     const auto* pred = down_cast<const ColumnExprPredicate*>(raw_pred);
-    RETURN_IF_ERROR(pred->evaluate(raw_dict_column.get(), selection.data(), 0, value_size));
+    size_t chunk_size = std::min<size_t>(pred->runtime_state()->chunk_size(), std::numeric_limits<uint16_t>::max());
+
+    if (value_size <= chunk_size) {
+        RETURN_IF_ERROR(pred->evaluate(raw_dict_column.get(), selection.data(), 0, value_size));
+    } else {
+        auto dict_column = raw_dict_column->clone_empty();
+        SparseRange<> range(0, value_size);
+        auto iter = range.new_iterator();
+        auto selection_cursor = selection.data();
+        while (iter.has_more()) {
+            auto next_range = iter.next(chunk_size);
+            size_t num_rows = next_range.span_size();
+            DCHECK_LE(next_range.begin() + num_rows, raw_dict_column->size());
+            dict_column->append(*raw_dict_column, next_range.begin(), num_rows);
+            RETURN_IF_ERROR(pred->evaluate(dict_column.get(), selection_cursor, 0, num_rows));
+            dict_column->reset_column();
+            selection_cursor += num_rows;
+        }
+    }
 
     size_t code_size = raw_code_column->size();
     const auto& code_column = ColumnHelper::cast_to<TYPE_INT>(raw_code_column);
@@ -343,7 +367,7 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_expr_predicate(ObjectPool* pool
     RuntimeState* state = pred->runtime_state();
     ColumnRef column_ref(pred->slot_desc());
     // change column input type from binary to int(code)
-    TypeDescriptor type_desc = TypeDescriptor::from_primtive_type(TYPE_INT);
+    TypeDescriptor type_desc = TypeDescriptor::from_logical_type(TYPE_INT);
     column_ref._type = type_desc;
     Expr* probe_expr = &column_ref;
 
@@ -354,7 +378,7 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_expr_predicate(ObjectPool* pool
     builder.set_is_not_in(is_not_in);
     builder.use_array_set(code_size);
     DCHECK_IF_ERROR(builder.create());
-    builder.add_values(used_values, 0);
+    (void)builder.add_values(used_values, 0);
     ExprContext* filter = builder.get_in_const_predicate();
 
     DCHECK_IF_ERROR(filter->prepare(state));
@@ -366,9 +390,9 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_expr_predicate(ObjectPool* pool
     return true;
 }
 
-// member function for ConjunctivePredicatesRewriter
+// member function for GlobalDictPredicatesRewriter
 
-Status ConjunctivePredicatesRewriter::rewrite_predicate(ObjectPool* pool) {
+Status GlobalDictPredicatesRewriter::rewrite_predicate(ObjectPool* pool) {
     std::vector<uint8_t> selection;
     auto pred_rewrite = [&](std::vector<const ColumnPredicate*>& preds) {
         for (auto& pred : preds) {

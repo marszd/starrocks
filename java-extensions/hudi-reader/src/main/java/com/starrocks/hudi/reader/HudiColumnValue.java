@@ -16,6 +16,7 @@ package com.starrocks.hudi.reader;
 
 import com.starrocks.jni.connector.ColumnType;
 import com.starrocks.jni.connector.ColumnValue;
+import org.apache.hadoop.hive.common.type.HiveDecimal;
 import org.apache.hadoop.hive.serde2.objectinspector.ListObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.MapObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
@@ -24,6 +25,7 @@ import org.apache.hadoop.hive.serde2.objectinspector.StructField;
 import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
 import org.apache.hadoop.io.LongWritable;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
@@ -75,14 +77,14 @@ public class HudiColumnValue implements ColumnValue {
     }
 
     @Override
-    public String getString() {
+    public String getString(ColumnType.TypeValue type) {
         return inspectObject().toString();
     }
 
     @Override
     public String getTimestamp(ColumnType.TypeValue type) {
         // INT64 timestamp type
-        if (HudiScannerUtils.isInt64Timestamp(type)) {
+        if (HudiScannerUtils.isMaybeInt64Timestamp(type) && (fieldData instanceof LongWritable)) {
             long datetime = ((LongWritable) fieldData).get();
             TimeUnit timeUnit = TIMESTAMP_UNIT_MAPPING.get(type);
             LocalDateTime localDateTime = HudiScannerUtils.getTimestamp(datetime, timeUnit, true);
@@ -146,5 +148,15 @@ public class HudiColumnValue implements ColumnValue {
             }
             values.add(cv);
         }
+    }
+
+    @Override
+    public byte getByte() {
+        throw new UnsupportedOperationException("Hoodie type does not support tinyint");
+    }
+
+    @Override
+    public BigDecimal getDecimal() {
+        return ((HiveDecimal) inspectObject()).bigDecimalValue();
     }
 }

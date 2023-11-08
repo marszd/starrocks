@@ -34,13 +34,16 @@
 
 package com.starrocks.qe;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import com.starrocks.analysis.AccessTestUtil;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.LabelName;
 import com.starrocks.analysis.SlotRef;
+import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.TableName;
-import com.starrocks.analysis.UserIdentity;
+import com.starrocks.catalog.BaseTableInfo;
 import com.starrocks.catalog.Catalog;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
@@ -60,36 +63,53 @@ import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Table.TableType;
 import com.starrocks.catalog.TableProperty;
 import com.starrocks.catalog.Type;
+import com.starrocks.catalog.system.information.MaterializedViewsSystemTable;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.ExceptionChecker;
 import com.starrocks.common.PatternMatcher;
 import com.starrocks.common.UserException;
 import com.starrocks.common.jmockit.Deencapsulation;
+import com.starrocks.common.proc.ComputeNodeProcDir;
+import com.starrocks.datacache.DataCacheMgr;
 import com.starrocks.lake.StarOSAgent;
 import com.starrocks.mysql.MysqlCommand;
+import com.starrocks.privilege.PrivilegeBuiltinConstants;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.MetadataMgr;
+import com.starrocks.server.RunMode;
 import com.starrocks.sql.ast.DescribeStmt;
-import com.starrocks.sql.ast.HelpStmt;
+import com.starrocks.sql.ast.QualifiedName;
 import com.starrocks.sql.ast.SetType;
 import com.starrocks.sql.ast.ShowAuthorStmt;
 import com.starrocks.sql.ast.ShowBackendsStmt;
+import com.starrocks.sql.ast.ShowBasicStatsMetaStmt;
+import com.starrocks.sql.ast.ShowCharsetStmt;
 import com.starrocks.sql.ast.ShowColumnStmt;
+import com.starrocks.sql.ast.ShowComputeNodesStmt;
 import com.starrocks.sql.ast.ShowCreateDbStmt;
 import com.starrocks.sql.ast.ShowCreateExternalCatalogStmt;
 import com.starrocks.sql.ast.ShowCreateTableStmt;
+import com.starrocks.sql.ast.ShowDataCacheRulesStmt;
 import com.starrocks.sql.ast.ShowDbStmt;
 import com.starrocks.sql.ast.ShowEnginesStmt;
-import com.starrocks.sql.ast.ShowMaterializedViewStmt;
+import com.starrocks.sql.ast.ShowGrantsStmt;
+import com.starrocks.sql.ast.ShowMaterializedViewsStmt;
 import com.starrocks.sql.ast.ShowPartitionsStmt;
 import com.starrocks.sql.ast.ShowProcedureStmt;
 import com.starrocks.sql.ast.ShowRoutineLoadStmt;
 import com.starrocks.sql.ast.ShowTableStmt;
 import com.starrocks.sql.ast.ShowUserStmt;
 import com.starrocks.sql.ast.ShowVariablesStmt;
+import com.starrocks.sql.ast.UserIdentity;
+import com.starrocks.sql.parser.NodePosition;
+import com.starrocks.statistic.AnalyzeMgr;
+import com.starrocks.statistic.ExternalBasicStatsMeta;
+import com.starrocks.statistic.StatsConstants;
 import com.starrocks.system.Backend;
+import com.starrocks.system.BackendCoreStat;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TStorageType;
 import mockit.Expectations;
@@ -104,9 +124,9 @@ import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.ExpectedException;
+import org.sparkproject.guava.collect.Maps;
 
-import java.io.IOException;
-import java.net.URL;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -117,6 +137,7 @@ import java.util.Map;
 import static com.starrocks.common.util.PropertyAnalyzer.PROPERTIES_STORAGE_COOLDOWN_TIME;
 import static com.starrocks.server.CatalogMgr.ResourceMappingCatalog.toResourceName;
 import static com.starrocks.thrift.TStorageMedium.SSD;
+
 public class ShowExecutorTest {
 
     private static final Logger LOG = LogManager.getLogger(ShowExecutorTest.class);
@@ -198,8 +219,8 @@ public class ShowExecutorTest {
             }
         };
 
-        MaterializedView.BaseTableInfo baseTableInfo = new MaterializedView.BaseTableInfo(
-                "default_catalog", "testDb", "testTbl");
+        BaseTableInfo baseTableInfo = new BaseTableInfo(
+                "default_catalog", "testDb", "testTbl", null);
 
         // mock materialized view
         MaterializedView mv = new MaterializedView();
@@ -212,6 +233,10 @@ public class ShowExecutorTest {
                 mv.getBaseTableInfos();
                 minTimes = 0;
                 result = baseTableInfo;
+
+                mv.getBaseSchema();
+                minTimes = 0;
+                result = Lists.newArrayList(column1, column2);
 
                 mv.getType();
                 minTimes = 0;
@@ -230,6 +255,10 @@ public class ShowExecutorTest {
                 result = 10L;
 
                 mv.getComment();
+                minTimes = 0;
+                result = "TEST MATERIALIZED VIEW";
+
+                mv.getDisplayComment();
                 minTimes = 0;
                 result = "TEST MATERIALIZED VIEW";
 
@@ -288,7 +317,7 @@ public class ShowExecutorTest {
 
                 db.getTables();
                 minTimes = 0;
-                result = Lists.newArrayList(table);
+                result = Lists.newArrayList(table, mv);
 
                 db.getMaterializedViews();
                 minTimes = 0;
@@ -337,6 +366,11 @@ public class ShowExecutorTest {
                 GlobalStateMgr.getCurrentState().getMetadataMgr().getDb("default_catalog", "emptyDb");
                 minTimes = 0;
                 result = null;
+
+                GlobalStateMgr.getCurrentState().getMetadataMgr().getTable("default_catalog", "testDb",
+                        "testTbl");
+                minTimes = 0;
+                result = table;
             }
         };
 
@@ -366,6 +400,8 @@ public class ShowExecutorTest {
     @Test
     public void testShowDb() throws AnalysisException, DdlException {
         ctx.setCurrentUserIdentity(UserIdentity.ROOT);
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+
         ShowDbStmt stmt = new ShowDbStmt(null);
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         ShowResultSet resultSet = executor.execute();
@@ -389,16 +425,21 @@ public class ShowExecutorTest {
         ShowDbStmt stmt = new ShowDbStmt(null);
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         ctx.setGlobalStateMgr(AccessTestUtil.fetchBlockCatalog());
+        ctx.setCurrentUserIdentity(UserIdentity.ROOT);
         ShowResultSet resultSet = executor.execute();
     }
 
     @Test
     public void testShowTable() throws AnalysisException, DdlException {
         ctx.setCurrentUserIdentity(UserIdentity.ROOT);
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+
         ShowTableStmt stmt = new ShowTableStmt("testDb", false, null);
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         ShowResultSet resultSet = executor.execute();
 
+        Assert.assertTrue(resultSet.next());
+        Assert.assertEquals("testMv", resultSet.getString(0));
         Assert.assertTrue(resultSet.next());
         Assert.assertEquals("testTbl", resultSet.getString(0));
         Assert.assertFalse(resultSet.next());
@@ -568,10 +609,15 @@ public class ShowExecutorTest {
     @Test
     public void testShowTableVerbose() throws AnalysisException, DdlException {
         ctx.setCurrentUserIdentity(UserIdentity.ROOT);
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+
         ShowTableStmt stmt = new ShowTableStmt("testDb", true, null);
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         ShowResultSet resultSet = executor.execute();
 
+        Assert.assertTrue(resultSet.next());
+        Assert.assertEquals("testMv", resultSet.getString(0));
+        Assert.assertEquals("VIEW", resultSet.getString(1));
         Assert.assertTrue(resultSet.next());
         Assert.assertEquals("testTbl", resultSet.getString(0));
         Assert.assertEquals("BASE TABLE", resultSet.getString(1));
@@ -754,7 +800,14 @@ public class ShowExecutorTest {
             }
         };
 
-        Config.integrate_starmgr = true;
+        new MockUp<RunMode>() {
+            @Mock
+            public RunMode getCurrentRunMode() {
+                return RunMode.SHARED_DATA;
+            }
+        };
+
+
         ShowBackendsStmt stmt = new ShowBackendsStmt();
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         ShowResultSet resultSet = executor.execute();
@@ -771,8 +824,79 @@ public class ShowExecutorTest {
         Assert.assertEquals("1", resultSet.getString(0));
         Assert.assertEquals("0", resultSet.getString(23));
         Assert.assertEquals("5", resultSet.getString(27));
+    }
 
-        Config.integrate_starmgr = false;
+    @Test
+    public void testShowComputeNodes() throws AnalysisException, DdlException {
+        SystemInfoService clusterInfo = AccessTestUtil.fetchSystemInfoService();
+        StarOSAgent starosAgent = new StarOSAgent();
+
+        ComputeNode node = new ComputeNode(1L, "127.0.0.1", 80);
+        node.updateResourceUsage(10, 100L, 1L, 30);
+
+        new MockUp<SystemInfoService>() {
+            @Mock
+            List<Long> getComputeNodeIds(boolean needAlive) {
+                return ImmutableList.of(node.getId());
+            }
+
+            @Mock
+            ComputeNode getComputeNode(long computeNodeId) {
+                if (computeNodeId == node.getId()) {
+                    return node;
+                }
+                return null;
+            }
+        };
+
+        new MockUp<GlobalStateMgr>() {
+            @Mock
+            SystemInfoService getCurrentSystemInfo() {
+                return clusterInfo;
+            }
+
+            @Mock
+            StarOSAgent getStarOSAgent() {
+                return starosAgent;
+            }
+        };
+
+        new MockUp<BackendCoreStat>() {
+            @Mock
+            int getCoresOfBe(long beId) {
+                return 16;
+            }
+        };
+
+        new MockUp<RunMode>() {
+            @Mock
+            public RunMode getCurrentRunMode() {
+                return RunMode.SHARED_DATA;
+            }
+        };
+
+        new MockUp<StarOSAgent>() {
+            @Mock
+            long getWorkerIdByBackendId(long backendId) {
+                return 5;
+            }
+        };
+
+        ShowComputeNodesStmt stmt = new ShowComputeNodesStmt();
+        ShowExecutor executor = new ShowExecutor(ctx, stmt);
+        ShowResultSet resultSet = executor.execute();
+
+        Assert.assertEquals(ComputeNodeProcDir.TITLE_NAMES.size(), resultSet.getMetaData().getColumnCount());
+        for (int i = 0; i < ComputeNodeProcDir.TITLE_NAMES.size(); ++i) {
+            Assert.assertEquals(ComputeNodeProcDir.TITLE_NAMES.get(i), resultSet.getMetaData().getColumn(i).getName());
+        }
+        System.out.println(resultSet.getMetaData().getColumn(13));
+
+        Assert.assertTrue(resultSet.next());
+        Assert.assertEquals("16", resultSet.getString(13));
+        Assert.assertEquals("10", resultSet.getString(14));
+        Assert.assertEquals("1.00 %", resultSet.getString(15));
+        Assert.assertEquals("3.0 %", resultSet.getString(16));
     }
 
     @Test
@@ -808,6 +932,18 @@ public class ShowExecutorTest {
     }
 
     @Test
+    public void testShowCharset() throws DdlException, AnalysisException {
+        // Dbeaver 23 Use
+        ShowCharsetStmt stmt = new ShowCharsetStmt();
+        ShowExecutor executor = new ShowExecutor(ctx, stmt);
+        ShowResultSet resultSet = executor.execute();
+        Assert.assertTrue(resultSet.next());
+        List<List<String>> resultRows = resultSet.getResultRows();
+        Assert.assertTrue(resultRows.size() >= 1);
+        Assert.assertEquals(resultRows.get(0).get(0), "utf8");
+    }
+
+    @Test
     public void testShowEmpty() throws AnalysisException, DdlException {
         ShowProcedureStmt stmt = new ShowProcedureStmt();
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
@@ -817,73 +953,11 @@ public class ShowExecutorTest {
     }
 
     @Test
-    public void testHelp() throws AnalysisException, IOException, UserException {
-        HelpModule module = new HelpModule();
-        URL help = getClass().getClassLoader().getResource("test-help-resource-show-help.zip");
-        module.setUpByZip(help.getPath());
-        new Expectations(module) {
-            {
-                HelpModule.getInstance();
-                minTimes = 0;
-                result = module;
-            }
-        };
-
-        // topic
-        HelpStmt stmt = new HelpStmt("ADD");
-        ShowExecutor executor = new ShowExecutor(ctx, stmt);
-        ShowResultSet resultSet = executor.execute();
-
-        Assert.assertTrue(resultSet.next());
-        Assert.assertEquals("ADD", resultSet.getString(0));
-        Assert.assertEquals("add function\n", resultSet.getString(1));
-        Assert.assertFalse(resultSet.next());
-
-        // topic
-        stmt = new HelpStmt("logical");
-        executor = new ShowExecutor(ctx, stmt);
-        resultSet = executor.execute();
-
-        Assert.assertTrue(resultSet.next());
-        Assert.assertEquals("OR", resultSet.getString(0));
-        Assert.assertFalse(resultSet.next());
-
-        // keywords
-        stmt = new HelpStmt("MATH");
-        executor = new ShowExecutor(ctx, stmt);
-        resultSet = executor.execute();
-
-        Assert.assertTrue(resultSet.next());
-        Assert.assertEquals("ADD", resultSet.getString(0));
-        Assert.assertTrue(resultSet.next());
-        Assert.assertEquals("MINUS", resultSet.getString(0));
-        Assert.assertFalse(resultSet.next());
-
-        // category
-        stmt = new HelpStmt("functions");
-        executor = new ShowExecutor(ctx, stmt);
-        resultSet = executor.execute();
-
-        Assert.assertTrue(resultSet.next());
-        Assert.assertEquals("HELP", resultSet.getString(0));
-        Assert.assertTrue(resultSet.next());
-        Assert.assertEquals("binary function", resultSet.getString(0));
-        Assert.assertTrue(resultSet.next());
-        Assert.assertEquals("bit function", resultSet.getString(0));
-        Assert.assertFalse(resultSet.next());
-
-        // empty
-        stmt = new HelpStmt("empty");
-        executor = new ShowExecutor(ctx, stmt);
-        resultSet = executor.execute();
-
-        Assert.assertFalse(resultSet.next());
-    }
-
-    @Test
     public void testShowMaterializedView() throws AnalysisException, DdlException {
         ctx.setCurrentUserIdentity(UserIdentity.ROOT);
-        ShowMaterializedViewStmt stmt = new ShowMaterializedViewStmt("testDb", (String) null);
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+
+        ShowMaterializedViewsStmt stmt = new ShowMaterializedViewsStmt("testDb", (String) null);
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         ShowResultSet resultSet = executor.execute();
         verifyShowMaterializedViewResult(resultSet);
@@ -891,7 +965,7 @@ public class ShowExecutorTest {
 
     @Test
     public void testShowMaterializedViewFromUnknownDatabase() throws DdlException, AnalysisException {
-        ShowMaterializedViewStmt stmt = new ShowMaterializedViewStmt("emptyDb", (String) null);
+        ShowMaterializedViewsStmt stmt = new ShowMaterializedViewsStmt("emptyDb", (String) null);
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         expectedEx.expect(AnalysisException.class);
         expectedEx.expectMessage("Unknown database 'emptyDb'");
@@ -901,36 +975,45 @@ public class ShowExecutorTest {
     @Test
     public void testShowMaterializedViewPattern() throws AnalysisException, DdlException {
         ctx.setCurrentUserIdentity(UserIdentity.ROOT);
-        ShowMaterializedViewStmt stmt = new ShowMaterializedViewStmt("testDb", "bcd%");
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
+
+        ShowMaterializedViewsStmt stmt = new ShowMaterializedViewsStmt("testDb", "bcd%");
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         ShowResultSet resultSet = executor.execute();
         Assert.assertFalse(resultSet.next());
 
-        stmt = new ShowMaterializedViewStmt("testDb", "%test%");
+        stmt = new ShowMaterializedViewsStmt("testDb", "%test%");
         executor = new ShowExecutor(ctx, stmt);
         resultSet = executor.execute();
         verifyShowMaterializedViewResult(resultSet);
     }
 
     private void verifyShowMaterializedViewResult(ShowResultSet resultSet) throws AnalysisException, DdlException {
-        String expectedSqlText = "CREATE MATERIALIZED VIEW `testMv`\n" +
+        String expectedSqlText = "CREATE MATERIALIZED VIEW `testMv` (`col1`, `col2`)\n" +
                 "COMMENT \"TEST MATERIALIZED VIEW\"\n" +
                 "PARTITION BY (`col1`)\n" +
                 "DISTRIBUTED BY HASH(`col1`) BUCKETS 10 \n" +
                 "REFRESH ASYNC\n" +
                 "PROPERTIES (\n" +
-                "\"replication_num\" = \"1\",\n" +
-                "\"storage_medium\" = \"SSD\",\n" +
-                "\"storage_cooldown_time\" = \"1970-01-01 08:00:00\"\n" +
+                "\"storage_cooldown_time\" = \"1970-01-01 08:00:00\",\n" +
+                "\"storage_medium\" = \"SSD\"\n" +
                 ")\n" +
                 "AS select col1, col2 from table1;";
 
         Assert.assertTrue(resultSet.next());
+        List<Column> mvSchemaTable = MaterializedViewsSystemTable.create().getFullSchema();
         Assert.assertEquals("1000", resultSet.getString(0));
-        Assert.assertEquals("testMv", resultSet.getString(1));
-        Assert.assertEquals("testDb", resultSet.getString(2));
-        Assert.assertEquals(expectedSqlText, resultSet.getString(3));
-        Assert.assertEquals("10", resultSet.getString(4));
+        Assert.assertEquals("testDb", resultSet.getString(1));
+        Assert.assertEquals("testMv", resultSet.getString(2));
+        Assert.assertEquals("ASYNC", resultSet.getString(3));
+        Assert.assertEquals("true", resultSet.getString(4));
+        Assert.assertEquals("", resultSet.getString(5));
+        Assert.assertEquals("RANGE", resultSet.getString(6));
+        for (int i = 6; i < mvSchemaTable.size() - 2; i++) {
+            Assert.assertEquals("", resultSet.getString(7));
+        }
+        Assert.assertEquals("10", resultSet.getString(mvSchemaTable.size() - 2));
+        Assert.assertEquals(expectedSqlText, resultSet.getString(mvSchemaTable.size() - 1));
         Assert.assertFalse(resultSet.next());
     }
 
@@ -953,7 +1036,8 @@ public class ShowExecutorTest {
             @Mock
             public Table getTable(String catalogName, String dbName, String tblName) {
                 List<Column> fullSchema = new ArrayList<>();
-                Column columnId = new Column("id", Type.INT);
+                Column columnId = new Column("id", Type.INT, true);
+                columnId.setComment("id");
                 Column columnName = new Column("name", Type.VARCHAR);
                 Column columnYear = new Column("year", Type.INT);
                 Column columnDt = new Column("dt", Type.INT);
@@ -986,15 +1070,13 @@ public class ShowExecutorTest {
         ShowResultSet resultSet = executor.execute();
         Assert.assertEquals("test_table", resultSet.getResultRows().get(0).get(0));
         Assert.assertEquals("CREATE TABLE `test_table` (\n" +
-                "  `id` int(11) DEFAULT NULL,\n" +
-                "  `name` varchar(1048576) DEFAULT NULL,\n" +
+                "  `id` int(11) DEFAULT NULL COMMENT \"id\",\n" +
+                "  `name` varchar DEFAULT NULL,\n" +
                 "  `year` int(11) DEFAULT NULL,\n" +
                 "  `dt` int(11) DEFAULT NULL\n" +
                 ")\n" +
-                "WITH (\n" +
-                " partitioned_by = ARRAY [ year, dt ]\n" +
-                ")\n" +
-                "LOCATION 'hdfs://hadoop/hive/warehouse/test.db/test'", resultSet.getResultRows().get(0).get(1));
+                "PARTITION BY ( year, dt )\n" +
+                "PROPERTIES (\"location\" = \"hdfs://hadoop/hive/warehouse/test.db/test\");", resultSet.getResultRows().get(0).get(1));
     }
 
 
@@ -1012,9 +1094,15 @@ public class ShowExecutorTest {
                 tableNames.add("hive_test");
                 return tableNames;
             }
+
+            @Mock
+            public Table getTable(String catalogName, String dbName, String tblName) {
+                return new Table(TableType.HIVE);
+            }
         };
 
         ShowTableStmt stmt = new ShowTableStmt("test", true, null, null, "hive_catalog");
+        ctx.setCurrentUserIdentity(UserIdentity.ROOT);
         ShowExecutor executor = new ShowExecutor(ctx, stmt);
         ShowResultSet resultSet = executor.execute();
 
@@ -1043,7 +1131,109 @@ public class ShowExecutorTest {
         Assert.assertEquals("test_hive", resultSet.getResultRows().get(0).get(0));
         Assert.assertEquals("CREATE EXTERNAL CATALOG `test_hive`\n" +
                 "comment \"hive_test\"\n" +
-                "PROPERTIES (\"hive.metastore.uris\"  =  \"thrift://hadoop:9083\",\n" +
-                "\"type\"  =  \"hive\"\n)", resultSet.getResultRows().get(0).get(1));
+                "PROPERTIES (\"type\"  =  \"hive\",\n" +
+                "\"hive.metastore.uris\"  =  \"thrift://hadoop:9083\"\n" +
+                ")", resultSet.getResultRows().get(0).get(1));
+    }
+
+    @Test
+    public void testShowCreateExternalCatalogNotExists() {
+        new MockUp<CatalogMgr>() {
+            @Mock
+            public Catalog getCatalogByName(String name) {
+                return null;
+            }
+        };
+
+        ShowCreateExternalCatalogStmt stmt = new ShowCreateExternalCatalogStmt("catalog_not_exist");
+        ShowExecutor executor = new ShowExecutor(ctx, stmt);
+        ExceptionChecker.expectThrowsWithMsg(AnalysisException.class, "Unknown catalog 'catalog_not_exist'", executor::execute);
+    }
+
+    @Test
+    public void testShowBasicStatsMeta() throws Exception {
+        new MockUp<AnalyzeMgr>() {
+            @Mock
+            public Map<AnalyzeMgr.StatsMetaKey, ExternalBasicStatsMeta> getExternalBasicStatsMetaMap() {
+                Map<AnalyzeMgr.StatsMetaKey, ExternalBasicStatsMeta> map = new HashMap<>();
+                map.put(new AnalyzeMgr.StatsMetaKey("hive0", "testDb", "testTable"),
+                        new ExternalBasicStatsMeta("hive0", "testDb", "testTable", null,
+                                StatsConstants.AnalyzeType.FULL, LocalDateTime.now(), Maps.newHashMap()));
+                return map;
+            }
+        };
+        ctx.setCurrentUserIdentity(UserIdentity.ROOT);
+        ShowBasicStatsMetaStmt stmt = new ShowBasicStatsMetaStmt(null);
+        ShowExecutor executor = new ShowExecutor(ctx, stmt);
+        ShowResultSet resultSet = executor.execute();
+        Assert.assertEquals("hive0.testDb", resultSet.getResultRows().get(0).get(0));
+        Assert.assertEquals("testTable", resultSet.getResultRows().get(0).get(1));
+        Assert.assertEquals("ALL", resultSet.getResultRows().get(0).get(2));
+        Assert.assertEquals("FULL", resultSet.getResultRows().get(0).get(3));
+    }
+
+    @Test
+    public void testShowGrants() throws Exception {
+        ShowGrantsStmt stmt = new ShowGrantsStmt("root");
+        ShowExecutor executor = new ShowExecutor(ctx, stmt);
+        ShowResultSet resultSet = executor.execute();
+        resultSet.getResultRows().forEach(System.out::println);
+        String expectString1 = "root, null, GRANT CREATE TABLE, DROP, ALTER, CREATE VIEW, CREATE FUNCTION, " +
+                "CREATE MATERIALIZED VIEW, CREATE PIPE ON ALL DATABASES TO ROLE 'root'";
+        Assert.assertTrue(resultSet.getResultRows().stream().anyMatch(l ->
+                l.toString().contains(expectString1)));
+        String expectString2 = "root, null, GRANT DELETE, DROP, INSERT, SELECT, ALTER, EXPORT, " +
+                "UPDATE ON ALL TABLES IN ALL DATABASES TO ROLE 'root'";
+        Assert.assertTrue(resultSet.getResultRows().stream().anyMatch(l ->
+                l.toString().contains(expectString2)));
+    }
+
+    @Test
+    public void testShowCreateExternalCatalogWithMask() throws AnalysisException, DdlException {
+        // More mask logic please write in CredentialUtilTest
+        new MockUp<CatalogMgr>() {
+            @Mock
+            public Catalog getCatalogByName(String name) {
+                Map<String, String> properties = new HashMap<>();
+                properties.put("hive.metastore.uris", "thrift://hadoop:9083");
+                properties.put("type", "hive");
+                properties.put("aws.s3.access_key", "iam_user_access_key");
+                properties.put("aws.s3.secret_key", "iam_user_secret_key");
+                return new Catalog(1, "test_hive", properties, "hive_test");
+            }
+        };
+        ShowCreateExternalCatalogStmt stmt = new ShowCreateExternalCatalogStmt("test_hive");
+        ShowExecutor executor = new ShowExecutor(ctx, stmt);
+        ShowResultSet resultSet = executor.execute();
+
+        Assert.assertEquals("test_hive", resultSet.getResultRows().get(0).get(0));
+        Assert.assertEquals("CREATE EXTERNAL CATALOG `test_hive`\n" +
+                "comment \"hive_test\"\n" +
+                "PROPERTIES (\"aws.s3.access_key\"  =  \"ia******ey\",\n" +
+                "\"aws.s3.secret_key\"  =  \"ia******ey\",\n" +
+                "\"hive.metastore.uris\"  =  \"thrift://hadoop:9083\",\n" +
+                "\"type\"  =  \"hive\"\n" +
+                ")", resultSet.getResultRows().get(0).get(1));
+    }
+
+    @Test
+    public void testShowDataCacheRules() throws DdlException, AnalysisException {
+        DataCacheMgr dataCacheMgr = DataCacheMgr.getInstance();
+        dataCacheMgr.createCacheRule(QualifiedName.of(ImmutableList.of("test1", "test1", "test1")), null, -1, null);
+
+        Map<String, String> properties = new HashMap<>();
+        properties.put("hello", "world");
+        properties.put("ni", "hao");
+        StringLiteral stringLiteral = new StringLiteral("hello");
+        dataCacheMgr.createCacheRule(QualifiedName.of(ImmutableList.of("test2", "test2", "test2")),
+                stringLiteral, -1, properties);
+
+        ShowDataCacheRulesStmt stmt = new ShowDataCacheRulesStmt(NodePosition.ZERO);
+        ShowExecutor executor = new ShowExecutor(ctx, stmt);
+        ShowResultSet resultSet = executor.execute();
+        List<String> row1 = resultSet.getResultRows().get(0);
+        List<String> row2 = resultSet.getResultRows().get(1);
+        Assert.assertEquals("[0, test1, test1, test1, -1, NULL, NULL]", row1.toString());
+        Assert.assertEquals("[1, test2, test2, test2, -1, 'hello', \"hello\"=\"world\", \"ni\"=\"hao\"]", row2.toString());
     }
 }

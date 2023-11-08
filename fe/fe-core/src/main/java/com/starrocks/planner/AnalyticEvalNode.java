@@ -57,8 +57,7 @@ import com.starrocks.thrift.TPlanNodeType;
 
 import java.util.List;
 import java.util.Optional;
-import java.util.OptionalInt;
-import java.util.stream.Collectors;
+import java.util.function.Function;
 
 public class AnalyticEvalNode extends PlanNode {
     private List<Expr> analyticFnCalls;
@@ -71,6 +70,8 @@ public class AnalyticEvalNode extends PlanNode {
     private List<OrderByElement> orderByElements;
 
     private final AnalyticWindow analyticWindow;
+
+    private final boolean useHashBasedPartition;
 
     // Physical tuples used/produced by this analytic node.
     private final TupleDescriptor intermediateTupleDesc;
@@ -85,7 +86,9 @@ public class AnalyticEvalNode extends PlanNode {
     public AnalyticEvalNode(
             PlanNodeId id, PlanNode input, List<Expr> analyticFnCalls,
             List<Expr> partitionExprs, List<OrderByElement> orderByElements,
-            AnalyticWindow analyticWindow, TupleDescriptor intermediateTupleDesc,
+            AnalyticWindow analyticWindow,
+            boolean useHashBasedPartition,
+            TupleDescriptor intermediateTupleDesc,
             TupleDescriptor outputTupleDesc,
             Expr partitionByEq, Expr orderByEq, TupleDescriptor bufferedTupleDesc) {
         super(id, input.getTupleIds(), "ANALYTIC");
@@ -96,6 +99,7 @@ public class AnalyticEvalNode extends PlanNode {
         this.partitionExprs = partitionExprs;
         this.orderByElements = orderByElements;
         this.analyticWindow = analyticWindow;
+        this.useHashBasedPartition = useHashBasedPartition;
         this.intermediateTupleDesc = intermediateTupleDesc;
         this.outputTupleDesc = outputTupleDesc;
         this.partitionByEq = partitionByEq;
@@ -103,6 +107,10 @@ public class AnalyticEvalNode extends PlanNode {
         this.bufferedTupleDesc = bufferedTupleDesc;
         children.add(input);
         nullableTupleIds = Sets.newHashSet(input.getNullableTupleIds());
+    }
+
+    public List<Expr> getAnalyticFnCalls() {
+        return analyticFnCalls;
     }
 
     public List<Expr> getPartitionExprs() {
@@ -135,6 +143,7 @@ public class AnalyticEvalNode extends PlanNode {
                 .add("subtitutedPartitionExprs", Expr.debugString(substitutedPartitionExprs))
                 .add("orderByElements", Joiner.on(", ").join(orderByElementStrs))
                 .add("window", analyticWindow)
+                .add("useHashBasedPartition", useHashBasedPartition)
                 .add("intermediateTid", intermediateTupleDesc.getId())
                 .add("intermediateTid", outputTupleDesc.getId())
                 .add("outputTid", outputTupleDesc.getId())
@@ -200,6 +209,10 @@ public class AnalyticEvalNode extends PlanNode {
             msg.analytic_node.setOrder_by_eq(orderByEq.treeToThrift());
         }
 
+        if (useHashBasedPartition) {
+            msg.analytic_node.setUse_hash_based_partition(useHashBasedPartition);
+        }
+
         if (bufferedTupleDesc != null) {
             msg.analytic_node.setBuffered_tuple_id(bufferedTupleDesc.getId().asInt());
         }
@@ -262,6 +275,10 @@ public class AnalyticEvalNode extends PlanNode {
             output.append("\n");
         }
 
+        if (useHashBasedPartition) {
+            output.append(prefix).append("useHashBasedPartition").append("\n");
+        }
+
         return output.toString();
     }
 
@@ -270,8 +287,8 @@ public class AnalyticEvalNode extends PlanNode {
     }
 
     @Override
-    public Optional<List<Expr>> candidatesOfSlotExpr(Expr expr) {
-        if (!expr.isBoundByTupleIds(getTupleIds())) {
+    public Optional<List<Expr>> candidatesOfSlotExpr(Expr expr, Function<Expr, Boolean> couldBound) {
+        if (!couldBound.apply(expr)) {
             return Optional.empty();
         }
         if (!(expr instanceof SlotRef)) {
@@ -289,22 +306,29 @@ public class AnalyticEvalNode extends PlanNode {
     }
 
     @Override
-    public boolean pushDownRuntimeFilters(DescriptorTable descTbl, RuntimeFilterDescription description, Expr probeExpr, List<Expr> partitionByExprs) {
+    public boolean pushDownRuntimeFilters(DescriptorTable descTbl, RuntimeFilterDescription description, Expr probeExpr,
+                                          List<Expr> partitionByExprs) {
         if (!canPushDownRuntimeFilter()) {
             return false;
         }
 
-        if (!probeExpr.isBoundByTupleIds(getTupleIds())) {
+        if (!couldBound(probeExpr, description, descTbl)) {
             return false;
         }
 
-        return pushdownRuntimeFilterForChildOrAccept(descTbl, description, probeExpr, candidatesOfSlotExpr(probeExpr),
-                partitionByExprs, candidatesOfSlotExprs(partitionByExprs), 0, true);
+        return pushdownRuntimeFilterForChildOrAccept(descTbl, description, probeExpr,
+                candidatesOfSlotExpr(probeExpr, couldBound(description, descTbl)),
+                partitionByExprs, candidatesOfSlotExprs(partitionByExprs, couldBoundForPartitionExpr()), 0, true);
     }
 
     @Override
     public boolean canUsePipeLine() {
         return getChildren().stream().allMatch(PlanNode::canUsePipeLine);
+    }
+
+    @Override
+    public boolean canUseRuntimeAdaptiveDop() {
+        return getChildren().stream().allMatch(PlanNode::canUseRuntimeAdaptiveDop);
     }
 
     @Override

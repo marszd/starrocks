@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <numeric>
 #include <string_view>
 #include <utility>
 
@@ -57,6 +58,7 @@ public:
     size_t num_key_fields() const { return _num_keys; }
 
     const std::vector<ColumnId> sort_key_idxes() const { return _sort_key_idxes; }
+    void append_sort_key_idx(ColumnId idx) { _sort_key_idxes.emplace_back(idx); }
 
     void reserve(size_t size) { _fields.reserve(size); }
 
@@ -86,8 +88,16 @@ public:
 
     KeysType keys_type() const { return static_cast<KeysType>(_keys_type); }
 
+    void init_sort_key_idxes() { _init_sort_key_idxes(); }
+
 private:
     void _build_index_map(const Fields& fields);
+    void _init_sort_key_idxes() {
+        if (_sort_key_idxes.empty()) {
+            _sort_key_idxes.resize(num_key_fields());
+            std::iota(_sort_key_idxes.begin(), _sort_key_idxes.end(), 0);
+        }
+    }
 
     Fields _fields;
     size_t _num_keys = 0;

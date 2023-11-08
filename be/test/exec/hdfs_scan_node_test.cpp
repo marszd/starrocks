@@ -68,10 +68,10 @@ private:
 ChunkPtr HdfsScanNodeTest::_create_chunk() {
     ChunkPtr chunk = std::make_shared<Chunk>();
 
-    auto col1 = ColumnHelper::create_column(TypeDescriptor::from_primtive_type(LogicalType::TYPE_INT), true);
-    auto col2 = ColumnHelper::create_column(TypeDescriptor::from_primtive_type(LogicalType::TYPE_BIGINT), true);
-    auto col3 = ColumnHelper::create_column(TypeDescriptor::from_primtive_type(LogicalType::TYPE_VARCHAR), true);
-    auto col4 = ColumnHelper::create_column(TypeDescriptor::from_primtive_type(LogicalType::TYPE_DATETIME), true);
+    auto col1 = ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_INT), true);
+    auto col2 = ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_BIGINT), true);
+    auto col3 = ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_VARCHAR), true);
+    auto col4 = ColumnHelper::create_column(TypeDescriptor::from_logical_type(LogicalType::TYPE_DATETIME), true);
     chunk->append_column(col1, 0);
     chunk->append_column(col2, 1);
     chunk->append_column(col3, 2);
@@ -235,7 +235,9 @@ DescriptorTbl* HdfsScanNodeTest::_create_table_desc() {
     tuple_desc_builder.add_slot(slot4);
     tuple_desc_builder.build(&table_desc_builder);
     DescriptorTbl* tbl = nullptr;
-    DescriptorTbl::create(_runtime_state.get(), _pool, table_desc_builder.desc_tbl(), &tbl, config::vector_chunk_size);
+    CHECK(DescriptorTbl::create(_runtime_state.get(), _pool, table_desc_builder.desc_tbl(), &tbl,
+                                config::vector_chunk_size)
+                  .ok());
 
     THdfsPartition partition;
     std::map<int64_t, THdfsPartition> p_map;
@@ -267,7 +269,9 @@ DescriptorTbl* HdfsScanNodeTest::_create_table_desc_for_filter_partition() {
     tuple_desc_builder.add_slot(slot4);
     tuple_desc_builder.build(&table_desc_builder);
     DescriptorTbl* tbl = nullptr;
-    DescriptorTbl::create(_runtime_state.get(), _pool, table_desc_builder.desc_tbl(), &tbl, config::vector_chunk_size);
+    CHECK(DescriptorTbl::create(_runtime_state.get(), _pool, table_desc_builder.desc_tbl(), &tbl,
+                                config::vector_chunk_size)
+                  .ok());
 
     // hdfs table
     THdfsTable t_hdfs_table;
@@ -370,8 +374,7 @@ TEST_F(HdfsScanNodeTest, TestBasic) {
         ASSERT_FALSE(eos);
         ASSERT_EQ(chunk->num_rows(), 4);
 
-        status = hdfs_scan_node->close(_runtime_state.get());
-        ASSERT_TRUE(status.ok());
+        hdfs_scan_node->close(_runtime_state.get());
     }
 
     // test filter partition
@@ -406,8 +409,7 @@ TEST_F(HdfsScanNodeTest, TestBasic) {
         status = hdfs_scan_node->get_next(_runtime_state.get(), &chunk, &eos);
         ASSERT_TRUE(eos);
 
-        status = hdfs_scan_node->close(_runtime_state.get());
-        ASSERT_TRUE(status.ok());
+        hdfs_scan_node->close(_runtime_state.get());
     }
 }
 } // namespace starrocks

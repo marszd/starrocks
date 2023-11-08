@@ -73,10 +73,17 @@ inline unsigned long long operator"" _ms(unsigned long long x) {
     (profile)->add_counter(name, type, RuntimeProfile::Counter::create_strategy(type, merge_type))
 #define ADD_TIMER(profile, name) \
     (profile)->add_counter(name, TUnit::TIME_NS, RuntimeProfile::Counter::create_strategy(TUnit::TIME_NS))
+#define ADD_PEAK_COUNTER(profile, name, type) \
+    (profile)->AddHighWaterMarkCounter(       \
+            name, type, RuntimeProfile::Counter::create_strategy(type, TCounterMergeType::SKIP_FIRST_MERGE))
 #define ADD_CHILD_COUNTER(profile, name, type, parent) \
     (profile)->add_child_counter(name, type, RuntimeProfile::Counter::create_strategy(type), parent)
 #define ADD_CHILD_COUNTER_SKIP_MERGE(profile, name, type, merge_type, parent) \
     (profile)->add_child_counter(name, type, RuntimeProfile::Counter::create_strategy(type, merge_type), parent)
+#define ADD_CHILD_COUNTER_SKIP_MIN_MAX(profile, name, type, min_max_type, parent)                                      \
+    (profile)->add_child_counter(                                                                                      \
+            name, type, RuntimeProfile::Counter::create_strategy(type, TCounterMergeType::MERGE_ALL, 0, min_max_type), \
+            parent)
 #define ADD_CHILD_TIMER_THESHOLD(profile, name, parent, threshold) \
     (profile)->add_child_counter(                                  \
             name, TUnit::TIME_NS,                                  \
@@ -89,6 +96,8 @@ inline unsigned long long operator"" _ms(unsigned long long x) {
 #define SCOPED_RAW_TIMER(c) ScopedRawTimer<MonotonicStopWatch> MACRO_CONCAT(SCOPED_RAW_TIMER, __COUNTER__)(c)
 #define COUNTER_UPDATE(c, v) (c)->update(v)
 #define COUNTER_SET(c, v) (c)->set(v)
+// this is only used for HighWaterMarkCounter
+#define COUNTER_ADD(c, v) (c)->add(v)
 #define ADD_THREAD_COUNTERS(profile, prefix) (profile)->add_thread_counters(prefix)
 #define SCOPED_THREAD_COUNTER_MEASUREMENT(c) \
     /*ThreadCounterMeasurement                                        \
@@ -100,6 +109,7 @@ inline unsigned long long operator"" _ms(unsigned long long x) {
 #define SCOPED_RAW_TIMER(c)
 #define COUNTER_UPDATE(c, v)
 #define COUNTER_SET(c, v)
+#define COUNTER_ADD(c, v)
 #define ADD_THREADCOUNTERS(profile, prefix) NULL
 #define SCOPED_THREAD_COUNTER_MEASUREMENT(c)
 #endif
@@ -116,16 +126,29 @@ class ObjectPool;
 // Thread-safe.
 class RuntimeProfile {
 public:
+    inline static const std::string MERGED_INFO_PREFIX_MIN = "__MIN_OF_";
+    inline static const std::string MERGED_INFO_PREFIX_MAX = "__MAX_OF_";
+
     class Counter {
     public:
-        static TCounterStrategy create_strategy(TUnit::type type,
-                                                TCounterMergeType::type merge_type = TCounterMergeType::MERGE_ALL,
-                                                int64_t display_threshold = 0) {
+        static TCounterStrategy create_strategy(
+                TCounterAggregateType::type aggregate_type,
+                TCounterMergeType::type merge_type = TCounterMergeType::MERGE_ALL, int64_t display_threshold = 0,
+                TCounterMinMaxType::type min_max_type = TCounterMinMaxType::MIN_MAX_ALL) {
             TCounterStrategy strategy;
-            strategy.aggregate_type = is_time_type(type) ? TCounterAggregateType::AVG : TCounterAggregateType::SUM;
+            strategy.aggregate_type = aggregate_type;
             strategy.merge_type = merge_type;
             strategy.display_threshold = display_threshold;
+            strategy.min_max_type = min_max_type;
             return strategy;
+        }
+
+        static TCounterStrategy create_strategy(
+                TUnit::type type, TCounterMergeType::type merge_type = TCounterMergeType::MERGE_ALL,
+                int64_t display_threshold = 0,
+                TCounterMinMaxType::type min_max_type = TCounterMinMaxType::MIN_MAX_ALL) {
+            auto aggregate_type = is_time_type(type) ? TCounterAggregateType::AVG : TCounterAggregateType::SUM;
+            return create_strategy(aggregate_type, merge_type, display_threshold, min_max_type);
         }
 
         explicit Counter(TUnit::type type, int64_t value = 0)
@@ -165,6 +188,8 @@ public:
             return _strategy.merge_type == TCounterMergeType::SKIP_ALL ||
                    _strategy.merge_type == TCounterMergeType::SKIP_FIRST_MERGE;
         }
+
+        bool skip_min_max() const { return _strategy.min_max_type == TCounterMinMaxType::SKIP_ALL; }
 
         int64_t display_threshold() const { return _strategy.display_threshold; }
 
@@ -385,6 +410,10 @@ public:
 
     // Gets the counter object with 'name'.  Returns NULL if there is no counter with
     // that name.
+    std::pair<Counter*, std::string> get_counter_pair(const std::string& name);
+
+    // Gets the counter object with 'name'.  Returns NULL if there is no counter with
+    // that name.
     Counter* get_counter(const std::string& name);
 
     // Adds all counters with 'name' that are registered either in this or
@@ -392,7 +421,7 @@ public:
     void get_counters(const std::string& name, std::vector<Counter*>* counters);
 
     // Copy all but the bucket counters from src profile
-    void copy_all_counters_from(RuntimeProfile* src_profile);
+    void copy_all_counters_from(RuntimeProfile* src_profile, const std::string& attached_counter_name = ROOT_COUNTER);
 
     // Remove the counter object with 'name', and it will remove all the child counters recursively
     void remove_counter(const std::string& name);
@@ -405,7 +434,7 @@ public:
 
     // Adds a string to the runtime profile.  If a value already exists for 'key',
     // the value will be updated.
-    void add_info_string(const std::string& key, const std::string& value);
+    void add_info_string(const std::string& key, const std::string& value = "");
 
     // Creates and returns a new EventSequence (owned by the runtime
     // profile) - unless a timer with the same 'key' already exists, in
@@ -576,7 +605,8 @@ public:
     // Merge all the isomorphic sub profiles and the caller must know for sure
     // that all the children are isomorphic, otherwise, the behavior is undefined
     // The merged result will be stored in the first profile
-    static void merge_isomorphic_profiles(std::vector<RuntimeProfile*>& profiles);
+    static RuntimeProfile* merge_isomorphic_profiles(ObjectPool* obj_pool, std::vector<RuntimeProfile*>& profiles,
+                                                     bool require_identical = true);
 
 private:
     static const std::unordered_set<std::string> NON_MERGE_COUNTER_NAMES;

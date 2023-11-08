@@ -28,6 +28,7 @@ static TCounterStrategy create_strategy(TUnit::type type) {
 }
 
 TEST(TestRuntimeProfile, testMergeIsomorphicProfiles1) {
+    std::shared_ptr<ObjectPool> obj_pool = std::make_shared<ObjectPool>();
     std::vector<RuntimeProfile*> profiles;
 
     auto profile1 = std::make_shared<RuntimeProfile>("profile");
@@ -56,9 +57,8 @@ TEST(TestRuntimeProfile, testMergeIsomorphicProfiles1) {
         profiles.push_back(profile2.get());
     }
 
-    RuntimeProfile::merge_isomorphic_profiles(profiles);
+    auto* merged_profile = RuntimeProfile::merge_isomorphic_profiles(obj_pool.get(), profiles);
 
-    auto* merged_profile = profiles[0];
     auto* merged_time1 = merged_profile->get_counter("time1");
     ASSERT_EQ(2000000000L, merged_time1->value());
     auto* merged_min_of_time1 = merged_profile->get_counter("__MIN_OF_time1");
@@ -88,6 +88,7 @@ TEST(TestRuntimeProfile, testMergeIsomorphicProfiles1) {
 }
 
 TEST(TestRuntimeProfile, testMergeIsomorphicProfiles2) {
+    std::shared_ptr<ObjectPool> obj_pool = std::make_shared<ObjectPool>();
     std::vector<RuntimeProfile*> profiles;
 
     auto profile1 = std::make_shared<RuntimeProfile>("profile");
@@ -136,9 +137,7 @@ TEST(TestRuntimeProfile, testMergeIsomorphicProfiles2) {
         profiles.push_back(profile2.get());
     }
 
-    RuntimeProfile::merge_isomorphic_profiles(profiles);
-
-    auto* merged_profile = profiles[0];
+    auto* merged_profile = RuntimeProfile::merge_isomorphic_profiles(obj_pool.get(), profiles);
     auto* merged_time1 = merged_profile->get_counter("time1");
     ASSERT_EQ(2500000000L, merged_time1->value());
     auto* merged_min_of_time1 = merged_profile->get_counter("__MIN_OF_time1");
@@ -159,6 +158,7 @@ TEST(TestRuntimeProfile, testMergeIsomorphicProfiles2) {
 }
 
 TEST(TestRuntimeProfile, testProfileMergeStrategy) {
+    std::shared_ptr<ObjectPool> obj_pool = std::make_shared<ObjectPool>();
     std::vector<RuntimeProfile*> profiles;
 
     TCounterStrategy strategy1;
@@ -210,9 +210,7 @@ TEST(TestRuntimeProfile, testProfileMergeStrategy) {
         profiles.push_back(profile2.get());
     }
 
-    RuntimeProfile::merge_isomorphic_profiles(profiles);
-
-    auto* merged_profile = profiles[0];
+    auto* merged_profile = RuntimeProfile::merge_isomorphic_profiles(obj_pool.get(), profiles);
 
     auto* merged_time1 = merged_profile->get_counter("time1");
     ASSERT_EQ(2000000000L, merged_time1->value());
@@ -247,4 +245,203 @@ TEST(TestRuntimeProfile, testProfileMergeStrategy) {
     ASSERT_EQ(8, merged_max_of_count2->value());
 }
 
+TEST(TestRuntimeProfile, testConflictInfoString) {
+    std::shared_ptr<ObjectPool> obj_pool = std::make_shared<ObjectPool>();
+    std::vector<RuntimeProfile*> profiles;
+    auto profile1 = std::make_shared<RuntimeProfile>("profile");
+    {
+        profile1->add_info_string("key1", "value1");
+        profiles.push_back(profile1.get());
+    }
+    auto profile2 = std::make_shared<RuntimeProfile>("profile");
+    {
+        profile2->add_info_string("key1", "value2");
+        profiles.push_back(profile2.get());
+    }
+    auto profile3 = std::make_shared<RuntimeProfile>("profile");
+    {
+        profile3->add_info_string("key1", "value1");
+        profiles.push_back(profile3.get());
+    }
+    auto profile4 = std::make_shared<RuntimeProfile>("profile");
+    {
+        profile4->add_info_string("key1__DUP(1)", "value3");
+        profile4->add_info_string("key1", "value4");
+        profiles.push_back(profile4.get());
+    }
+    auto profile5 = std::make_shared<RuntimeProfile>("profile");
+    {
+        profile5->add_info_string("key1", "value5");
+        profile5->add_info_string("key1__DUP(1)", "value6");
+        profiles.push_back(profile5.get());
+    }
+
+    auto* merged_profile = RuntimeProfile::merge_isomorphic_profiles(obj_pool.get(), profiles);
+    const std::set<std::string> expected_values{"value1", "value2", "value3", "value4", "value5", "value6"};
+    std::set<std::string> actual_values;
+    ASSERT_TRUE(merged_profile->get_info_string("key1") != nullptr);
+    actual_values.insert(*(merged_profile->get_info_string("key1")));
+    ASSERT_TRUE(merged_profile->get_info_string("key1__DUP(0)") != nullptr);
+    actual_values.insert(*(merged_profile->get_info_string("key1__DUP(0)")));
+    ASSERT_TRUE(merged_profile->get_info_string("key1__DUP(1)") != nullptr);
+    actual_values.insert(*(merged_profile->get_info_string("key1__DUP(1)")));
+    ASSERT_TRUE(merged_profile->get_info_string("key1__DUP(2)") != nullptr);
+    actual_values.insert(*(merged_profile->get_info_string("key1__DUP(2)")));
+    ASSERT_TRUE(merged_profile->get_info_string("key1__DUP(3)") != nullptr);
+    actual_values.insert(*(merged_profile->get_info_string("key1__DUP(3)")));
+    ASSERT_TRUE(merged_profile->get_info_string("key1__DUP(4)") != nullptr);
+    actual_values.insert(*(merged_profile->get_info_string("key1__DUP(4)")));
+
+    ASSERT_EQ(expected_values, actual_values);
+}
+
+TEST(TestRuntimeProfile, testCopyCounterWithParent) {
+    auto strategy_unit = create_strategy(TUnit::UNIT);
+    auto strategy_time = create_strategy(TUnit::TIME_NS);
+    auto src1 = std::make_shared<RuntimeProfile>("src profile1");
+
+    auto* time1 = src1->add_counter("time1", TUnit::TIME_NS, strategy_time);
+    time1->set(1L);
+    auto* time2 = src1->add_child_counter("time2", TUnit::TIME_NS, strategy_time, "time1");
+    time2->set(2L);
+    auto* time3 = src1->add_child_counter("time3", TUnit::TIME_NS, strategy_time, "time2");
+    time3->set(3L);
+    auto* time4 = src1->add_counter("time4", TUnit::TIME_NS, strategy_time);
+    time4->set(4L);
+
+    auto src2 = std::make_shared<RuntimeProfile>("src profile2");
+    auto* count1 = src2->add_counter("count1", TUnit::UNIT, strategy_unit);
+    count1->set(11L);
+    auto* count2 = src2->add_child_counter("count2", TUnit::UNIT, strategy_unit, "count1");
+    count2->set(12L);
+    auto* count3 = src2->add_child_counter("count3", TUnit::UNIT, strategy_unit, "count2");
+    count3->set(13L);
+    auto* count4 = src2->add_counter("count4", TUnit::UNIT, strategy_unit);
+    count4->set(14L);
+
+    auto dest = std::make_shared<RuntimeProfile>("destination");
+    dest->add_counter("cascade1", TUnit::UNIT, strategy_unit);
+    dest->add_child_counter("cascade2", TUnit::UNIT, strategy_unit, "cascade1");
+
+    dest->copy_all_counters_from(src1.get(), "cascade1");
+    dest->copy_all_counters_from(src2.get(), "cascade2");
+
+    auto kv = dest->get_counter_pair("time1");
+    ASSERT_TRUE(kv.first != nullptr);
+    ASSERT_EQ(1L, kv.first->value());
+    ASSERT_EQ("cascade1", kv.second);
+
+    kv = dest->get_counter_pair("time2");
+    ASSERT_TRUE(kv.first != nullptr);
+    ASSERT_EQ(2L, kv.first->value());
+    ASSERT_EQ("time1", kv.second);
+
+    kv = dest->get_counter_pair("time3");
+    ASSERT_TRUE(kv.first != nullptr);
+    ASSERT_EQ(3L, kv.first->value());
+    ASSERT_EQ("time2", kv.second);
+
+    kv = dest->get_counter_pair("time4");
+    ASSERT_TRUE(kv.first != nullptr);
+    ASSERT_EQ(4L, kv.first->value());
+    ASSERT_EQ("cascade1", kv.second);
+
+    kv = dest->get_counter_pair("count1");
+    ASSERT_TRUE(kv.first != nullptr);
+    ASSERT_EQ(11L, kv.first->value());
+    ASSERT_EQ("cascade2", kv.second);
+
+    kv = dest->get_counter_pair("count2");
+    ASSERT_TRUE(kv.first != nullptr);
+    ASSERT_EQ(12L, kv.first->value());
+    ASSERT_EQ("count1", kv.second);
+
+    kv = dest->get_counter_pair("count3");
+    ASSERT_TRUE(kv.first != nullptr);
+    ASSERT_EQ(13L, kv.first->value());
+    ASSERT_EQ("count2", kv.second);
+
+    kv = dest->get_counter_pair("count4");
+    ASSERT_TRUE(kv.first != nullptr);
+    ASSERT_EQ(14L, kv.first->value());
+    ASSERT_EQ("cascade2", kv.second);
+}
+
+TEST(TestRuntimeProfile, testRemoveCounter) {
+    auto create_profile = []() -> std::shared_ptr<RuntimeProfile> {
+        auto profile = std::make_shared<RuntimeProfile>("profile1");
+
+        profile->add_counter("counter1", TUnit::UNIT, RuntimeProfile::Counter::create_strategy(TUnit::UNIT));
+        profile->add_counter("counter2", TUnit::UNIT, RuntimeProfile::Counter::create_strategy(TUnit::UNIT));
+        profile->add_counter("counter3", TUnit::UNIT, RuntimeProfile::Counter::create_strategy(TUnit::UNIT));
+
+        profile->add_child_counter("counter2-1", TUnit::UNIT, RuntimeProfile::Counter::create_strategy(TUnit::UNIT),
+                                   "counter2");
+        profile->add_child_counter("counter2-2", TUnit::UNIT, RuntimeProfile::Counter::create_strategy(TUnit::UNIT),
+                                   "counter2");
+
+        profile->add_child_counter("counter2-2-1", TUnit::UNIT, RuntimeProfile::Counter::create_strategy(TUnit::UNIT),
+                                   "counter2-2");
+        profile->add_child_counter("counter2-2-2", TUnit::UNIT, RuntimeProfile::Counter::create_strategy(TUnit::UNIT),
+                                   "counter2-2");
+
+        profile->add_child_counter("counter3-1", TUnit::UNIT, RuntimeProfile::Counter::create_strategy(TUnit::UNIT),
+                                   "counter3");
+
+        return profile;
+    };
+
+    auto check_countains = [](RuntimeProfile* profile, const std::vector<std::string>& names) {
+        for (auto& name : names) {
+            ASSERT_TRUE(profile->get_counter(name) != nullptr);
+        }
+    };
+
+    {
+        auto profile = create_profile();
+        profile->remove_counter("counter1");
+        check_countains(profile.get(), {"counter2", "counter3", "counter2-1", "counter2-2", "counter2-2-1",
+                                        "counter2-2-2", "counter3-1"});
+    }
+    {
+        auto profile = create_profile();
+        profile->remove_counter("counter2");
+        check_countains(profile.get(), {"counter1", "counter3", "counter3-1"});
+    }
+    {
+        auto profile = create_profile();
+        profile->remove_counter("counter2-1");
+        check_countains(profile.get(), {"counter1", "counter2", "counter3", "counter2-2", "counter2-2-1",
+                                        "counter2-2-2", "counter3-1"});
+    }
+    {
+        auto profile = create_profile();
+        profile->remove_counter("counter2-2");
+        check_countains(profile.get(), {"counter1", "counter2", "counter3", "counter2-1", "counter3-1"});
+    }
+    {
+        auto profile = create_profile();
+        profile->remove_counter("counter2-2-1");
+        check_countains(profile.get(),
+                        {"counter1", "counter2", "counter3", "counter2-1", "counter2-2", "counter2-2-2", "counter3-1"});
+    }
+    {
+        auto profile = create_profile();
+        profile->remove_counter("counter2-2-2");
+        check_countains(profile.get(),
+                        {"counter1", "counter2", "counter3", "counter2-1", "counter2-2", "counter2-2-1", "counter3-1"});
+    }
+    {
+        auto profile = create_profile();
+        profile->remove_counter("counter3");
+        check_countains(profile.get(),
+                        {"counter1", "counter2", "counter2-1", "counter2-2", "counter2-2-1", "counter2-2-2"});
+    }
+    {
+        auto profile = create_profile();
+        profile->remove_counter("counter3-1");
+        check_countains(profile.get(), {"counter1", "counter2", "counter2-1", "counter2-2", "counter2-2-1",
+                                        "counter2-2-2", "counter3"});
+    }
+}
 } // namespace starrocks

@@ -16,6 +16,7 @@
 
 #include "exec/pipeline/query_context.h"
 #include "runtime/fragment_mgr.h"
+#include "util/misc.h"
 
 namespace starrocks {
 
@@ -32,11 +33,10 @@ Status ProfileReportWorker::register_non_pipeline_load(const TUniqueId& fragment
     return Status::OK();
 }
 
-Status ProfileReportWorker::unregister_non_pipeline_load(const TUniqueId& fragment_instance_id) {
+void ProfileReportWorker::unregister_non_pipeline_load(const TUniqueId& fragment_instance_id) {
     LOG(INFO) << "unregister_non_pipeline_load fragment_instance_id=" << print_id(fragment_instance_id);
     std::lock_guard lg(_non_pipeline_report_mutex);
     _non_pipeline_report_tasks.erase(fragment_instance_id);
-    return Status::OK();
 }
 
 Status ProfileReportWorker::register_pipeline_load(const TUniqueId& query_id, const TUniqueId& fragment_instance_id) {
@@ -55,12 +55,11 @@ Status ProfileReportWorker::register_pipeline_load(const TUniqueId& query_id, co
     return Status::OK();
 }
 
-Status ProfileReportWorker::unregister_pipeline_load(const TUniqueId& query_id, const TUniqueId& fragment_instance_id) {
+void ProfileReportWorker::unregister_pipeline_load(const TUniqueId& query_id, const TUniqueId& fragment_instance_id) {
     LOG(INFO) << "unregister_pipeline_load query_id=" << print_id(query_id)
               << ", fragment_instance_id=" << print_id(fragment_instance_id);
     std::lock_guard lg(_pipeline_report_mutex);
     _pipeline_report_tasks.erase(PipeLineReportTaskKey(query_id, fragment_instance_id));
-    return Status::OK();
 }
 
 void ProfileReportWorker::_start_report_profile() {
@@ -119,11 +118,7 @@ void ProfileReportWorker::execute() {
             LOG(WARNING) << "profile_report_interval config is illegal: " << interval << ", force set to 1";
             interval = 1;
         }
-        int32_t left_seconds = interval;
-        while (!_stop.load(std::memory_order_consume) && left_seconds > 0) {
-            sleep(1);
-            --left_seconds;
-        }
+        nap_sleep(interval, [this] { return _stop.load(std::memory_order_consume); });
     }
     LOG(INFO) << "ProfileReportWorker going to exit.";
 }

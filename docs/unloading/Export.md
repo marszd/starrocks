@@ -1,20 +1,30 @@
 # Export data using EXPORT
 
-This topic describes how to export data from specified tables or partitions in your StarRocks cluster as CSV data files by using the [EXPORT](../sql-reference/sql-statements/data-manipulation/EXPORT.md) statement to HDFS, Alibaba Cloud OSS, AWS S3, or other S3-compatible object storage systems.
+This topic describes how to export data from specified tables or partitions in your StarRocks cluster as CSV data files to an external storage system, which can be a distributed file system HDFS or a cloud storage system such as AWS S3.
+
+> **NOTICE**
+>
+> You can export data out of StarRocks tables only as a user who has the EXPORT privilege on those StarRocks tables. If you do not have the EXPORT privilege, follow the instructions provided in [GRANT](../sql-reference/sql-statements/account-management/GRANT.md) to grant the EXPORT privilege to the user that you use to connect to your StarRocks cluster.
 
 ## Background information
 
-In StarRocks v2.4 and earlier, Broker Load depends on brokers to set up connections between your StarRocks cluster and your storage system. When you export data from StarRocks, you need to input `WITH BROKER "<broker_name>"` to specify the broker group you want to use. A broker is an independent, stateless service that is integrated with a file-system interface. With brokers, StarRocks can access and read data files that are stored in your storage system, and can use its own computing resources to pre-process and load the data of these data files.
+In v2.4 and earlier, StarRocks depends on brokers to set up connections between your StarRocks cluster and your external storage system when it uses the EXPORT statement to export data. Therefore, you need to input `WITH BROKER "<broker_name>"` to specify the broker you want to use in the EXPORT statement. This is called "broker-based unloading." A broker is an independent, stateless service that is integrated with a file-system interface, helping StarRocks export data to your external storage system.
 
-From StarRocks v2.5 onwards, Broker Load no longer needs to depend on brokers to set up connections between your StarRocks cluster and your storage system. When you export data from StarRocks, you no longer need to specify a broker group, but you still need to retain the `WITH BROKER` keyword.
+From v2.5 onwards, StarRocks no longer depends on brokers to set up connections between your StarRocks cluster and your external storage system when it uses the EXPORT statement to export data. Therefore, you no longer need to specify a broker in the EXPORT statement, but you still need to retain the `WITH BROKER` keyword. This is called "broker-free unloading."
+
+When your data is stored in HDFS, however, broker-free unloading may not work and you can resort to broker-based unloading:
+
+- If you export data to multiple HDFS clusters, you need to deploy and configure an independent broker for each of these HDFS clusters.
+- If you export data to a single HDFS cluster and you have configured multiple Kerberos users, you need to deploy one independent broker.
 
 > **NOTE**
 >
-> Unloading without the broker process may not work in certain circumstances, such as when you configure multiple HA systems or have multiple Kerberos configurations. In this situation, you must export data by using the broker process.
+> You can use the [SHOW BROKER](../sql-reference/sql-statements/Administration/SHOW_BROKER.md) statement to check for brokers that are deployed in your StarRocks cluster. If no brokers are deployed, you can deploy brokers by following the instructions provided in [Deploy a broker](../deployment/deploy_broker.md).
 
-If you need to use brokers to export data, make sure that brokers are deployed in your StarRocks cluster.
+## Supported storage systems
 
-You can use the [SHOW BROKER](../sql-reference/sql-statements/Administration/SHOW%20BROKER.md) statement to check for brokers that are deployed in your StarRocks cluster. If no brokers are deployed, you must deploy brokers by following the instructions provided in [Deploy a broker](../administration/deploy_broker.md).
+- Distributed file system HDFS
+- Cloud storage system such as AWS S3
 
 ## Precautions
 
@@ -24,7 +34,7 @@ You can use the [SHOW BROKER](../sql-reference/sql-statements/Administration/SHO
 
 - If the FEs in your StarRocks cluster restart or a new leader FE is elected when an export job is running, the export job fails. In this situation, you must submit the export job again.
 
-- If the FEs in your StarRocks cluster restart or a new leader FE is elected after an export job finishes, some of the job information returned by the [SHOW EXPORT](../sql-reference/sql-statements/data-manipulation/SHOW%20EXPORT.md) statement may be lost.
+- If the FEs in your StarRocks cluster restart or a new leader FE is elected after an export job finishes, some of the job information returned by the [SHOW EXPORT](../sql-reference/sql-statements/data-manipulation/SHOW_EXPORT.md) statement may be lost.
 
 - StarRocks exports only the data of base tables. StarRocks does not export the data of materialized views created on base tables.
 
@@ -90,7 +100,7 @@ WITH BROKER
 );
 ```
 
-For detailed syntax and parameter descriptions, see [EXPORT](../sql-reference/sql-statements/data-manipulation/EXPORT.md).
+For detailed syntax and parameter descriptions as well as the command examples of exporting data to AWS S3, see [EXPORT](../sql-reference/sql-statements/data-manipulation/EXPORT.md).
 
 ### Obtain the query ID of an export job
 
@@ -125,7 +135,7 @@ Timeout: 3600
 ErrorMsg: N/A
 ```
 
-For detailed syntax and parameter descriptions, see [SHOW EXPORT](../sql-reference/sql-statements/data-manipulation/SHOW%20EXPORT.md).
+For detailed syntax and parameter descriptions, see [SHOW EXPORT](../sql-reference/sql-statements/data-manipulation/SHOW_EXPORT.md).
 
 ### Cancel an export job
 
@@ -139,7 +149,7 @@ CANCEL EXPORT WHERE queryid = "921d8f80-7c9d-11eb-9342-acde48001122";
 >
 > In the preceding example, `queryid` is the query ID of the export job.
 
-For detailed syntax and parameter descriptions, see [CANCEL EXPORT](../sql-reference/sql-statements/data-manipulation/CANCEL%20EXPORT.md).
+For detailed syntax and parameter descriptions, see [CANCEL EXPORT](../sql-reference/sql-statements/data-manipulation/CANCEL_EXPORT.md).
 
 ## Best practices
 

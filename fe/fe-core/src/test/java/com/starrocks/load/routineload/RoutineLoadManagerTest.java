@@ -39,7 +39,6 @@ import com.google.common.collect.Maps;
 import com.starrocks.analysis.LabelName;
 import com.starrocks.analysis.ParseNode;
 import com.starrocks.analysis.TableName;
-import com.starrocks.analysis.UserIdentity;
 import com.starrocks.catalog.Database;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
@@ -53,6 +52,7 @@ import com.starrocks.mysql.privilege.Auth;
 import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.persist.EditLog;
 import com.starrocks.persist.RoutineLoadOperation;
+import com.starrocks.persist.metablock.SRMetaBlockReader;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.OriginStatement;
 import com.starrocks.server.GlobalStateMgr;
@@ -61,6 +61,7 @@ import com.starrocks.sql.ast.CreateRoutineLoadStmt;
 import com.starrocks.sql.ast.PauseRoutineLoadStmt;
 import com.starrocks.sql.ast.ResumeRoutineLoadStmt;
 import com.starrocks.sql.ast.StopRoutineLoadStmt;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TResourceInfo;
 import com.starrocks.utframe.UtFrameUtils;
@@ -71,7 +72,9 @@ import mockit.MockUp;
 import mockit.Mocked;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.junit.After;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.Test;
 
 import java.util.ArrayList;
@@ -88,6 +91,16 @@ public class RoutineLoadManagerTest {
 
     @Mocked
     private SystemInfoService systemInfoService;
+
+    @Before
+    public void setUp() {
+        UtFrameUtils.setUpForPersistTest();
+    }
+
+    @After
+    public void tearDown() {
+        UtFrameUtils.tearDownForPersisTest();
+    }
 
     @Test
     public void testAddJobByStmt(@Injectable Auth auth,
@@ -135,7 +148,7 @@ public class RoutineLoadManagerTest {
                 result = true;
             }
         };
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         routineLoadManager.createRoutineLoadJob(createRoutineLoadStmt);
 
         Map<String, RoutineLoadJob> idToRoutineLoadJob =
@@ -194,7 +207,7 @@ public class RoutineLoadManagerTest {
                 result = false;
             }
         };
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         try {
             routineLoadManager.createRoutineLoadJob(createRoutineLoadStmt);
             Assert.fail();
@@ -215,7 +228,7 @@ public class RoutineLoadManagerTest {
         KafkaRoutineLoadJob kafkaRoutineLoadJob = new KafkaRoutineLoadJob(1L, jobName, 1L, 1L,
                 serverAddress, topicName);
 
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
 
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newConcurrentMap();
         Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = Maps.newConcurrentMap();
@@ -245,7 +258,7 @@ public class RoutineLoadManagerTest {
         KafkaRoutineLoadJob kafkaRoutineLoadJob = new KafkaRoutineLoadJob(1L, jobName, 1L, 1L,
                 serverAddress, topicName);
 
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
 
         new Expectations() {
             {
@@ -300,7 +313,7 @@ public class RoutineLoadManagerTest {
             }
         };
 
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         routineLoadManager.updateBeTaskSlot();
         routineLoadManager.takeBeTaskSlot();
 
@@ -326,7 +339,7 @@ public class RoutineLoadManagerTest {
             }
         };
 
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         routineLoadManager.updateBeTaskSlot();
 
         // take tow slots
@@ -392,7 +405,7 @@ public class RoutineLoadManagerTest {
             }
         };
 
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         Deencapsulation.setField(routineLoadManager, "dbToNameToRoutineLoadJob", dbToNameRoutineLoadList);
         List<RoutineLoadJob> result = routineLoadManager.getJobByName(jobName);
 
@@ -422,7 +435,7 @@ public class RoutineLoadManagerTest {
             }
         };
 
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         Map<Long, RoutineLoadJob> idToRoutineLoadJob = Maps.newHashMap();
         idToRoutineLoadJob.put(1L, routineLoadJob1);
         idToRoutineLoadJob.put(2L, routineLoadJob2);
@@ -462,7 +475,7 @@ public class RoutineLoadManagerTest {
             }
         };
 
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newHashMap();
         Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = Maps.newHashMap();
         List<RoutineLoadJob> routineLoadJobList = Lists.newArrayList();
@@ -486,7 +499,7 @@ public class RoutineLoadManagerTest {
                                         @Mocked Database database,
                                         @Mocked Auth auth,
                                         @Mocked ConnectContext connectContext) throws UserException {
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newHashMap();
         Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = Maps.newHashMap();
         List<RoutineLoadJob> routineLoadJobList = Lists.newArrayList();
@@ -548,7 +561,7 @@ public class RoutineLoadManagerTest {
                                          @Mocked Database database,
                                          @Mocked Auth auth,
                                          @Mocked ConnectContext connectContext) throws UserException {
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newHashMap();
         Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = Maps.newHashMap();
         List<RoutineLoadJob> routineLoadJobList = Lists.newArrayList();
@@ -592,7 +605,7 @@ public class RoutineLoadManagerTest {
                                        @Mocked Database database,
                                        @Mocked Auth auth,
                                        @Mocked ConnectContext connectContext) throws UserException {
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newHashMap();
         Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = Maps.newHashMap();
         List<RoutineLoadJob> routineLoadJobList = Lists.newArrayList();
@@ -634,7 +647,7 @@ public class RoutineLoadManagerTest {
     public void testCleanOldRoutineLoadJobs(@Injectable RoutineLoadJob routineLoadJob,
                                             @Mocked GlobalStateMgr globalStateMgr,
                                             @Mocked EditLog editLog) {
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newHashMap();
         Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = Maps.newHashMap();
         List<RoutineLoadJob> routineLoadJobList = Lists.newArrayList();
@@ -671,7 +684,7 @@ public class RoutineLoadManagerTest {
     @Test
     public void testReplayRemoveOldRoutineLoad(@Injectable RoutineLoadOperation operation,
                                                @Injectable RoutineLoadJob routineLoadJob) {
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         Map<Long, RoutineLoadJob> idToRoutineLoadJob = Maps.newHashMap();
         idToRoutineLoadJob.put(1L, routineLoadJob);
         Deencapsulation.setField(routineLoadManager, "idToRoutineLoadJob", idToRoutineLoadJob);
@@ -703,7 +716,7 @@ public class RoutineLoadManagerTest {
 
     @Test
     public void testReplayChangeRoutineLoadJob(@Injectable RoutineLoadOperation operation) {
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         RoutineLoadJob routineLoadJob = new KafkaRoutineLoadJob();
         Deencapsulation.setField(routineLoadJob, "name", "");
         Deencapsulation.setField(routineLoadJob, "dbId", 1L);
@@ -739,7 +752,7 @@ public class RoutineLoadManagerTest {
                                         @Mocked Database database,
                                         @Mocked Auth auth,
                                         @Mocked ConnectContext connectContext) throws UserException {
-        RoutineLoadManager routineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr routineLoadManager = new RoutineLoadMgr();
         Map<Long, Map<String, List<RoutineLoadJob>>> dbToNameToRoutineLoadJob = Maps.newHashMap();
         Map<String, List<RoutineLoadJob>> nameToRoutineLoadJob = Maps.newHashMap();
         List<RoutineLoadJob> routineLoadJobList = Lists.newArrayList();
@@ -780,7 +793,6 @@ public class RoutineLoadManagerTest {
 
     @Test
     public void testLoadImageWithoutExpiredJob() throws Exception {
-        UtFrameUtils.setUpForPersistTest();
 
         Config.label_keep_max_second = 10;
         Config.enable_dict_optimize_routine_load = true;
@@ -792,7 +804,7 @@ public class RoutineLoadManagerTest {
                 "PROPERTIES(\"format\" = \"json\",\"jsonpaths\"=\"[\\\"$.k1\\\",\\\"$.k2.\\\\\\\"k2.1\\\\\\\"\\\"]\") " +
                 "FROM KAFKA(\"kafka_broker_list\" = \"xxx.xxx.xxx.xxx:xxx\",\"kafka_topic\" = \"topic_0\");";
 
-        RoutineLoadManager leaderLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr leaderLoadManager = new RoutineLoadMgr();
         long now = System.currentTimeMillis();
 
         // 1. create a job that will be discard after image load
@@ -819,7 +831,7 @@ public class RoutineLoadManagerTest {
         // 3. save image & reload
         UtFrameUtils.PseudoImage pseudoImage = new UtFrameUtils.PseudoImage();
         leaderLoadManager.write(pseudoImage.getDataOutputStream());
-        RoutineLoadManager restartedRoutineLoadManager = new RoutineLoadManager();
+        RoutineLoadMgr restartedRoutineLoadManager = new RoutineLoadMgr();
         restartedRoutineLoadManager.readFields(pseudoImage.getDataInputStream());
         // discard expired job
         Assert.assertNull(restartedRoutineLoadManager.getJob(discardJobId));
@@ -831,6 +843,41 @@ public class RoutineLoadManagerTest {
         Assert.assertNull(leaderLoadManager.getJob(discardJobId));
         Assert.assertNotNull(leaderLoadManager.getJob(goodJobId));
 
-        UtFrameUtils.tearDownForPersisTest();
+    }
+
+    @Test
+    public void testJsonFormatImage() throws Exception {
+
+        ConnectContext connectContext = new ConnectContext();
+        connectContext.setCurrentUserIdentity(UserIdentity.ROOT);
+        connectContext.setThreadLocalInfo();
+        String db = "test";
+        String createSQL = "CREATE ROUTINE LOAD db0.routine_load_0 ON t1 " +
+                "PROPERTIES(\"format\" = \"json\",\"jsonpaths\"=\"[\\\"$.k1\\\",\\\"$.k2.\\\\\\\"k2.1\\\\\\\"\\\"]\") " +
+                "FROM KAFKA(\"kafka_broker_list\" = \"xxx.xxx.xxx.xxx:xxx\",\"kafka_topic\" = \"topic_0\");";
+
+        RoutineLoadMgr leaderLoadManager = new RoutineLoadMgr();
+
+        RoutineLoadJob kafkaRoutineLoadJob = new KafkaRoutineLoadJob(1L, "kafkaJob",
+                1, 1, "xxx", "xxtopic");
+        kafkaRoutineLoadJob.setOrigStmt(new OriginStatement(createSQL, 0));
+        leaderLoadManager.addRoutineLoadJob(kafkaRoutineLoadJob, db);
+
+        createSQL = "CREATE ROUTINE LOAD db0.routine_load_2 ON t1 " +
+                "PROPERTIES(\"format\" = \"json\",\"jsonpaths\"=\"[\\\"$.k1\\\",\\\"$.k2.\\\\\\\"k2.1\\\\\\\"\\\"]\") " +
+                "FROM PULSAR(\"pulsar_service_url\" = \"xxx.xxx.xxx.xxx:xxx\",\"pulsar_topic\" = \"topic_0\");";
+        RoutineLoadJob pulsarRoutineLoadJob = new PulsarRoutineLoadJob(2L, "pulsarJob", 1, 1, "xxxx", "xxx", "xxx");
+        pulsarRoutineLoadJob.setOrigStmt(new OriginStatement(createSQL, 0));
+        leaderLoadManager.addRoutineLoadJob(pulsarRoutineLoadJob, db);
+
+        UtFrameUtils.PseudoImage pseudoImage = new UtFrameUtils.PseudoImage();
+        leaderLoadManager.saveRoutineLoadJobsV2(pseudoImage.getDataOutputStream());
+        RoutineLoadMgr restartedRoutineLoadManager = new RoutineLoadMgr();
+        SRMetaBlockReader reader = new SRMetaBlockReader(pseudoImage.getDataInputStream());
+        restartedRoutineLoadManager.loadRoutineLoadJobsV2(reader);
+        reader.close();
+
+        Assert.assertNotNull(restartedRoutineLoadManager.getJob(1L));
+        Assert.assertNotNull(restartedRoutineLoadManager.getJob(2L));
     }
 }

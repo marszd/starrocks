@@ -43,6 +43,8 @@
 #include "gen_cpp/segment.pb.h"
 #include "gutil/macros.h"
 #include "runtime/global_dict/types.h"
+#include "storage/row_store_encoder_factory.h"
+#include "storage/tablet_schema.h"
 
 namespace starrocks {
 
@@ -54,12 +56,17 @@ class MemTracker;
 class WritableFile;
 class Chunk;
 class ColumnWriter;
+class Schema;
 
 extern const char* const k_segment_magic;
 extern const uint32_t k_segment_magic_length;
 
 struct SegmentWriterOptions {
+#ifdef BE_TEST
+    uint32_t num_rows_per_block = 100;
+#else
     uint32_t num_rows_per_block = 1024;
+#endif
     GlobalDictByNameMaps* global_dicts = nullptr;
     std::vector<int32_t> referenced_column_ids;
 };
@@ -89,7 +96,7 @@ struct SegmentWriterOptions {
 //
 class SegmentWriter {
 public:
-    SegmentWriter(std::unique_ptr<WritableFile> block, uint32_t segment_id, const TabletSchema* tablet_schema,
+    SegmentWriter(std::unique_ptr<WritableFile> block, uint32_t segment_id, TabletSchemaCSPtr tablet_schema,
                   SegmentWriterOptions opts);
     ~SegmentWriter();
 
@@ -97,6 +104,8 @@ public:
     void operator=(const SegmentWriter&) = delete;
 
     Status init();
+
+    Status init(bool has_key);
 
     // Used for vertical compaction
     // footer is used for partial update
@@ -132,7 +141,7 @@ private:
     void _init_column_meta(ColumnMetaPB* meta, uint32_t column_id, const TabletColumn& column);
 
     uint32_t _segment_id;
-    const TabletSchema* _tablet_schema;
+    TabletSchemaCSPtr _tablet_schema;
     SegmentWriterOptions _opts;
 
     std::unique_ptr<WritableFile> _wfile;
@@ -142,6 +151,8 @@ private:
     std::vector<std::unique_ptr<ColumnWriter>> _column_writers;
     std::vector<uint32_t> _column_indexes;
     bool _has_key = true;
+    std::vector<uint32_t> _sort_column_indexes;
+    std::unique_ptr<Schema> _schema_without_full_row_column;
 
     // num rows written when appending [partial] columns
     uint32_t _num_rows_written = 0;

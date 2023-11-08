@@ -45,7 +45,6 @@ import com.starrocks.analysis.ExprSubstitutionMap;
 import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.SlotId;
 import com.starrocks.analysis.SlotRef;
-import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.analysis.TupleId;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.TreeNode;
@@ -59,6 +58,8 @@ import com.starrocks.thrift.TNormalPlanNode;
 import com.starrocks.thrift.TPlan;
 import com.starrocks.thrift.TPlanNode;
 import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections.MapUtils;
+import org.roaringbitmap.RoaringBitmap;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -68,6 +69,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -109,10 +111,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     // estimate of the output cardinality of this node; set in computeStats();
     // invalid: -1
     protected long cardinality;
-
-    // number of nodes on which the plan tree rooted at this node would execute;
-    // set in computeStats(); invalid: -1
-    protected int numNodes;
 
     // sum of tupleIds' avgSerializedSizes; set in computeStats()
     protected float avgRowSize;
@@ -208,6 +206,10 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         this.planNodeName = s;
     }
 
+    public String getPlanNodeName() {
+        return planNodeName;
+    }
+
     public PlanNodeId getId() {
         return id;
     }
@@ -254,10 +256,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
     public long getCardinality() {
         return cardinality;
-    }
-
-    public int getNumNodes() {
-        return numNodes;
     }
 
     public float getAvgRowSize() {
@@ -469,6 +467,9 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     }
 
     protected String getColumnStatistics(String prefix) {
+        if (MapUtils.isEmpty(columnStatistics)) {
+            return "";
+        }
         StringBuilder outputBuilder = new StringBuilder();
         TreeMap<ColumnRefOperator, ColumnStatistic> sortMap =
                 new TreeMap<>(Comparator.comparingInt(ColumnRefOperator::getId));
@@ -509,7 +510,6 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         msg.node_id = id.asInt();
         msg.num_children = children.size();
         msg.limit = limit;
-        msg.setUse_vectorized(true);
         for (TupleId tid : tupleIds) {
             msg.addToRow_tuples(tid.asInt());
             msg.addToNullable_tuples(nullableTupleIds.contains(tid));
@@ -548,7 +548,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     }
 
     /**
-     * Computes planner statistics: avgRowSize, numNodes, cardinality.
+     * Computes planner statistics: avgRowSize, cardinality.
      * Subclasses need to override this.
      * Assumes that it has already been called on all children.
      * This is broken out of finalize() so that it can be called separately
@@ -558,11 +558,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     protected void computeStats(Analyzer analyzer) {
         avgRowSize = 0.0F;
         for (TupleId tid : tupleIds) {
-            TupleDescriptor desc = analyzer.getTupleDesc(tid);
-            avgRowSize += desc.getAvgSerializedSize();
-        }
-        if (!children.isEmpty()) {
-            numNodes = getChild(0).numNodes;
+            avgRowSize += 4;
         }
     }
 
@@ -719,6 +715,10 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     }
 
     public boolean canUsePipeLine() {
+        return true;
+    }
+
+    public boolean canUseRuntimeAdaptiveDop() {
         return false;
     }
 
@@ -739,20 +739,20 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
      * @param expr: the slot expr that need to find its candidate slot exprs.
      * @return List<Expr>: all the slot expr's candidate slot exprs.
      */
-    public Optional<List<Expr>> candidatesOfSlotExpr(Expr expr) {
+    public Optional<List<Expr>> candidatesOfSlotExpr(Expr expr, Function<Expr, Boolean> couldBound) {
         // NOTE: No need to check expr is slot or not here, each node should implement its `candidatesOfSlotExpr` itself.
-        if (!expr.isBoundByTupleIds(getTupleIds())) {
+        if (!couldBound.apply(expr)) {
             return Optional.empty();
         }
         return Optional.of(Lists.newArrayList(expr));
     }
 
-    public Optional<List<List<Expr>>> candidatesOfSlotExprs(List<Expr> exprs) {
-        if (!exprs.stream().allMatch(expr -> candidatesOfSlotExpr(expr).isPresent())) {
+    public Optional<List<List<Expr>>> candidatesOfSlotExprs(List<Expr> exprs, Function<Expr, Boolean> couldBound) {
+        if (!exprs.stream().allMatch(expr -> candidatesOfSlotExpr(expr, couldBound).isPresent())) {
             return Optional.empty();
         }
         List<List<Expr>> candidatesOfSlotExprs =
-                exprs.stream().map(expr -> candidatesOfSlotExpr(expr).get()).collect(Collectors.toList());
+                exprs.stream().map(expr -> candidatesOfSlotExpr(expr, couldBound).get()).collect(Collectors.toList());
         return Optional.of(candidateOfPartitionByExprs(candidatesOfSlotExprs));
     }
 
@@ -776,7 +776,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
         }
 
         // rf be crossed exchange when partitionByExprs are slot refs and bound by the plan node.
-        return candidatesOfSlotExprs(partitionByExprs);
+        return candidatesOfSlotExprs(partitionByExprs, couldBoundForPartitionExpr());
     }
 
     /**
@@ -813,23 +813,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
             }
         }
 
-        boolean isBound = false;
-        if (probeExpr instanceof SlotRef && description.runtimeFilterType().equals(
-                RuntimeFilterDescription.RuntimeFilterType.TOPN_FILTER)) {
-            SlotRef slotRef = (SlotRef) probeExpr;
-            found:
-            for (TupleId tupleId : getTupleIds()) {
-                for (SlotDescriptor slot : descTbl.getTupleDesc(tupleId).getSlots()) {
-                    // TopN Filter only works in no-nullable column
-                    if (slot.getId().equals(slotRef.getSlotId()) && !slotRef.isNullable()) {
-                        isBound = true;
-                        break found;
-                    }
-                }
-            }
-        } else {
-            isBound = probeExpr.isBoundByTupleIds(getTupleIds());
-        }
+        boolean isBound = couldBound(probeExpr, description, descTbl);
         if (isBound) {
             checkRuntimeFilterOnNullValue(description, probeExpr);
         }
@@ -843,6 +827,43 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
             return true;
         }
         return false;
+    }
+    protected Function<Expr, Boolean> couldBound(RuntimeFilterDescription rfDesc, DescriptorTable descTbl) {
+        return (Expr expr) -> couldBound(expr ,rfDesc, descTbl);
+    }
+
+    protected Function<Expr, Boolean> couldBoundForPartitionExpr() {
+        return (Expr expr) -> expr.isBoundByTupleIds(getTupleIds());
+    }
+
+    private RoaringBitmap cachedSlotIds = null;
+
+    public RoaringBitmap getSlotIds(DescriptorTable descTbl) {
+        if (cachedSlotIds == null) {
+            cachedSlotIds = new RoaringBitmap();
+            getTupleIds().stream().map(descTbl::getTupleDesc)
+                    .flatMap(tupleDesc -> tupleDesc.getSlots().stream().map(SlotDescriptor::getId))
+                    .map(SlotId::asInt).forEach(cachedSlotIds::add);
+        }
+        return cachedSlotIds;
+    }
+
+    protected boolean couldBound(Expr probeExpr, RuntimeFilterDescription rfDesc, DescriptorTable descTbl) {
+        if (probeExpr instanceof SlotRef &&
+                rfDesc.runtimeFilterType().equals(RuntimeFilterDescription.RuntimeFilterType.TOPN_FILTER)) {
+            SlotRef slotRef = (SlotRef) probeExpr;
+            for (TupleId tupleId : getTupleIds()) {
+                for (SlotDescriptor slot : descTbl.getTupleDesc(tupleId).getSlots()) {
+                    // TopN Filter only works in no-nullable column
+                    if (slot.getId().equals(slotRef.getSlotId()) && (!slotRef.isNullable() || rfDesc.isNullLast())) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        } else {
+            return getSlotIds(descTbl).contains(probeExpr.getUsedSlotIds());
+        }
     }
 
     private boolean tryPushdownRuntimeFilterToChild(DescriptorTable descTbl, RuntimeFilterDescription description,
@@ -888,14 +909,16 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
                                                             boolean addProbeInfo) {
         boolean accept = tryPushdownRuntimeFilterToChild(descTbl, description, optProbeExprCandidates,
                 optPartitionByExprsCandidates, childIdx);
-        boolean isBound = probeExpr.isBoundByTupleIds(getTupleIds());
+        RoaringBitmap slotIds = getSlotIds(descTbl);
+        boolean isBound = slotIds.contains(probeExpr.getUsedSlotIds()) &&
+                partitionByExprs.stream().allMatch(expr->slotIds.contains(expr.getUsedSlotIds()));
         if (isBound) {
             checkRuntimeFilterOnNullValue(description, probeExpr);
         }
         if (accept) {
             return true;
         }
-        if (addProbeInfo && description.canProbeUse(this)) {
+        if (isBound && addProbeInfo && description.canProbeUse(this)) {
             // can not push down to children.
             // use runtime filter at this level.
             description.addProbeExpr(id.asInt(), probeExpr);
@@ -956,5 +979,10 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     // 2. SetOperation: input slotId and its corresponding input slotIds of the child PlanNode;
     // 3. HashJoinNode: slotIds of both sides of Join equal conditions in semi join and inner join.
     public void collectEquivRelation(FragmentNormalizer normalizer) {
+    }
+
+    // disable optimize depends on physical order
+    // eg: sortedStreamingAGG/ PerBucketCompute
+    public void disablePhysicalPropertyOptimize() {
     }
 }

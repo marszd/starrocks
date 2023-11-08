@@ -33,11 +33,11 @@ public class LogicalLimitOperator extends LogicalOperator {
         GLOBAL, // GLOBAL limit will gather child
     }
 
-    private final long offset;
+    private long offset;
 
-    private final Phase phase;
+    private Phase phase;
 
-    public LogicalLimitOperator(long limit, long offset, Phase phase) {
+    private LogicalLimitOperator(long limit, long offset, Phase phase) {
         super(OperatorType.LOGICAL_LIMIT);
         Preconditions.checkState(limit < 0 || limit + offset >= 0,
                 String.format("limit(%d) + offset(%d) is too large and yields an overflow result(%d)", limit, offset,
@@ -45,6 +45,10 @@ public class LogicalLimitOperator extends LogicalOperator {
         this.limit = limit;
         this.offset = offset;
         this.phase = phase;
+    }
+
+    private LogicalLimitOperator() {
+        super(OperatorType.LOGICAL_LIMIT);
     }
 
     public static LogicalLimitOperator init(long limit) {
@@ -55,27 +59,12 @@ public class LogicalLimitOperator extends LogicalOperator {
         return new LogicalLimitOperator(limit, offset, Phase.INIT);
     }
 
-    public static LogicalLimitOperator global(long limit) {
-        return global(limit, DEFAULT_OFFSET);
-    }
-
     public static LogicalLimitOperator global(long limit, long offset) {
         return new LogicalLimitOperator(limit, offset, Phase.GLOBAL);
     }
 
     public static LogicalLimitOperator local(long limit) {
-        return local(limit, DEFAULT_OFFSET);
-    }
-
-    public static LogicalLimitOperator local(long limit, long offset) {
-        return new LogicalLimitOperator(limit, offset, Phase.LOCAL);
-    }
-
-    private LogicalLimitOperator(Builder builder) {
-        super(OperatorType.LOGICAL_LIMIT, builder.getLimit(), builder.getPredicate(), builder.getProjection());
-        this.limit = builder.getLimit();
-        this.offset = builder.offset;
-        this.phase = builder.phase;
+        return new LogicalLimitOperator(limit, DEFAULT_OFFSET, Phase.LOCAL);
     }
 
     public boolean hasOffset() {
@@ -136,29 +125,26 @@ public class LogicalLimitOperator extends LogicalOperator {
     }
 
     public static class Builder extends LogicalOperator.Builder<LogicalLimitOperator, LogicalLimitOperator.Builder> {
-        private long offset = DEFAULT_OFFSET;
-
-        private Phase phase = Phase.INIT;
 
         @Override
-        public LogicalLimitOperator build() {
-            return new LogicalLimitOperator(this);
+        protected LogicalLimitOperator newInstance() {
+            return new LogicalLimitOperator();
         }
 
         @Override
         public LogicalLimitOperator.Builder withOperator(LogicalLimitOperator operator) {
             super.withOperator(operator);
-            this.offset = operator.offset;
-            this.phase = operator.phase;
+            builder.offset = operator.offset;
+            builder.phase = operator.phase;
             return this;
         }
 
         public void setPhase(Phase phase) {
-            this.phase = phase;
+            builder.phase = phase;
         }
 
         public Builder setOffset(long offset) {
-            this.offset = offset;
+            builder.offset = offset;
             return this;
         }
     }

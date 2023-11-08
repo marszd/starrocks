@@ -22,9 +22,10 @@
 namespace starrocks::pipeline {
 class AggregateDistinctBlockingSourceOperator : public SourceOperator {
 public:
-    AggregateDistinctBlockingSourceOperator(OperatorFactory* factory, int32_t id, int32_t plan_node_id,
-                                            int32_t driver_sequence, AggregatorPtr aggregator)
-            : SourceOperator(factory, id, "aggregate_distinct_blocking_source", plan_node_id, driver_sequence),
+    AggregateDistinctBlockingSourceOperator(AggregatorPtr aggregator, OperatorFactory* factory, int32_t id,
+                                            int32_t plan_node_id, int32_t driver_sequence,
+                                            const char* name = "aggregate_distinct_blocking_source")
+            : SourceOperator(factory, id, name, plan_node_id, false, driver_sequence),
               _aggregator(std::move(aggregator)) {
         _aggregator->ref();
     }
@@ -34,13 +35,13 @@ public:
     bool has_output() const override;
     bool is_finished() const override;
 
-    Status set_finished(RuntimeState* state) override;
+    [[nodiscard]] Status set_finished(RuntimeState* state) override;
 
     void close(RuntimeState* state) override;
 
-    StatusOr<ChunkPtr> pull_chunk(RuntimeState* state) override;
+    [[nodiscard]] StatusOr<ChunkPtr> pull_chunk(RuntimeState* state) override;
 
-private:
+protected:
     // It is used to perform aggregation algorithms shared by
     // AggregateDistinctBlockingSinkOperator. It is
     // - prepared at SinkOperator::prepare(),
@@ -60,7 +61,7 @@ public:
 
     OperatorPtr create(int32_t degree_of_parallelism, int32_t driver_sequence) override {
         return std::make_shared<AggregateDistinctBlockingSourceOperator>(
-                this, _id, _plan_node_id, driver_sequence, _aggregator_factory->get_or_create(driver_sequence));
+                _aggregator_factory->get_or_create(driver_sequence), this, _id, _plan_node_id, driver_sequence);
     }
 
 private:

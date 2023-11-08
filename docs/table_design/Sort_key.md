@@ -6,15 +6,15 @@ Additionally, to reduce memory consumption, StarRocks supports creating a prefix
 
 ## Principles
 
-In the Duplicate Key model, sort key columns are defined by using the `DUPLICATE KEY` keyword.
+In the Duplicate Key table, sort key columns are defined by using the `DUPLICATE KEY` keyword.
 
-In the Aggregate Key model, sort key columns are defined by using the `AGGREGATE KEY` keyword.
+In the Aggregate table, sort key columns are defined by using the `AGGREGATE KEY` keyword.
 
-In the Unique Key model, sort key columns are defined by using the `UNIQUE KEY` keyword.
+In the Unique Key table, sort key columns are defined by using the `UNIQUE KEY` keyword.
 
-In the Primary Key model, sort key columns are primary key columns, which are defined by using the `PRIMARY KEY` keyword.
+Since v3.0, the primary key and sort key are decoupled in the Primary Key table. The sort key columns are defined by using the `ORDER BY` keyword. The primary key columns are defined by using the `PRIMARY KEY` keyword.
 
-When you define sort key columns for a table at table creation, take note of the following points:
+When you define sort key columns for a Duplicate Key table, an Aggregate table, or a Unique Key table, take note of the following points:
 
 - Sort key columns must be continuously defined columns, of which the first defined column must be the beginning sort key column.
 
@@ -33,7 +33,7 @@ The following examples show allowed sort key columns and unallowed sort key colu
   - `city_code` and `user_id`
   - `site_id`, `city_code`, and `pv`
 
-The following sections provide examples of how to define sort key columns when you create tables that use various data models. These examples are suitable for StarRocks clusters that have at least three BEs.
+The following sections provide examples of how to define sort key columns when you create tables of different types. These examples are suitable for StarRocks clusters that have at least three BEs.
 
 ### Duplicate Key
 
@@ -50,8 +50,12 @@ CREATE TABLE site_access_duplicate
     pv BIGINT DEFAULT '0'
 )
 DUPLICATE KEY(site_id, city_code)
-DISTRIBUTED BY HASH(site_id) BUCKETS 10;
+DISTRIBUTED BY HASH(site_id);
 ```
+
+> **NOTICE**
+>
+> Since v2.5.7, StarRocks can automatically set the number of buckets (BUCKETS) when you create a table or add a partition. You no longer need to manually set the number of buckets. For detailed information, see [determine the number of buckets](./Data_distribution.md#determine-the-number-of-buckets).
 
 ### Aggregate Key
 
@@ -64,16 +68,16 @@ CREATE TABLE site_access_aggregate
 (
     site_id INT DEFAULT '10',
     city_code SMALLINT,
-    user_id INT MAX,
+    user_id BITMAP BITMAP_UNION,
     pv BIGINT SUM DEFAULT '0'
 )
 AGGREGATE KEY(site_id, city_code)
-DISTRIBUTED BY HASH(site_id) BUCKETS 10;
+DISTRIBUTED BY HASH(site_id);
 ```
 
 >**NOTICE**
 >
-> For an Aggregate Key table, columns for which `agg_type` is not specified are key columns, and those for which `agg_type` is specified are value columns. See [CREATE TABLE](../sql-reference/sql-statements/data-definition/CREATE%20TABLE.md). In the preceding example, only `site_id` and `city_code` are specified as sort key columns, and therefore `agg_type` must be specified for `user_id` and `pv`.
+> For an Aggregate table, columns for which `agg_type` is not specified are key columns, and those for which `agg_type` is specified are value columns. See [CREATE TABLE](../sql-reference/sql-statements/data-definition/CREATE_TABLE.md). In the preceding example, only `site_id` and `city_code` are specified as sort key columns, and therefore `agg_type` must be specified for `user_id` and `pv`.
 
 ### Unique Key
 
@@ -90,12 +94,12 @@ CREATE TABLE site_access_unique
     pv BIGINT DEFAULT '0'
 )
 UNIQUE KEY(site_id, city_code)
-DISTRIBUTED BY HASH(site_id) BUCKETS 10;
+DISTRIBUTED BY HASH(site_id);
 ```
 
 ### Primary Key
 
-Create a table named `site_access_primary`. The table consists of four columns: `site_id`, `city_code`, `user_id`, and `pv`, of which `site_id` and `city_code` are selected as sort key columns.
+Create a table named `site_access_primary`. The table consists of four columns: `site_id`, `city_code`, `user_id`, and `pv`, of which `site_id` is selected as the primary key column, `site_id` and `city_code` are selected as sort key columns.
 
 The statement for creating the table is as follows:
 
@@ -107,8 +111,9 @@ CREATE TABLE site_access_primary
     user_id INT,
     pv BIGINT DEFAULT '0'
 )
-PRIMARY KEY(site_id, city_code)
-DISTRIBUTED BY HASH(site_id) BUCKETS 10;
+PRIMARY KEY(site_id)
+DISTRIBUTED BY HASH(site_id)
+ORDER BY(site_id,city_code);
 ```
 
 ## Sorting effect

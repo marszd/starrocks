@@ -38,6 +38,7 @@ import com.google.common.collect.Lists;
 import com.starrocks.common.Config;
 import com.starrocks.common.Version;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.system.BackendCoreStat;
 
 import java.lang.reflect.Field;
 import java.util.List;
@@ -62,16 +63,21 @@ public final class GlobalVariable {
     public static final String ENABLE_QUERY_QUEUE_SELECT = "enable_query_queue_select";
     public static final String ENABLE_QUERY_QUEUE_STATISTIC = "enable_query_queue_statistic";
     public static final String ENABLE_QUERY_QUEUE_LOAD = "enable_query_queue_load";
+    public static final String ENABLE_GROUP_LEVEL_QUERY_QUEUE = "enable_group_level_query_queue";
     public static final String QUERY_QUEUE_FRESH_RESOURCE_USAGE_INTERVAL_MS =
             "query_queue_fresh_resource_usage_interval_ms";
     public static final String QUERY_QUEUE_CONCURRENCY_LIMIT = "query_queue_concurrency_limit";
+    public static final String QUERY_QUEUE_DRIVER_HIGH_WATER = "query_queue_driver_high_water";
+    public static final String QUERY_QUEUE_DRIVER_LOW_WATER = "query_queue_driver_low_water";
     public static final String QUERY_QUEUE_MEM_USED_PCT_LIMIT = "query_queue_mem_used_pct_limit";
     public static final String QUERY_QUEUE_CPU_USED_PERMILLE_LIMIT = "query_queue_cpu_used_permille_limit";
     public static final String QUERY_QUEUE_PENDING_TIMEOUT_SECOND = "query_queue_pending_timeout_second";
     public static final String QUERY_QUEUE_MAX_QUEUED_QUERIES = "query_queue_max_queued_queries";
+    public static final String ACTIVATE_ALL_ROLES_ON_LOGIN = "activate_all_roles_on_login";
+    public static final String ACTIVATE_ALL_ROLES_ON_LOGIN_V2 = "activate_all_roles_on_login_v2";
 
     @VariableMgr.VarAttr(name = VERSION_COMMENT, flag = VariableMgr.READ_ONLY)
-    public static String versionComment = "StarRocks version " + Version.STARROCKS_VERSION;
+    public static String versionComment = Version.STARROCKS_VERSION + "-" + Version.STARROCKS_COMMIT_HASH;
 
     @VariableMgr.VarAttr(name = VERSION, flag = VariableMgr.READ_ONLY)
     public static String version = Config.mysql_server_version;
@@ -134,12 +140,23 @@ public final class GlobalVariable {
     private static boolean enableQueryQueueStatistic = false;
     @VariableMgr.VarAttr(name = ENABLE_QUERY_QUEUE_LOAD, flag = VariableMgr.GLOBAL)
     private static boolean enableQueryQueueLoad = false;
+    @VariableMgr.VarAttr(name = ENABLE_GROUP_LEVEL_QUERY_QUEUE, flag = VariableMgr.GLOBAL)
+    private static boolean enableGroupLevelQueryQueue = false;
     // Use the resource usage, only when the duration from the last report is within this interval.
     @VariableMgr.VarAttr(name = QUERY_QUEUE_FRESH_RESOURCE_USAGE_INTERVAL_MS, flag = VariableMgr.GLOBAL)
     private static long queryQueueResourceUsageIntervalMs = 5000;
     // Effective iff it is positive.
     @VariableMgr.VarAttr(name = QUERY_QUEUE_CONCURRENCY_LIMIT, flag = VariableMgr.GLOBAL)
     private static int queryQueueConcurrencyLimit = 0;
+
+    // Effective iff it is non-negative.
+    @VariableMgr.VarAttr(name = QUERY_QUEUE_DRIVER_HIGH_WATER, flag = VariableMgr.GLOBAL)
+    private static int queryQueueDriverHighWater = -1;
+
+    // Effective iff it is non-negative.
+    @VariableMgr.VarAttr(name = QUERY_QUEUE_DRIVER_LOW_WATER, flag = VariableMgr.GLOBAL)
+    private static int queryQueueDriverLowWater = -1;
+
     // Effective iff it is positive.
     @VariableMgr.VarAttr(name = QUERY_QUEUE_MEM_USED_PCT_LIMIT, flag = VariableMgr.GLOBAL)
     private static double queryQueueMemUsedPctLimit = 0;
@@ -151,6 +168,10 @@ public final class GlobalVariable {
     // Unlimited iff it is non-positive.
     @VariableMgr.VarAttr(name = QUERY_QUEUE_MAX_QUEUED_QUERIES, flag = VariableMgr.GLOBAL)
     private static int queryQueueMaxQueuedQueries = 1024;
+
+    @VariableMgr.VarAttr(name = ACTIVATE_ALL_ROLES_ON_LOGIN_V2, flag = VariableMgr.GLOBAL,
+            alias = ACTIVATE_ALL_ROLES_ON_LOGIN, show = ACTIVATE_ALL_ROLES_ON_LOGIN)
+    private static boolean activateAllRolesOnLogin = false;
 
     public static boolean isEnableQueryQueueSelect() {
         return enableQueryQueueSelect;
@@ -176,6 +197,14 @@ public final class GlobalVariable {
         GlobalVariable.enableQueryQueueLoad = enableQueryQueueLoad;
     }
 
+    public static boolean isEnableGroupLevelQueryQueue() {
+        return enableGroupLevelQueryQueue;
+    }
+
+    public static void setEnableGroupLevelQueryQueue(boolean enableGroupLevelQueryQueue) {
+        GlobalVariable.enableGroupLevelQueryQueue = enableGroupLevelQueryQueue;
+    }
+
     public static long getQueryQueueResourceUsageIntervalMs() {
         return queryQueueResourceUsageIntervalMs;
     }
@@ -194,6 +223,28 @@ public final class GlobalVariable {
 
     public static void setQueryQueueConcurrencyLimit(int queryQueueConcurrencyLimit) {
         GlobalVariable.queryQueueConcurrencyLimit = queryQueueConcurrencyLimit;
+    }
+
+    public static boolean isQueryQueueDriverHighWaterEffective() {
+        return queryQueueDriverHighWater >= 0;
+    }
+
+    public static int getQueryQueueDriverHighWater() {
+        if (queryQueueDriverHighWater == 0) {
+            return BackendCoreStat.getAvgNumOfHardwareCoresOfBe() * 16;
+        }
+        return queryQueueDriverHighWater;
+    }
+
+    public static boolean isQueryQueueDriverLowWaterEffective() {
+        return queryQueueDriverLowWater >= 0;
+    }
+
+    public static int getQueryQueueDriverLowWater() {
+        if (queryQueueDriverLowWater == 0) {
+            return BackendCoreStat.getAvgNumOfHardwareCoresOfBe() * 8;
+        }
+        return queryQueueDriverLowWater;
     }
 
     public static boolean isQueryQueueMemUsedPctLimitEffective() {
@@ -238,6 +289,14 @@ public final class GlobalVariable {
 
     public static void setQueryQueueMaxQueuedQueries(int queryQueueMaxQueuedQueries) {
         GlobalVariable.queryQueueMaxQueuedQueries = queryQueueMaxQueuedQueries;
+    }
+
+    public static boolean isActivateAllRolesOnLogin() {
+        return activateAllRolesOnLogin;
+    }
+
+    public static void setActivateAllRolesOnLogin(boolean activateAllRolesOnLogin) {
+        GlobalVariable.activateAllRolesOnLogin = activateAllRolesOnLogin;
     }
 
     // Don't allow create instance.

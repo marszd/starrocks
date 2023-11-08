@@ -14,6 +14,7 @@
 
 package com.starrocks.sql.optimizer.rule.transformation.materialization;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.Column;
@@ -32,7 +33,6 @@ import com.starrocks.sql.optimizer.operator.logical.LogicalScanOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -43,17 +43,13 @@ public class MVColumnPruner {
 
     public OptExpression pruneColumns(OptExpression queryExpression) {
         Projection projection = queryExpression.getOp().getProjection();
-        // OptExpression after mv rewrite must have projection
-        // if not, skip this rewrite result
-        if (projection == null) {
-            return null;
-        }
+        // OptExpression after mv rewrite must have projection.
+        Preconditions.checkState(projection != null);
         requiredOutputColumns = new ColumnRefSet(projection.getOutputColumns());
         return queryExpression.getOp().accept(new ColumnPruneVisitor(), queryExpression, null);
     }
 
-    // prune columns by top-down
-    // now only SPJG/union operators are suppported
+    // Prune columns by top-down, only support SPJG/union operators.
     private class ColumnPruneVisitor extends OptExpressionVisitor<OptExpression, Void> {
         public OptExpression visitLogicalTableScan(OptExpression optExpression, Void context) {
             LogicalScanOperator scanOperator = optExpression.getOp().cast();
@@ -67,14 +63,14 @@ public class MVColumnPruner {
                     scanOperator.getColRefToColumnMetaMap().keySet().stream().filter(requiredOutputColumns::contains)
                             .collect(Collectors.toSet());
             outputColumns.addAll(Utils.extractColumnRef(scanOperator.getPredicate()));
-            if (outputColumns.size() == 0) {
-                outputColumns.add(Utils.findSmallestColumnRef(
-                        new ArrayList<>(scanOperator.getColRefToColumnMetaMap().keySet())));
+            if (outputColumns.isEmpty()) {
+                outputColumns.add(
+                        Utils.findSmallestColumnRefFromTable(scanOperator.getColRefToColumnMetaMap(), scanOperator.getTable()));
             }
 
             ImmutableMap.Builder<ColumnRefOperator, Column> columnRefColumnMapBuilder = new ImmutableMap.Builder<>();
             scanOperator.getColRefToColumnMetaMap().keySet().stream()
-                    .filter(key -> outputColumns.contains(key))
+                    .filter(outputColumns::contains)
                     .forEach(key -> columnRefColumnMapBuilder.put(key, scanOperator.getColRefToColumnMetaMap().get(key)));
             ImmutableMap<ColumnRefOperator, Column> newColumnRefMap = columnRefColumnMapBuilder.build();
             if (newColumnRefMap.size() != scanOperator.getColRefToColumnMetaMap().size()) {
@@ -115,8 +111,8 @@ public class MVColumnPruner {
             return OptExpression.create(optExpression.getOp(), children);
         }
 
-        // now filter and join operator will not be kept in plan after mv rewrite
-        // keep these two functions for extendibility
+        // NOTE: filter and join operator will not be kept in plan after mv rewrite,
+        // keep these just for extendable.
         public OptExpression visitLogicalFilter(OptExpression optExpression, Void context) {
             LogicalFilterOperator filterOperator = (LogicalFilterOperator) optExpression.getOp();
             ColumnRefSet requiredInputColumns = filterOperator.getRequiredChildInputColumns();
@@ -133,7 +129,7 @@ public class MVColumnPruner {
         }
 
         public OptExpression visit(OptExpression optExpression, Void context) {
-            throw UnsupportedException.unsupportedException(String.format("ColumnPrunner does not support:%s", optExpression));
+            throw UnsupportedException.unsupportedException(String.format("ColumnPruner does not support:%s", optExpression));
         }
 
         private List<OptExpression> visitChildren(OptExpression optExpression) {

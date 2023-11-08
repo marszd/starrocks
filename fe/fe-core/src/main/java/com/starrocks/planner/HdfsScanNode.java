@@ -12,21 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.planner;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.base.Preconditions;
 import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.catalog.HiveTable;
 import com.starrocks.catalog.Type;
-import com.starrocks.common.UserException;
+import com.starrocks.connector.CatalogConnector;
 import com.starrocks.connector.RemoteScanRangeLocations;
-import com.starrocks.connector.hive.HiveConnector;
 import com.starrocks.credential.CloudConfiguration;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.optimizer.ScanOptimzeOption;
 import com.starrocks.sql.plan.HDFSScanNodePredicates;
 import com.starrocks.thrift.TCloudConfiguration;
 import com.starrocks.thrift.TExplainLevel;
@@ -48,16 +48,18 @@ import static com.starrocks.thrift.TExplainLevel.VERBOSE;
  * 2. Min-max pruning: creates an additional list of conjuncts that are used to
  * prune a row group if any fail the row group's min-max parquet::Statistics.
  * 3. Get scan range locations.
- * 4. Compute stats, like cardinality, avgRowSize and numNodes.
+ * 4. Compute stats, like cardinality, avgRowSize.
  * <p>
  * TODO: Dictionary pruning
  */
 public class HdfsScanNode extends ScanNode {
-    private RemoteScanRangeLocations scanRangeLocations = new RemoteScanRangeLocations();
+    private final RemoteScanRangeLocations scanRangeLocations = new RemoteScanRangeLocations();
 
     private HiveTable hiveTable = null;
     private CloudConfiguration cloudConfiguration = null;
-    private HDFSScanNodePredicates scanNodePredicates = new HDFSScanNodePredicates();
+    private final HDFSScanNodePredicates scanNodePredicates = new HDFSScanNodePredicates();
+
+    private DescriptorTable descTbl;
 
     public HdfsScanNode(PlanNodeId id, TupleDescriptor desc, String planNodeName) {
         super(id, desc, planNodeName);
@@ -81,8 +83,9 @@ public class HdfsScanNode extends ScanNode {
         return helper.toString();
     }
 
-    public void setupScanRangeLocations(DescriptorTable descTbl) throws UserException {
-        scanRangeLocations.setupScanRangeLocations(descTbl, hiveTable, scanNodePredicates);
+    public void setupScanRangeLocations(DescriptorTable descTbl) {
+        this.descTbl = descTbl;
+        scanRangeLocations.setup(descTbl, hiveTable, scanNodePredicates);
     }
 
     private void setupCloudCredential() {
@@ -90,16 +93,17 @@ public class HdfsScanNode extends ScanNode {
         if (catalog == null) {
             return;
         }
-        HiveConnector connector = (HiveConnector) GlobalStateMgr.getCurrentState().getConnectorMgr().
-                getConnector(catalog);
-        if (connector != null) {
-            cloudConfiguration = connector.getCloudConfiguration();
-        }
+        CatalogConnector connector = GlobalStateMgr.getCurrentState().getConnectorMgr().getConnector(catalog);
+        Preconditions.checkState(connector != null,
+                String.format("connector of catalog %s should not be null", catalog));
+        cloudConfiguration = connector.getMetadata().getCloudConfiguration();
+        Preconditions.checkState(cloudConfiguration != null,
+                String.format("cloudConfiguration of catalog %s should not be null", catalog));
     }
 
     @Override
     public List<TScanRangeLocations> getScanRangeLocations(long maxScanRangeLength) {
-        return scanRangeLocations.getScanRangeLocations(maxScanRangeLength);
+        return scanRangeLocations.getScanRangeLocations(descTbl, hiveTable, scanNodePredicates);
     }
 
     @Override
@@ -142,14 +146,12 @@ public class HdfsScanNode extends ScanNode {
         output.append(prefix).append(String.format("avgRowSize=%s", avgRowSize));
         output.append("\n");
 
-        output.append(prefix).append(String.format("numNodes=%s", numNodes));
-        output.append("\n");
-
         if (detailLevel == TExplainLevel.VERBOSE) {
             for (SlotDescriptor slotDescriptor : desc.getSlots()) {
                 Type type = slotDescriptor.getOriginType();
                 if (type.isComplexType()) {
-                    output.append(prefix).append(String.format("Pruned type: %d <-> [%s]\n", slotDescriptor.getId().asInt(), type));
+                    output.append(prefix)
+                            .append(String.format("Pruned type: %d [%s] <-> [%s]\n", slotDescriptor.getId().asInt(), slotDescriptor.getColumn().getName(), type));
                 }
             }
         }
@@ -169,13 +171,58 @@ public class HdfsScanNode extends ScanNode {
         tHdfsScanNode.setTuple_id(desc.getId().asInt());
         msg.hdfs_scan_node = tHdfsScanNode;
 
-        List<Expr> noEvalPartitionConjuncts = scanNodePredicates.getNoEvalPartitionConjuncts();
-        String partitionSqlPredicate = getExplainString(noEvalPartitionConjuncts);
-        for (Expr expr : noEvalPartitionConjuncts) {
-            msg.hdfs_scan_node.addToPartition_conjuncts(expr.treeToThrift());
+        if (hiveTable != null) {
+            msg.hdfs_scan_node.setHive_column_names(hiveTable.getDataColumnNames());
+            msg.hdfs_scan_node.setTable_name(hiveTable.getName());
         }
-        msg.hdfs_scan_node.setPartition_sql_predicates(partitionSqlPredicate);
 
+        setScanOptimizeOptionToThrift(tHdfsScanNode, this);
+        setCloudConfigurationToThrift(tHdfsScanNode, cloudConfiguration);
+        setNonEvalPartitionConjunctsToThrift(tHdfsScanNode, this, this.getScanNodePredicates());
+        setMinMaxConjunctsToThrift(tHdfsScanNode, this, this.getScanNodePredicates());
+        setNonPartitionConjunctsToThrift(msg, this, this.getScanNodePredicates());
+    }
+
+    public static void setScanOptimizeOptionToThrift(THdfsScanNode tHdfsScanNode, ScanNode scanNode) {
+        ScanOptimzeOption option = scanNode.getScanOptimzeOption();
+        tHdfsScanNode.setCan_use_any_column(option.getCanUseAnyColumn());
+        tHdfsScanNode.setCan_use_min_max_count_opt(option.getCanUseMinMaxCountOpt());
+        tHdfsScanNode.setUse_partition_column_value_only(option.getUsePartitionColumnValueOnly());
+    }
+
+    public static void setCloudConfigurationToThrift(THdfsScanNode tHdfsScanNode, CloudConfiguration cc) {
+        if (cc != null) {
+            TCloudConfiguration tCloudConfiguration = new TCloudConfiguration();
+            cc.toThrift(tCloudConfiguration);
+            tHdfsScanNode.setCloud_configuration(tCloudConfiguration);
+        }
+    }
+
+    public static void setMinMaxConjunctsToThrift(THdfsScanNode tHdfsScanNode, ScanNode scanNode,
+                                                  HDFSScanNodePredicates scanNodePredicates) {
+        List<Expr> minMaxConjuncts = scanNodePredicates.getMinMaxConjuncts();
+        if (!minMaxConjuncts.isEmpty()) {
+            String minMaxSqlPredicate = scanNode.getExplainString(minMaxConjuncts);
+            for (Expr expr : minMaxConjuncts) {
+                tHdfsScanNode.addToMin_max_conjuncts(expr.treeToThrift());
+            }
+            tHdfsScanNode.setMin_max_tuple_id(scanNodePredicates.getMinMaxTuple().getId().asInt());
+            tHdfsScanNode.setMin_max_sql_predicates(minMaxSqlPredicate);
+        }
+    }
+
+    public static void setNonEvalPartitionConjunctsToThrift(THdfsScanNode tHdfsScanNode, ScanNode scanNode,
+                                                            HDFSScanNodePredicates scanNodePredicates) {
+        List<Expr> noEvalPartitionConjuncts = scanNodePredicates.getNoEvalPartitionConjuncts();
+        String partitionSqlPredicate = scanNode.getExplainString(noEvalPartitionConjuncts);
+        for (Expr expr : noEvalPartitionConjuncts) {
+            tHdfsScanNode.addToPartition_conjuncts(expr.treeToThrift());
+        }
+        tHdfsScanNode.setPartition_sql_predicates(partitionSqlPredicate);
+    }
+
+    public static void setNonPartitionConjunctsToThrift(TPlanNode msg, ScanNode scanNode,
+                                                        HDFSScanNodePredicates scanNodePredicates) {
         // put non-partition conjuncts into conjuncts
         if (msg.isSetConjuncts()) {
             msg.conjuncts.clear();
@@ -185,33 +232,17 @@ public class HdfsScanNode extends ScanNode {
         for (Expr expr : nonPartitionConjuncts) {
             msg.addToConjuncts(expr.treeToThrift());
         }
-        String sqlPredicate = getExplainString(nonPartitionConjuncts);
+        String sqlPredicate = scanNode.getExplainString(nonPartitionConjuncts);
         msg.hdfs_scan_node.setSql_predicates(sqlPredicate);
-
-        List<Expr> minMaxConjuncts = scanNodePredicates.getMinMaxConjuncts();
-        if (!minMaxConjuncts.isEmpty()) {
-            String minMaxSqlPredicate = getExplainString(minMaxConjuncts);
-            for (Expr expr : minMaxConjuncts) {
-                msg.hdfs_scan_node.addToMin_max_conjuncts(expr.treeToThrift());
-            }
-            msg.hdfs_scan_node.setMin_max_tuple_id(scanNodePredicates.getMinMaxTuple().getId().asInt());
-            msg.hdfs_scan_node.setMin_max_sql_predicates(minMaxSqlPredicate);
-        }
-
-        if (hiveTable != null) {
-            msg.hdfs_scan_node.setHive_column_names(hiveTable.getDataColumnNames());
-            msg.hdfs_scan_node.setTable_name(hiveTable.getName());
-        }
-
-        if (cloudConfiguration != null) {
-            TCloudConfiguration tCloudConfiguration = new TCloudConfiguration();
-            cloudConfiguration.toThrift(tCloudConfiguration);
-            msg.hdfs_scan_node.setCloud_configuration(tCloudConfiguration);
-        }
     }
 
     @Override
-    public boolean canUsePipeLine() {
+    public boolean canUseRuntimeAdaptiveDop() {
+        return true;
+    }
+
+    @Override
+    protected boolean supportTopNRuntimeFilter() {
         return true;
     }
 }

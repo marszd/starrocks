@@ -37,9 +37,10 @@ under the License.
     <properties>
         <starrocks.home>${basedir}/../../</starrocks.home>
         <fe_ut_parallel>${env.FE_UT_PARALLEL}</fe_ut_parallel>
-        <jacoco.version>0.8.5</jacoco.version>
-        <iceberg.version>1.0.0</iceberg.version>
+        <jacoco.version>0.8.7</jacoco.version>
+        <iceberg.version>1.2.1</iceberg.version>
         <awsv2.version>2.17.257</awsv2.version>
+        <paimon.version>0.5.0-incubating</paimon.version>
         <python>python</python>
     </properties>
 
@@ -160,15 +161,16 @@ under the License.
             <artifactId>jackson-core</artifactId>
         </dependency>
 
-        <!-- https://mvnrepository.com/artifact/org.codehaus.jackson/jackson-mapper-asl -->
+        <!-- https://mvnrepository.com/artifact/com.starrocks/starrocks-bdb-je -->
         <dependency>
-            <groupId>org.codehaus.jackson</groupId>
-            <artifactId>jackson-mapper-asl</artifactId>
-        </dependency>
-
-        <dependency>
-            <groupId>com.sleepycat</groupId>
-            <artifactId>je</artifactId>
+            <groupId>com.starrocks</groupId>
+            <artifactId>starrocks-bdb-je</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.checkerframework</groupId>
+                    <artifactId>checker-qual</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/de.jflex/jflex -->
@@ -178,8 +180,9 @@ under the License.
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/org.jmockit/jmockit -->
+        <!-- https://mvnrepository.com/artifact/com.github.hazendaz.jmockit/jmockit -->
         <dependency>
-            <groupId>org.jmockit</groupId>
+            <groupId>com.github.hazendaz.jmockit</groupId>
             <artifactId>jmockit</artifactId>
             <scope>test</scope>
         </dependency>
@@ -245,6 +248,14 @@ under the License.
             <scope>test</scope>
         </dependency>
 
+        <!-- https://mvnrepository.com/artifact/org.assertj/assertj-core -->
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>3.24.2</version>
+            <scope>test</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.apache.iceberg</groupId>
             <artifactId>iceberg-api</artifactId>
@@ -285,21 +296,24 @@ under the License.
             <groupId>org.apache.iceberg</groupId>
             <artifactId>iceberg-aws</artifactId>
             <version>${iceberg.version}</version>
-            <scope>runtime</scope>
         </dependency>
 
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>bundle</artifactId>
             <version>${awsv2.version}</version>
-            <scope>runtime</scope>
         </dependency>
 
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>url-connection-client</artifactId>
             <version>${awsv2.version}</version>
-            <scope>runtime</scope>
+            <exclusions>
+                <exclusion>
+                    <artifactId>utils</artifactId>
+                    <groupId>software.amazon.awssdk</groupId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <dependency>
@@ -340,6 +354,12 @@ under the License.
         <dependency>
             <groupId>org.apache.logging.log4j</groupId>
             <artifactId>log4j-slf4j-impl</artifactId>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.apache.logging.log4j/log4j-1.2-api -->
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-1.2-api</artifactId>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/io.netty/netty-all -->
@@ -470,6 +490,10 @@ under the License.
                     <artifactId>log4j</artifactId>
                     <groupId>log4j</groupId>
                 </exclusion>
+                <exclusion>
+                    <artifactId>stream</artifactId>
+                    <groupId>com.clearspring.analytics</groupId>
+                </exclusion>
             </exclusions>
         </dependency>
 
@@ -477,7 +501,7 @@ under the License.
         <dependency>
             <groupId>org.apache.ivy</groupId>
             <artifactId>ivy</artifactId>
-            <version>2.5.1</version>
+            <version>2.5.2</version>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/org.apache.spark/spark-launcher_2.12 -->
@@ -491,6 +515,12 @@ under the License.
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-sql_2.12</artifactId>
             <scope>provided</scope>
+            <exclusions>
+                <exclusion>
+                    <artifactId>orc-core</artifactId>
+                    <groupId>org.apache.orc</groupId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/com.fasterxml.uuid/java-uuid-generator -->
@@ -541,7 +571,6 @@ under the License.
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-common</artifactId>
-            <version>3.3.3</version>
             <exclusions>
                 <exclusion>
                     <artifactId>zookeeper</artifactId>
@@ -551,6 +580,10 @@ under the License.
                     <groupId>org.slf4j</groupId>
                     <artifactId>slf4j-reload4j</artifactId>
                 </exclusion>
+                <exclusion>
+                    <groupId>ch.qos.reload4j</groupId>
+                    <artifactId>reload4j</artifactId>
+                </exclusion>
             </exclusions>
         </dependency>
 
@@ -558,12 +591,49 @@ under the License.
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-client</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>ch.qos.reload4j</groupId>
+                    <artifactId>reload4j</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/org.apache.hadoop/hadoop-aws -->
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-aws</artifactId>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/com.qcloud.cos/hadoop-cos -->
+        <dependency>
+            <groupId>com.qcloud.cos</groupId>
+            <artifactId>hadoop-cos</artifactId>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/com.qcloud/chdfs_hadoop_plugin_network -->
+        <dependency>
+            <groupId>com.qcloud</groupId>
+            <artifactId>chdfs_hadoop_plugin_network</artifactId>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.apache.hadoop/hadoop-azure-datalake -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-azure-datalake</artifactId>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.apache.hadoop/hadoop-azure -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-azure</artifactId>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/com.google.cloud.bigdataoss/gcs-connector -->
+        <dependency>
+            <groupId>com.google.cloud.bigdataoss</groupId>
+            <artifactId>gcs-connector</artifactId>
+            <classifier>shaded</classifier>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/org.antlr/antlr4 -->
@@ -637,6 +707,10 @@ under the License.
                     <groupId>org.apache.hbase.thirdparty</groupId>
                     <artifactId>hbase-shaded-netty</artifactId>
                 </exclusion>
+                <exclusion>
+                    <groupId>org.glassfish</groupId>
+                    <artifactId>javax.el</artifactId>
+                </exclusion>
             </exclusions>
         </dependency>
 
@@ -644,17 +718,40 @@ under the License.
         <dependency>
             <groupId>org.apache.hudi</groupId>
             <artifactId>hudi-hadoop-mr</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.glassfish</groupId>
+                    <artifactId>javax.el</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-bundle</artifactId>
+            <version>${paimon.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.paimon</groupId>
+            <artifactId>paimon-s3</artifactId>
+            <version>${paimon.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.xerial.snappy</groupId>
+            <artifactId>snappy-java</artifactId>
+            <version>1.1.10.5</version>
         </dependency>
 
         <dependency>
             <groupId>com.starrocks</groupId>
             <artifactId>starclient</artifactId>
-            <version>0.2.2</version>
+            <version>3.2-rc3</version>
         </dependency>
         <dependency>
             <groupId>com.starrocks</groupId>
             <artifactId>starmanager</artifactId>
-            <version>0.2.2</version>
+            <version>3.2-rc3</version>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/io.opentelemetry/opentelemetry-api -->
@@ -675,17 +772,17 @@ under the License.
             <artifactId>opentelemetry-exporter-jaeger</artifactId>
         </dependency>
 
-        <!-- https://mvnrepository.com/artifact/mysql/mysql-connector-java -->
+        <!-- https://mvnrepository.com/artifact/com.mysql/mysql-connector-j -->
         <dependency>
-            <groupId>mysql</groupId>
-            <artifactId>mysql-connector-java</artifactId>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/org.postgresql/postgresql -->
+        <!-- we need pg driver for jdbc connector -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
-            <scope>test</scope>
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/com.mockrunner/mockrunner-jdbc -->
@@ -708,10 +805,42 @@ under the License.
             <scope>test</scope>
         </dependency>
 
+        <!-- https://mvnrepository.com/artifact/org.apache.groovy/groovy-groovysh -->
+        <dependency>
+            <groupId>org.apache.groovy</groupId>
+            <artifactId>groovy-groovysh</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>io.trino</groupId>
             <artifactId>trino-parser</artifactId>
             <version>385</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.threeten</groupId>
+            <artifactId>threeten-extra</artifactId>
+            <version>1.7.2</version>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.mockito/mockito-core -->
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-inline</artifactId>
+            <version>4.11.0</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- https://mvnrepository.com/artifact/org.apache.ranger/ranger-plugins-common -->
+        <dependency>
+            <groupId>org.apache.ranger</groupId>
+            <artifactId>ranger-plugins-common</artifactId>
+            <version>2.4.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>io.airlift</groupId>
+            <artifactId>concurrent</artifactId>
         </dependency>
     </dependencies>
 
@@ -722,7 +851,7 @@ under the License.
             <plugin>
                 <groupId>org.jacoco</groupId>
                 <artifactId>jacoco-maven-plugin</artifactId>
-                <version>0.8.5</version>
+                <version>0.8.7</version>
                 <executions>
                     <execution>
                         <id>default-prepare-agent</id>
@@ -822,7 +951,7 @@ under the License.
                     <!-->not reuse forked jvm, so that each unit test will run in separate jvm. to avoid singleton confict<-->
                     <reuseForks>false</reuseForks>
                     <argLine>
-                        -javaagent:${settings.localRepository}/org/jmockit/jmockit/1.48/jmockit-1.48.jar -Xmx2048m
+                        -javaagent:${settings.localRepository}/com/github/hazendaz/jmockit/jmockit/1.49.4/jmockit-1.49.4.jar -Xmx4096m
                         -Duser.timezone=Asia/Shanghai @{jacocoArgLine}
                     </argLine>
                     <!-- Set maven to use independent class loading to avoid unit test failure due to the early shutdown of the JVM -->
@@ -837,6 +966,7 @@ under the License.
             <!-- also parse the proto for FE -->
             <plugin>
                 <artifactId>maven-antrun-plugin</artifactId>
+                <version>1.8</version>
                 <executions>
                     <execution>
                         <id>generate-sources</id>

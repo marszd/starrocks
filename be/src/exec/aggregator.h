@@ -18,7 +18,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <queue>
 #include <utility>
 
@@ -29,7 +31,9 @@
 #include "common/statusor.h"
 #include "exec/aggregate/agg_hash_variant.h"
 #include "exec/aggregate/agg_profile.h"
+#include "exec/chunk_buffer_memory_manager.h"
 #include "exec/pipeline/context_with_dependency.h"
+#include "exec/pipeline/spill_process_channel.h"
 #include "exprs/agg/aggregate_factory.h"
 #include "exprs/expr.h"
 #include "gen_cpp/QueryPlanExtra_constants.h"
@@ -39,6 +43,7 @@
 #include "runtime/mem_pool.h"
 #include "runtime/runtime_state.h"
 #include "runtime/types.h"
+#include "util/defer_op.h"
 
 namespace starrocks {
 
@@ -73,14 +78,26 @@ struct HashTableKeyAllocator {
     AggDataPtr allocate() {
         if (vecs.empty() || vecs.back().second == alloc_batch_size) {
             uint8_t* mem = pool->allocate_aligned(alloc_batch_size * aggregate_key_size, aligned);
+            if (mem == nullptr) {
+                throw std::bad_alloc();
+            }
             vecs.emplace_back(mem, 0);
         }
         return static_cast<AggDataPtr>(vecs.back().first) + aggregate_key_size * vecs.back().second++;
     }
 
-    uint8_t* allocate_null_key_data() { return pool->allocate_aligned(alloc_batch_size * aggregate_key_size, aligned); }
+    AggDataPtr allocate_null_key_data() { return pool->allocate_aligned(aggregate_key_size, aligned); }
 
     void reset() { vecs.clear(); }
+
+    void rollback() {
+        DCHECK(!vecs.empty());
+        DCHECK_GT(vecs.back().second, 0);
+        vecs.back().second--;
+        if (vecs.back().second == 0) {
+            vecs.pop_back();
+        }
+    }
 };
 
 inline void RawHashTableIterator::next() {
@@ -113,7 +130,12 @@ struct AggFunctionTypes {
     TypeDescriptor serde_type; // for serialize
     std::vector<FunctionContext::TypeDesc> arg_typedescs;
     bool has_nullable_child;
-    bool is_nullable; // agg function result whether is nullable
+    bool is_nullable; // whether result of agg function is nullable
+    // hold order-by info
+    std::vector<bool> is_asc_order;
+    std::vector<bool> nulls_first;
+
+    bool is_distinct = false;
 };
 
 struct ColumnType {
@@ -175,6 +197,11 @@ static const StreamingHtMinReductionEntry STREAMING_HT_MIN_REDUCTION[] = {
 static const int STREAMING_HT_MIN_REDUCTION_SIZE =
         sizeof(STREAMING_HT_MIN_REDUCTION) / sizeof(STREAMING_HT_MIN_REDUCTION[0]);
 
+struct LimitedMemAggState {
+    size_t limited_memory_size{};
+    bool has_limited(const Aggregator& aggregator) const;
+};
+
 using AggregatorPtr = std::shared_ptr<Aggregator>;
 
 struct AggregatorParams {
@@ -200,6 +227,19 @@ struct AggregatorParams {
     bool is_generate_retract;
     // The agg index of count agg function.
     int32_t count_agg_idx;
+
+    // aggregate function types
+    // only invalid after inited
+    std::vector<AggFunctionTypes> agg_fn_types;
+    // group by types
+    // only invalid after inited
+    std::vector<ColumnType> group_by_types;
+
+    bool has_nullable_key;
+
+    void init();
+
+    ChunkUniquePtr create_result_chunk(bool is_serialize_fmt, const TupleDescriptor& desc);
 };
 using AggregatorParamsPtr = std::shared_ptr<AggregatorParams>;
 AggregatorParamsPtr convert_to_aggregator_params(const TPlanNode& tnode);
@@ -207,7 +247,13 @@ AggregatorParamsPtr convert_to_aggregator_params(const TPlanNode& tnode);
 // it contains common data struct and algorithm of aggregation
 class Aggregator : public pipeline::ContextWithDependency {
 public:
-    Aggregator(AggregatorParamsPtr&& params);
+#ifdef NDEBUG
+    static constexpr size_t two_level_memory_threshold = 33554432; // 32M, L3 Cache
+#else
+    static constexpr size_t two_level_memory_threshold = 64;
+#endif
+
+    Aggregator(AggregatorParamsPtr params);
 
     ~Aggregator() noexcept override {
         if (_state != nullptr) {
@@ -215,13 +261,13 @@ public:
         }
     }
 
-    Status open(RuntimeState* state);
-    virtual Status prepare(RuntimeState* state, ObjectPool* pool, RuntimeProfile* runtime_profile,
-                           MemTracker* mem_tracker);
+    [[nodiscard]] virtual Status open(RuntimeState* state);
+    [[nodiscard]] Status prepare(RuntimeState* state, ObjectPool* pool, RuntimeProfile* runtime_profile);
     void close(RuntimeState* state) override;
 
     const MemPool* mem_pool() const { return _mem_pool.get(); }
     bool is_none_group_by_exprs() { return _group_by_expr_ctxs.empty(); }
+    bool only_group_by_exprs() { return _is_only_group_by_columns; }
     const std::vector<ExprContext*>& conjunct_ctxs() { return _conjunct_ctxs; }
     const std::vector<ExprContext*>& group_by_expr_ctxs() { return _group_by_expr_ctxs; }
     const std::vector<FunctionContext*>& agg_fn_ctxs() { return _agg_fn_ctxs; }
@@ -239,7 +285,22 @@ public:
     void set_aggr_phase(AggrPhase aggr_phase) { _aggr_phase = aggr_phase; }
     AggrPhase get_aggr_phase() { return _aggr_phase; }
 
-    TStreamingPreaggregationMode::type streaming_preaggregation_mode() { return _streaming_preaggregation_mode; }
+    bool is_hash_set() const { return _is_only_group_by_columns; }
+    const int64_t hash_map_memory_usage() const { return _hash_map_variant.reserved_memory_usage(mem_pool()); }
+    const int64_t hash_set_memory_usage() const { return _hash_set_variant.reserved_memory_usage(mem_pool()); }
+
+    const int64_t memory_usage() const {
+        if (is_hash_set()) {
+            return hash_set_memory_usage();
+        } else if (!_group_by_expr_ctxs.empty()) {
+            return hash_map_memory_usage();
+        } else {
+            return 0;
+        }
+    }
+
+    TStreamingPreaggregationMode::type& streaming_preaggregation_mode() { return _streaming_preaggregation_mode; }
+    TStreamingPreaggregationMode::type streaming_preaggregation_mode() const { return _streaming_preaggregation_mode; }
     const AggHashMapVariant& hash_map_variant() { return _hash_map_variant; }
     const AggHashSetVariant& hash_set_variant() { return _hash_set_variant; }
     std::any& it_hash() { return _it_hash; }
@@ -257,6 +318,7 @@ public:
     bool is_chunk_buffer_empty();
     ChunkPtr poll_chunk_buffer();
     void offer_chunk_to_buffer(const ChunkPtr& chunk);
+    bool is_chunk_buffer_full();
 
     bool should_expand_preagg_hash_tables(size_t prev_row_returned, size_t input_chunk_size, int64_t ht_mem,
                                           int64_t ht_rows) const;
@@ -268,15 +330,19 @@ public:
     [[nodiscard]] Status compute_batch_agg_states_with_selection(Chunk* chunk, size_t chunk_size);
 
     // Convert one row agg states to chunk
-    Status convert_to_chunk_no_groupby(ChunkPtr* chunk);
+    [[nodiscard]] Status convert_to_chunk_no_groupby(ChunkPtr* chunk);
 
     void process_limit(ChunkPtr* chunk);
 
-    Status evaluate_groupby_exprs(Chunk* chunk);
-    Status evaluate_agg_fn_exprs(Chunk* chunk);
-    Status evaluate_agg_input_column(Chunk* chunk, std::vector<ExprContext*>& agg_expr_ctxs, int i);
+    [[nodiscard]] Status evaluate_groupby_exprs(Chunk* chunk);
+    [[nodiscard]] Status evaluate_agg_fn_exprs(Chunk* chunk);
+    [[nodiscard]] Status evaluate_agg_fn_exprs(Chunk* chunk, bool use_intermediate);
+    [[nodiscard]] Status evaluate_agg_input_column(Chunk* chunk, std::vector<ExprContext*>& agg_expr_ctxs, int i);
 
     [[nodiscard]] Status output_chunk_by_streaming(Chunk* input_chunk, ChunkPtr* chunk);
+
+    // convert input chunk to spill format
+    [[nodiscard]] Status convert_to_spill_format(Chunk* input_chunk, ChunkPtr* chunk);
 
     // Elements queried in HashTable will be added to HashTable,
     // elements that cannot be queried are not processed,
@@ -291,7 +357,7 @@ public:
     void try_convert_to_two_level_map();
     void try_convert_to_two_level_set();
 
-    Status check_has_error();
+    [[nodiscard]] Status check_has_error();
 
     void set_aggr_mode(AggrMode aggr_mode) { _aggr_mode = aggr_mode; }
     // reset_state is used to clear the internal state of the Aggregator, then it can process new tablet, in
@@ -300,15 +366,34 @@ public:
     // to produce the final result that will be populated into the cache.
     // refill_chunk: partial-hit result of stale version.
     // refill_op: pre-cache agg operator, Aggregator's holder.
-    Status reset_state(RuntimeState* state, const std::vector<ChunkPtr>& refill_chunks, pipeline::Operator* refill_op);
+    // reset_sink_complete: reset sink_complete state. sometimes if operator sink has complete we don't have to reset sink state
+    [[nodiscard]] Status reset_state(RuntimeState* state, const std::vector<ChunkPtr>& refill_chunks,
+                                     pipeline::Operator* refill_op, bool reset_sink_complete = true);
 
-#ifdef NDEBUG
-    static constexpr size_t two_level_memory_threshold = 33554432; // 32M, L3 Cache
-    static constexpr size_t streaming_hash_table_size_threshold = 10000000;
-#else
-    static constexpr size_t two_level_memory_threshold = 64;
-    static constexpr size_t streaming_hash_table_size_threshold = 4;
-#endif
+    const AggregatorParamsPtr& params() const { return _params; }
+
+    bool is_full() { return _spiller != nullptr && _spiller->is_full(); }
+
+    const std::shared_ptr<spill::Spiller>& spiller() const { return _spiller; }
+    void set_spiller(std::shared_ptr<spill::Spiller> spiller) { _spiller = std::move(spiller); }
+
+    const SpillProcessChannelPtr spill_channel() const { return _spill_channel; }
+    void set_spill_channel(SpillProcessChannelPtr channel) { _spill_channel = std::move(channel); }
+
+    auto& io_executor() { return *spill_channel()->io_executor(); }
+
+    [[nodiscard]] Status spill_aggregate_data(RuntimeState* state, std::function<StatusOr<ChunkPtr>()> chunk_provider);
+
+    bool has_pending_data() const { return _spiller != nullptr && _spiller->has_pending_data(); }
+    bool has_pending_restore() const { return _spiller != nullptr && !_spiller->restore_finished(); }
+    bool is_spilled_eos() const {
+        return _spiller == nullptr || _spiller->spilled_append_rows() == _spiller->restore_read_rows();
+    }
+
+    void set_streaming_all_states(bool streaming_all_states) { _streaming_all_states = streaming_all_states; }
+
+    bool is_streaming_all_states() const { return _streaming_all_states; }
+
     HashTableKeyAllocator _state_allocator;
 
 protected:
@@ -316,8 +401,6 @@ protected:
 
     bool _is_closed = false;
     RuntimeState* _state = nullptr;
-
-    MemTracker* _mem_tracker = nullptr;
 
     ObjectPool* _pool;
     std::unique_ptr<MemPool> _mem_pool;
@@ -334,6 +417,7 @@ protected:
     std::atomic<bool> _is_sink_complete = false;
     // only used in pipeline engine
     std::queue<ChunkPtr> _buffer;
+    std::unique_ptr<pipeline::ChunkBufferMemoryManager> _buffer_mem_manager;
     std::mutex _buffer_mutex;
 
     // Certain aggregates require a finalize step, which is the final step of the
@@ -343,6 +427,7 @@ protected:
     bool _needs_finalize;
     // Indicate whether data of the hash table has been taken out or reach limit
     bool _is_ht_eos = false;
+    std::atomic_bool _streaming_all_states = false;
     bool _is_only_group_by_columns = false;
     // At least one group by column is nullable
     bool _has_nullable_key = false;
@@ -410,11 +495,15 @@ protected:
 
     AggStatistics* _agg_stat;
 
+    std::shared_ptr<spill::Spiller> _spiller;
+    SpillProcessChannelPtr _spill_channel;
+
 public:
     void build_hash_map(size_t chunk_size, bool agg_group_by_with_limit = false);
     void build_hash_map_with_selection(size_t chunk_size);
     void build_hash_map_with_selection_and_allocation(size_t chunk_size, bool agg_group_by_with_limit = false);
-    Status convert_hash_map_to_chunk(int32_t chunk_size, ChunkPtr* chunk);
+    [[nodiscard]] Status convert_hash_map_to_chunk(int32_t chunk_size, ChunkPtr* chunk,
+                                                   bool* use_intermediate_as_output = nullptr);
 
     void build_hash_set(size_t chunk_size);
     void build_hash_set_with_selection(size_t chunk_size);
@@ -437,10 +526,10 @@ protected:
         return _aggr_mode == AM_STREAMING_PRE_CACHE || _aggr_mode == AM_BLOCKING_PRE_CACHE || !_needs_finalize;
     }
 
-    Status _reset_state(RuntimeState* state);
+    [[nodiscard]] Status _reset_state(RuntimeState* state, bool reset_sink_complete);
 
     // initial const columns for i'th FunctionContext.
-    Status _evaluate_const_columns(int i);
+    [[nodiscard]] Status _evaluate_const_columns(int i);
 
     // Create new aggregate function result column by type
     Columns _create_agg_result_columns(size_t num_rows, bool use_intermediate);
@@ -460,8 +549,8 @@ protected:
     void end_pending_reset_state() { _is_pending_reset_state = false; }
     bool is_pending_reset_state() { return _is_pending_reset_state; }
 
-    void _reset_groupby_exprs();
-    Status _evaluate_group_by_exprs(Chunk* chunk);
+    void _reset_exprs();
+    [[nodiscard]] Status _evaluate_group_by_exprs(Chunk* chunk);
 
     // Choose different agg hash map/set by different group by column's count, type, nullable
     template <typename HashVariantType>
@@ -477,35 +566,63 @@ template <class HashMapWithKey>
 inline AggDataPtr AllocateState<HashMapWithKey>::operator()(const typename HashMapWithKey::KeyType& key) {
     AggDataPtr agg_state = aggregator->_state_allocator.allocate();
     *reinterpret_cast<typename HashMapWithKey::KeyType*>(agg_state) = key;
-    for (int i = 0; i < aggregator->_agg_fn_ctxs.size(); i++) {
-        aggregator->_agg_functions[i]->create(aggregator->_agg_fn_ctxs[i],
-                                              agg_state + aggregator->_agg_states_offsets[i]);
+    size_t created = 0;
+    size_t aggregate_function_sz = aggregator->_agg_fn_ctxs.size();
+    try {
+        for (int i = 0; i < aggregate_function_sz; i++) {
+            aggregator->_agg_functions[i]->create(aggregator->_agg_fn_ctxs[i],
+                                                  agg_state + aggregator->_agg_states_offsets[i]);
+            created++;
+        }
+        return agg_state;
+    } catch (std::bad_alloc& e) {
+        for (size_t i = 0; i < created; ++i) {
+            aggregator->_agg_functions[i]->destroy(aggregator->_agg_fn_ctxs[i],
+                                                   agg_state + aggregator->_agg_states_offsets[i]);
+        }
+        aggregator->_state_allocator.rollback();
+        throw;
     }
-    return agg_state;
 }
 
 template <class HashMapWithKey>
 inline AggDataPtr AllocateState<HashMapWithKey>::operator()(std::nullptr_t) {
     AggDataPtr agg_state = aggregator->_state_allocator.allocate_null_key_data();
-    for (int i = 0; i < aggregator->_agg_fn_ctxs.size(); i++) {
-        aggregator->_agg_functions[i]->create(aggregator->_agg_fn_ctxs[i],
-                                              agg_state + aggregator->_agg_states_offsets[i]);
+    size_t created = 0;
+    size_t aggregate_function_sz = aggregator->_agg_fn_ctxs.size();
+    try {
+        for (int i = 0; i < aggregate_function_sz; i++) {
+            aggregator->_agg_functions[i]->create(aggregator->_agg_fn_ctxs[i],
+                                                  agg_state + aggregator->_agg_states_offsets[i]);
+            created++;
+        }
+        return agg_state;
+    } catch (std::bad_alloc& e) {
+        for (int i = 0; i < created; i++) {
+            aggregator->_agg_functions[i]->destroy(aggregator->_agg_fn_ctxs[i],
+                                                   agg_state + aggregator->_agg_states_offsets[i]);
+        }
+        throw;
     }
-    return agg_state;
+}
+
+inline bool LimitedMemAggState::has_limited(const Aggregator& aggregator) const {
+    return limited_memory_size > 0 && aggregator.memory_usage() >= limited_memory_size;
 }
 
 template <class T>
 class AggregatorFactoryBase {
 public:
     using Ptr = std::shared_ptr<T>;
-    AggregatorFactoryBase(const TPlanNode& tnode) : _tnode(tnode) {}
+    AggregatorFactoryBase(const TPlanNode& tnode)
+            : _tnode(tnode), _aggregator_param(convert_to_aggregator_params(_tnode)) {}
 
     Ptr get_or_create(size_t id) {
         auto it = _aggregators.find(id);
         if (it != _aggregators.end()) {
             return it->second;
         }
-        auto aggregator = std::make_shared<T>(convert_to_aggregator_params(_tnode));
+        auto aggregator = std::make_shared<T>(_aggregator_param);
         aggregator->set_aggr_mode(_aggr_mode);
         _aggregators[id] = aggregator;
         return aggregator;
@@ -513,8 +630,14 @@ public:
 
     void set_aggr_mode(AggrMode aggr_mode) { _aggr_mode = aggr_mode; }
 
+    const AggregatorParamsPtr& aggregator_param() { return _aggregator_param; }
+
+    const TPlanNode& t_node() { return _tnode; }
+    const AggrMode aggr_mode() { return _aggr_mode; }
+
 private:
     const TPlanNode& _tnode;
+    AggregatorParamsPtr _aggregator_param;
     std::unordered_map<size_t, Ptr> _aggregators;
     AggrMode _aggr_mode = AggrMode::AM_DEFAULT;
 };
@@ -522,6 +645,7 @@ private:
 using AggregatorFactory = AggregatorFactoryBase<Aggregator>;
 using AggregatorFactoryPtr = std::shared_ptr<AggregatorFactory>;
 
+using SortedStreamingAggregatorPtr = std::shared_ptr<SortedStreamingAggregator>;
 using StreamingAggregatorFactory = AggregatorFactoryBase<SortedStreamingAggregator>;
 using StreamingAggregatorFactoryPtr = std::shared_ptr<StreamingAggregatorFactory>;
 

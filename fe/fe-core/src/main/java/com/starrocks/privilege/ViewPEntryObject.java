@@ -20,43 +20,49 @@ import com.starrocks.catalog.Table;
 import com.starrocks.server.GlobalStateMgr;
 
 import java.util.List;
+import java.util.Objects;
 
 /**
  * View is a subclass of table, only the table type is different
  */
 public class ViewPEntryObject extends TablePEntryObject {
-    protected ViewPEntryObject(long databaseId, long tableId) {
-        super(databaseId, tableId);
+    protected ViewPEntryObject(String dbUUID, String tblUUID) {
+        super(dbUUID, tblUUID);
     }
 
     public static ViewPEntryObject generate(GlobalStateMgr mgr, List<String> tokens) throws PrivilegeException {
         if (tokens.size() != 2) {
             throw new PrivilegeException("invalid object tokens, should have two: " + tokens);
         }
-        long dbId;
-        long tableId;
+        String dbUUID;
+        String tblUUID;
 
-        if (tokens.get(0).equals("*")) {
-            dbId = ALL_DATABASE_ID;
-            tableId = ALL_TABLES_ID;
+        if (Objects.equals(tokens.get(0), "*")) {
+            dbUUID = PrivilegeBuiltinConstants.ALL_DATABASES_UUID;
+            tblUUID = PrivilegeBuiltinConstants.ALL_TABLES_UUID;
         } else {
             Database database = mgr.getDb(tokens.get(0));
             if (database == null) {
                 throw new PrivObjNotFoundException("cannot find db: " + tokens.get(0));
             }
-            dbId = database.getId();
+            dbUUID = database.getUUID();
 
-            if (tokens.get(1).equals("*")) {
-                tableId = ALL_TABLES_ID;
+            if (Objects.equals(tokens.get(1), "*")) {
+                tblUUID = PrivilegeBuiltinConstants.ALL_TABLES_UUID;
             } else {
                 Table table = database.getTable(tokens.get(1));
-                if (table == null || !table.getType().equals(Table.TableType.VIEW)) {
+                if (table == null || !table.isView()) {
                     throw new PrivObjNotFoundException("cannot find view " + tokens.get(1) + " in db " + tokens.get(0));
                 }
-                tableId = table.getId();
+                tblUUID = table.getUUID();
             }
         }
 
-        return new ViewPEntryObject(dbId, tableId);
+        return new ViewPEntryObject(dbUUID, tblUUID);
+    }
+
+    @Override
+    public String toString() {
+        return toStringImpl("VIEWS");
     }
 }

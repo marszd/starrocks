@@ -17,7 +17,6 @@ package com.starrocks.sql.ast;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-import com.starrocks.analysis.ColumnDef;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.catalog.Column;
@@ -26,6 +25,8 @@ import com.starrocks.catalog.PartitionInfo;
 import com.starrocks.catalog.PartitionType;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
+import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -46,8 +47,17 @@ public class ListPartitionDesc extends PartitionDesc {
 
     private final List<String> partitionColNames;
 
+    // for automatic partition table is ture. otherwise is false
+    protected boolean isAutoPartitionTable = false;
+
     public ListPartitionDesc(List<String> partitionColNames,
                              List<PartitionDesc> partitionDescs) {
+        this(partitionColNames, partitionDescs, NodePosition.ZERO);
+    }
+
+    public ListPartitionDesc(List<String> partitionColNames,
+                             List<PartitionDesc> partitionDescs, NodePosition pos) {
+        super(pos);
         super.type = PartitionType.LIST;
         this.partitionColNames = partitionColNames;
         this.singleListPartitionDescs = Lists.newArrayList();
@@ -61,6 +71,21 @@ public class ListPartitionDesc extends PartitionDesc {
                 }
             }
         }
+    }
+
+    public List<PartitionDesc> getPartitionDescs() {
+        List<PartitionDesc> partitionDescs = Lists.newArrayList();
+        if (singleListPartitionDescs != null) {
+            partitionDescs.addAll(singleListPartitionDescs);
+        }
+        if (multiListPartitionDescs != null) {
+            partitionDescs.addAll(multiListPartitionDescs);
+        }
+        return partitionDescs;
+    }
+
+    public List<String> getPartitionColNames() {
+        return partitionColNames;
     }
 
     public List<String> findAllPartitionNames() {
@@ -86,7 +111,7 @@ public class ListPartitionDesc extends PartitionDesc {
         this.analyzeMultiListPartition(tableProperties, columnDefList);
     }
 
-    private List<ColumnDef> analyzePartitionColumns(List<ColumnDef> columnDefs) throws AnalysisException {
+    public List<ColumnDef> analyzePartitionColumns(List<ColumnDef> columnDefs) throws AnalysisException {
         if (this.partitionColNames == null || this.partitionColNames.isEmpty()) {
             throw new AnalysisException("No partition columns.");
         }
@@ -99,7 +124,8 @@ public class ListPartitionDesc extends PartitionDesc {
             boolean found = false;
             for (ColumnDef columnDef : columnDefs) {
                 if (columnDef.getName().equals(partitionCol)) {
-                    if (columnDef.getType().isFloatingPointType() || columnDef.getType().isComplexType()) {
+                    if (columnDef.getType().isFloatingPointType() || columnDef.getType().isComplexType()
+                            || columnDef.getType().isDecimalOfAnyVersion()) {
                         throw new AnalysisException(String.format("Invalid partition column '%s': %s",
                                 columnDef.getName(), "invalid data type " + columnDef.getType()));
                     }
@@ -117,6 +143,65 @@ public class ListPartitionDesc extends PartitionDesc {
             }
         }
         return partitionColumns;
+    }
+
+    public void analyzeExternalPartitionColumns(List<ColumnDef> columnDefs, String engineName) {
+        if (this.partitionColNames == null || this.partitionColNames.isEmpty()) {
+            throw new SemanticException("No partition columns.");
+        }
+        List<ColumnDef> partitionColumns = new ArrayList<>(this.partitionColNames.size());
+        Set<String> partColNames = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
+        for (String partitionCol : this.partitionColNames) {
+            if (!partColNames.add(partitionCol)) {
+                throw new SemanticException("Duplicated partition column " + partitionCol);
+            }
+            boolean found = false;
+            for (ColumnDef columnDef : columnDefs) {
+                if (columnDef.getName().equals(partitionCol)) {
+                    if (columnDef.getType().isFloatingPointType() || columnDef.getType().isComplexType()
+                            || columnDef.getType().isDecimalOfAnyVersion()) {
+                        throw new SemanticException(String.format("Invalid partition column '%s': %s",
+                                columnDef.getName(), "invalid data type " + columnDef.getType()));
+                    }
+                    found = true;
+                    partitionColumns.add(columnDef);
+                    break;
+                }
+            }
+            if (!found) {
+                throw new SemanticException("Partition column[" + partitionCol + "] does not exist in column list.");
+            }
+        }
+
+        if (engineName.equalsIgnoreCase("iceberg")) {
+            checkIcebergPartitionColPos(columnDefs);
+        } else if (engineName.equalsIgnoreCase("hive")) {
+            checkHivePartitionColPos(columnDefs);
+        }
+    }
+
+    public void checkIcebergPartitionColPos(List<ColumnDef> columnDefs) {
+        for (int i = 0; i < columnDefs.size() - partitionColNames.size(); i++) {
+            String colName = columnDefs.get(i).getName();
+            if (partitionColNames.contains(colName)) {
+                throw new SemanticException("Partition columns must be at the end of column defs");
+            }
+        }
+    }
+
+    public void checkHivePartitionColPos(List<ColumnDef> columnDefs) {
+        List<String> allColNames = columnDefs.stream()
+                .map(ColumnDef::getName)
+                .collect(Collectors.toList());
+
+        if (allColNames.size() == partitionColNames.size()) {
+            throw new SemanticException("Table contains only partition columns");
+        }
+
+        if (!allColNames.subList(allColNames.size() - partitionColNames.size(), allColNames.size()).equals(partitionColNames)) {
+            throw new SemanticException("Partition columns must be the last columns in the table and " +
+                    "in the same order as partition by clause: %s", partitionColNames);
+        }
     }
 
     private void analyzeMultiListPartition(Map<String, String> tableProperties,
@@ -197,8 +282,7 @@ public class ListPartitionDesc extends PartitionDesc {
     }
 
     @Override
-    public PartitionInfo toPartitionInfo(List<Column> columns, Map<String, Long> partitionNameToId,
-                                         boolean isTemp, boolean isExprPartition)
+    public PartitionInfo toPartitionInfo(List<Column> columns, Map<String, Long> partitionNameToId, boolean isTemp)
             throws DdlException {
         try {
             List<Column> partitionColumns = this.findPartitionColumns(columns);
@@ -212,6 +296,7 @@ public class ListPartitionDesc extends PartitionDesc {
                 listPartitionInfo.setValues(partitionId, desc.getValues());
                 listPartitionInfo.setLiteralExprValues(partitionId, desc.getValues());
                 listPartitionInfo.setIdToIsTempPartition(partitionId, isTemp);
+                listPartitionInfo.setStorageCacheInfo(partitionId, desc.getDataCacheInfo());
             }
             for (MultiItemListPartitionDesc desc : this.multiListPartitionDescs) {
                 long partitionId = partitionNameToId.get(desc.getPartitionName());
@@ -222,7 +307,9 @@ public class ListPartitionDesc extends PartitionDesc {
                 listPartitionInfo.setMultiValues(partitionId, desc.getMultiValues());
                 listPartitionInfo.setMultiLiteralExprValues(partitionId, desc.getMultiValues());
                 listPartitionInfo.setIdToIsTempPartition(partitionId, isTemp);
+                listPartitionInfo.setStorageCacheInfo(partitionId, desc.getDataCacheInfo());
             }
+            listPartitionInfo.setAutomaticPartition(isAutoPartitionTable);
             return listPartitionInfo;
         } catch (AnalysisException e) {
             throw new DdlException(e.getMessage(), e);
@@ -240,6 +327,16 @@ public class ListPartitionDesc extends PartitionDesc {
             }
         }
         return partitionColumns;
+    }
+
+
+
+    public boolean isAutoPartitionTable() {
+        return isAutoPartitionTable;
+    }
+
+    public void setAutoPartitionTable(boolean autoPartitionTable) {
+        isAutoPartitionTable = autoPartitionTable;
     }
 
     @Override

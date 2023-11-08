@@ -61,8 +61,9 @@ public:
             generate_desc_tuple(slot_info, &desc_tbl_builder);
         }
         DescriptorTbl* desc_tbl = nullptr;
-        DescriptorTbl::create(runtime_state, &obj_pool, desc_tbl_builder.desc_tbl(), &desc_tbl,
-                              config::vector_chunk_size);
+        auto st = DescriptorTbl::create(runtime_state, &obj_pool, desc_tbl_builder.desc_tbl(), &desc_tbl,
+                                        config::vector_chunk_size);
+        st.permit_unchecked_error();
         return desc_tbl;
     }
 
@@ -73,7 +74,7 @@ public:
             SlotTypeDescInfoArray slot_type_desc_infos;
             for (auto slot_info : slot_info_array) {
                 slot_type_desc_infos.emplace_back(std::get<0>(slot_info),
-                                                  TypeDescriptor::from_primtive_type(std::get<1>(slot_info)),
+                                                  TypeDescriptor::from_logical_type(std::get<1>(slot_info)),
                                                   std::get<2>(slot_info));
             }
             slot_type_desc_info_arrays.emplace_back(std::move(slot_type_desc_infos));

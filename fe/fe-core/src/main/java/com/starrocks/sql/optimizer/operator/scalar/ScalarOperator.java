@@ -14,10 +14,13 @@
 
 package com.starrocks.sql.optimizer.operator.scalar;
 
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.starrocks.catalog.Type;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 
+import java.util.Collections;
 import java.util.List;
 
 import static java.util.Objects.requireNonNull;
@@ -29,6 +32,15 @@ public abstract class ScalarOperator implements Cloneable {
     protected boolean notEvalEstimate = false;
     // Used to determine if it is derive from predicate range extractor
     protected boolean fromPredicateRangeDerive = false;
+    // Check weather the scalar operator is redundant which will not affect the final
+    // if it's not considered. eg, `IsNullPredicateOperator` which is pushed down
+    // from JoinNode.
+    protected boolean isRedundant = false;
+
+    // whether the ScalarOperator is pushdown from equivalence derivation
+    protected boolean isPushdown = false;
+
+    private List<String> hints = Collections.emptyList();
 
     public ScalarOperator(OperatorType opType, Type type) {
         this.opType = requireNonNull(opType, "opType is null");
@@ -48,6 +60,14 @@ public abstract class ScalarOperator implements Cloneable {
         }
 
         return true;
+    }
+
+    public boolean isTrue() {
+        return this.equals(ConstantOperator.TRUE);
+    }
+
+    public boolean isFalse() {
+        return this.equals(ConstantOperator.FALSE);
     }
 
     public abstract boolean isNullable();
@@ -105,6 +125,13 @@ public abstract class ScalarOperator implements Cloneable {
     @Override
     public abstract boolean equals(Object other);
 
+    /**
+     * equivalent means logical equals, but may physical different, such as with different id
+     */
+    public boolean equivalent(Object other) {
+        return equals(other);
+    }
+
     public abstract <R, C> R accept(ScalarOperatorVisitor<R, C> visitor, C context);
 
     // Default Shallow Clone for ConstantOperator and ColumnRefOperator
@@ -113,6 +140,9 @@ public abstract class ScalarOperator implements Cloneable {
         ScalarOperator operator = null;
         try {
             operator = (ScalarOperator) super.clone();
+            operator.hints = Lists.newArrayList(hints);
+            operator.isRedundant = this.isRedundant;
+            operator.isPushdown = this.isPushdown;
         } catch (CloneNotSupportedException ignored) {
         }
         return operator;
@@ -123,6 +153,18 @@ public abstract class ScalarOperator implements Cloneable {
      * For a + b, the used columns are a and b.
      */
     public abstract ColumnRefSet getUsedColumns();
+
+    public List<ColumnRefOperator> getColumnRefs() {
+        List<ColumnRefOperator> columns = Lists.newArrayList();
+        getColumnRefs(columns);
+        return columns;
+    }
+
+    public void getColumnRefs(List<ColumnRefOperator> columns) {
+        for (ScalarOperator child : getChildren()) {
+            child.getColumnRefs(columns);
+        }
+    }
 
     public String debugString() {
         return toString();
@@ -138,5 +180,84 @@ public abstract class ScalarOperator implements Cloneable {
 
     public boolean isConstantNull() {
         return this instanceof ConstantOperator && ((ConstantOperator) this).isNull();
+    }
+
+    public boolean isConstantZero() {
+        return this instanceof ConstantOperator && ((ConstantOperator) this).isZero();
+    }
+
+    public boolean isConstantFalse() {
+        return this instanceof ConstantOperator && this.getType() == Type.BOOLEAN &&
+                !((ConstantOperator) this).getBoolean();
+    }
+
+    public boolean isConstantTrue() {
+        return this instanceof ConstantOperator && this.getType() == Type.BOOLEAN &&
+                ((ConstantOperator) this).getBoolean();
+    }
+
+    public boolean isConstantNullOrFalse() {
+        return isConstantNull() || isConstantFalse();
+    }
+
+    public void setHints(List<String> hints) {
+        this.hints = hints;
+    }
+
+    public List<String> getHints() {
+        return hints;
+    }
+
+    public boolean isRedundant() {
+        return isRedundant;
+    }
+
+    public void setRedundant(boolean redundant) {
+        isRedundant = redundant;
+    }
+
+    public boolean isPushdown() {
+        return isPushdown;
+    }
+
+    public void setIsPushdown(boolean isPushdown) {
+        this.isPushdown = isPushdown;
+    }
+
+    // whether ScalarOperator are equals without id
+    public static boolean isEquivalent(ScalarOperator left, ScalarOperator right) {
+        if (!left.getOpType().equals(right.getOpType())) {
+            return false;
+        }
+
+        boolean ret = left.equivalent(right);
+        if (!ret) {
+            return false;
+        }
+        Preconditions.checkState(left.getChildren().size() == right.getChildren().size());
+        for (int i = 0; i < left.getChildren().size(); i++) {
+            if (!isEquivalent(left.getChild(i), right.getChild(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public static boolean isColumnEqualBinaryPredicate(ScalarOperator predicate) {
+        if (predicate instanceof BinaryPredicateOperator) {
+            BinaryPredicateOperator binaryPredicate = (BinaryPredicateOperator) predicate;
+            return binaryPredicate.getBinaryType().isEquivalence()
+                    && binaryPredicate.getChild(0).isColumnRef() && binaryPredicate.getChild(1).isColumnRef();
+        }
+        return false;
+    }
+
+    public static boolean isColumnEqualConstant(ScalarOperator predicate) {
+        if (predicate instanceof BinaryPredicateOperator) {
+            BinaryPredicateOperator binaryPredicate = (BinaryPredicateOperator) predicate;
+            return binaryPredicate.getBinaryType().isEquivalence()
+                    && binaryPredicate.getChild(0).isColumnRef() && binaryPredicate.getChild(1).isConstantRef();
+        }
+        return false;
     }
 }

@@ -17,6 +17,7 @@ package com.starrocks.connector.jdbc;
 
 import com.google.common.collect.Lists;
 import com.mockrunner.mock.jdbc.MockResultSet;
+import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.JDBCResource;
 import com.starrocks.catalog.JDBCTable;
@@ -29,6 +30,7 @@ import org.junit.Test;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.util.Arrays;
@@ -86,7 +88,7 @@ public class PostgresSchemaResolverTest {
             }
         };
         try {
-            JDBCMetadata jdbcMetadata = new JDBCMetadata(properties);
+            JDBCMetadata jdbcMetadata = new JDBCMetadata(properties, "catalog");
             List<String> result = jdbcMetadata.listDbNames();
             List<String> expectResult = Lists.newArrayList("postgres", "template1", "test");
             Assert.assertEquals(expectResult, result);
@@ -109,7 +111,7 @@ public class PostgresSchemaResolverTest {
             }
         };
         try {
-            JDBCMetadata jdbcMetadata = new JDBCMetadata(properties);
+            JDBCMetadata jdbcMetadata = new JDBCMetadata(properties, "catalog");
             Database db = jdbcMetadata.getDb("test");
             Assert.assertEquals("test", db.getOriginName());
         } catch (Exception e) {
@@ -136,7 +138,7 @@ public class PostgresSchemaResolverTest {
             }
         };
         try {
-            JDBCMetadata jdbcMetadata = new JDBCMetadata(properties);
+            JDBCMetadata jdbcMetadata = new JDBCMetadata(properties, "catalog");
             List<String> result = jdbcMetadata.listTableNames("test");
             List<String> expectResult = Lists.newArrayList("tbl1", "tbl2", "tbl3");
             Assert.assertEquals(expectResult, result);
@@ -163,9 +165,18 @@ public class PostgresSchemaResolverTest {
             }
         };
         try {
-            JDBCMetadata jdbcMetadata = new JDBCMetadata(properties);
+            JDBCMetadata jdbcMetadata = new JDBCMetadata(properties, "catalog");
             Table table = jdbcMetadata.getTable("test", "tbl1");
             Assert.assertTrue(table instanceof JDBCTable);
+            Assert.assertEquals("catalog.test.tbl1", table.getUUID());
+            Assert.assertEquals("tbl1", table.getName());
+            Assert.assertNull(properties.get(JDBCTable.JDBC_TABLENAME));
+            PostgresSchemaResolver postgresSchemaResolver = new PostgresSchemaResolver();
+            ResultSet columnSet = postgresSchemaResolver.getColumns(connection, "test", "tbl1");
+            List<Column> fullSchema = postgresSchemaResolver.convertToSRTable(columnSet);
+            Table table1 = postgresSchemaResolver.getTable(1, "tbl1", fullSchema, "test", "catalog", properties);
+            Assert.assertTrue(table1 instanceof JDBCTable);
+            Assert.assertNull(properties.get(JDBCTable.JDBC_TABLENAME));
         } catch (Exception e) {
             System.out.println(e.getMessage());
             Assert.fail();

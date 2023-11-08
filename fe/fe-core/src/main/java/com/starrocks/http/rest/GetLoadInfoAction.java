@@ -40,13 +40,11 @@ import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
-import com.starrocks.http.UnauthorizedException;
 import com.starrocks.load.Load;
-import com.starrocks.mysql.privilege.PrivPredicate;
-import com.starrocks.privilege.PrivilegeManager;
+import com.starrocks.privilege.AccessDeniedException;
 import com.starrocks.privilege.PrivilegeType;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Authorizer;
 import io.netty.handler.codec.http.HttpMethod;
 
 // Get load information of one load job
@@ -63,7 +61,7 @@ public class GetLoadInfoAction extends RestBaseAction {
 
     @Override
     public void executeWithoutPassword(BaseRequest request, BaseResponse response)
-            throws DdlException {
+            throws DdlException, AccessDeniedException {
         Load.JobInfo info = new Load.JobInfo(request.getSingleParameter(DB_KEY),
                 request.getSingleParameter(LABEL_KEY));
         if (Strings.isNullOrEmpty(info.dbName)) {
@@ -78,25 +76,16 @@ public class GetLoadInfoAction extends RestBaseAction {
         }
 
         if (info.tblNames.isEmpty()) {
-            if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-                if (!PrivilegeManager.checkActionInDb(ConnectContext.get(), info.dbName, "INSERT")) {
-                    throw new UnauthorizedException(
-                            "Access denied; you need (at least one of) the INSERT privilege(s) for this operation");
-                }
-            } else {
-                checkDbAuth(ConnectContext.get().getCurrentUserIdentity(), info.dbName, PrivPredicate.LOAD);
-            }
+            Authorizer.checkActionInDb(ConnectContext.get().getCurrentUserIdentity(),
+                    ConnectContext.get().getCurrentRoleIds(), info.dbName, PrivilegeType.INSERT);
         } else {
             for (String tblName : info.tblNames) {
-                if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-                    checkTableAction(ConnectContext.get(), info.dbName, tblName, PrivilegeType.INSERT);
-                } else {
-                    checkTblAuth(ConnectContext.get().getCurrentUserIdentity(), info.dbName, tblName,
-                            PrivPredicate.LOAD);
-                }
+                Authorizer.checkTableAction(
+                        ConnectContext.get().getCurrentUserIdentity(), ConnectContext.get().getCurrentRoleIds(),
+                        info.dbName, tblName, PrivilegeType.INSERT);
             }
         }
-        globalStateMgr.getLoadManager().getLoadJobInfo(info);
+        globalStateMgr.getLoadMgr().getLoadJobInfo(info);
 
         sendResult(request, response, new Result(info));
     }

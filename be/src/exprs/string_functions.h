@@ -46,7 +46,7 @@ struct ConcatState {
     std::string tail;
 };
 
-class StringFunctionsState;
+struct StringFunctionsState;
 
 struct MatchInfo {
     size_t from;
@@ -55,7 +55,6 @@ struct MatchInfo {
 
 struct MatchInfoChain {
     std::vector<MatchInfo> info_chain;
-    unsigned long long last_to = 0;
 };
 
 class StringFunctions {
@@ -288,11 +287,26 @@ public:
     static Status split_close(FunctionContext* context, FunctionContext::FunctionStateScope scope);
 
     /**
+    * @param: [array_string, delimiter]
+    * @paramType: [ArrayBinaryColumn, BinaryColumn]
+    * @return: MapColumn map<string,string>
+    */
+
+    DEFINE_VECTORIZED_FN(str_to_map);
+
+    /**
      * @param: [string_value, delimiter, field]
      * @paramType: [BinaryColumn, BinaryColumn, IntColumn]
      * @return: BinaryColumn
      */
     DEFINE_VECTORIZED_FN(split_part);
+
+    /**
+     * @param: [string_value, delimiter, field]
+     * @paramType: [BinaryColumn, BinaryColumn, IntColumn]
+     * @return: BinaryColumn
+     */
+    DEFINE_VECTORIZED_FN(substring_index);
 
     // regex method
     static Status regexp_extract_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope);
@@ -300,18 +314,44 @@ public:
     static Status regexp_close(FunctionContext* context, FunctionContext::FunctionStateScope scope);
 
     /**
-     * @param: [string_value, pattern_value, index_value
+     * @param: [string_value, pattern_value, index_value]
      * @paramType: [BinaryColumn, BinaryColumn, Int64Column]
      * @return: BinaryColumn
      */
     DEFINE_VECTORIZED_FN(regexp_extract);
 
     /**
-     * @param: [string_value, pattern_value, replace_value
+     * return all match sub-string
+     * @param: [string_value, pattern_value]
+     * @paramType: [BinaryColumn, BinaryColumn]
+     * @return: Array<BinaryColumn>
+     */
+    DEFINE_VECTORIZED_FN(regexp_extract_all);
+
+    /**
+     * @param: [string_value, pattern_value, replace_value]
      * @paramType: [BinaryColumn, BinaryColumn, BinaryColumn]
      * @return: BinaryColumn
      */
     DEFINE_VECTORIZED_FN(regexp_replace);
+
+    /**
+     * @param: [string_value, pattern_value, replace_value]
+     * @paramType: [BinaryColumn, BinaryColumn, BinaryColumn]
+     * @return: BinaryColumn
+     */
+    DEFINE_VECTORIZED_FN(replace);
+    static Status replace_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope);
+    static Status replace_close(FunctionContext* context, FunctionContext::FunctionStateScope scope);
+
+    /**
+     * @param: [string_value, from_value, to_value]
+     * @paramType: [BinaryColumn, BinaryColumn, BinaryColumn]
+     * @return: BinaryColumn
+     */
+    DEFINE_VECTORIZED_FN(translate);
+    static Status translate_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope);
+    static Status translate_close(FunctionContext* context, FunctionContext::FunctionStateScope scope);
 
     /**
      * @param: [DOUBLE]
@@ -354,6 +394,10 @@ public:
 
     static Status sub_str_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope);
 
+    static Status url_extract_parameter_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope);
+
+    static Status url_extract_parameter_close(FunctionContext* context, FunctionContext::FunctionStateScope scope);
+
     static Status sub_str_close(FunctionContext* context, FunctionContext::FunctionStateScope scope);
 
     static Status left_or_right_prepare(FunctionContext* context, FunctionContext::FunctionStateScope scope);
@@ -376,6 +420,10 @@ public:
    * @return: BinaryColumn
    */
     DEFINE_VECTORIZED_FN(parse_url);
+
+    DEFINE_VECTORIZED_FN(url_extract_parameter);
+
+    DEFINE_VECTORIZED_FN(url_extract_host);
 
     /**
      * @param: [BigIntColumn]
@@ -414,6 +462,26 @@ public:
      */
     DEFINE_VECTORIZED_FN(strcmp);
 
+    /**
+     * params are one strings. Returns string for url encode string,
+     *
+     * @param: [string_value]
+     * @paramType: [StringColumn]
+     * @return: StringColumn
+     */
+    DEFINE_VECTORIZED_FN(url_encode);
+    static std::string url_encode_func(const std::string& value);
+
+    /**
+     * params are one strings. Returns string for url decode string,
+     *
+     * @param: [string_value]
+     * @paramType: [StringColumn]
+     * @return: StringColumn
+     */
+    DEFINE_VECTORIZED_FN(url_decode);
+    static std::string url_decode_func(const std::string& value);
+
     static inline char _DUMMY_STRING_FOR_EMPTY_PATTERN = 'A';
 
 private:
@@ -446,9 +514,17 @@ private:
         ParseUrlState() : url_part() {}
     };
 
+    struct UrlExtractParameterState {
+        std::optional<std::string> opt_const_result;
+        bool result_is_null{false};
+        std::optional<std::string> opt_const_param_key;
+        std::optional<std::string> opt_const_query_params;
+        UrlExtractParameterState() = default;
+    };
+
     static StatusOr<ColumnPtr> parse_url_general(FunctionContext* context, const starrocks::Columns& columns);
-    static StatusOr<ColumnPtr> parse_url_const(UrlParser::UrlPart* url_part, FunctionContext* context,
-                                               const starrocks::Columns& columns);
+    static StatusOr<ColumnPtr> parse_const_urlpart(UrlParser::UrlPart* url_part, FunctionContext* context,
+                                                   const starrocks::Columns& columns);
 
     template <LogicalType Type, bool scale_up, bool check_overflow>
     static inline void money_format_decimal_impl(FunctionContext* context, ColumnViewer<Type> const& money_viewer,
@@ -495,7 +571,7 @@ template <LogicalType Type>
 StatusOr<ColumnPtr> StringFunctions::money_format_decimal(FunctionContext* context, const starrocks::Columns& columns) {
     RETURN_IF_COLUMNS_ONLY_NULL(columns);
     using CppType = RunTimeCppType<Type>;
-    static_assert(pt_is_decimal<Type>, "Invalid decimal type");
+    static_assert(lt_is_decimal<Type>, "Invalid decimal type");
     auto money_viewer = ColumnViewer<Type>(columns[0]);
     const auto& type = context->get_arg_type(0);
     int scale = type->scale;

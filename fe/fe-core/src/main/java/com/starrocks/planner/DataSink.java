@@ -34,9 +34,12 @@
 
 package com.starrocks.planner;
 
+import com.starrocks.catalog.HiveTable;
+import com.starrocks.catalog.IcebergTable;
 import com.starrocks.catalog.MysqlTable;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.TableFunctionTable;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
 import com.starrocks.thrift.TDataSink;
@@ -89,14 +92,25 @@ public abstract class DataSink {
 
     public static boolean canTableSinkUsePipeline(Table table) {
         if (table instanceof OlapTable) {
-            return Config.enable_pipeline_load;
+            return true;
         } else if (table instanceof MysqlTable) {
             return true;
+        } else if (table instanceof IcebergTable) {
+            return true;
+        } else if (table instanceof HiveTable) {
+            return true;
+        } else if (table instanceof TableFunctionTable) {
+            return true;
         }
+
         return false;
     }
 
     public boolean canUsePipeLine() {
+        return true;
+    }
+
+    public boolean canUseRuntimeAdaptiveDop() {
         return false;
     }
 }

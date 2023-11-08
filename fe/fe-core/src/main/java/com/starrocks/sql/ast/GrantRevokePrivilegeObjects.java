@@ -15,8 +15,10 @@
 
 package com.starrocks.sql.ast;
 
+import com.starrocks.analysis.FunctionName;
 import com.starrocks.analysis.ParseNode;
-import com.starrocks.analysis.UserIdentity;
+import com.starrocks.common.Pair;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.util.List;
 
@@ -27,13 +29,19 @@ public class GrantRevokePrivilegeObjects implements ParseNode {
     //UnResolved AST used in syntax grantImpersonate
     private List<UserIdentity> userPrivilegeObjectList;
 
-    //UnResolved AST used in syntax grantOnAll
-    private boolean isAllDB;
-    private String dbName;
-
     //UnResolved AST used in syntax grantPrivWithFunc
-    private FunctionArgsDef functionArgsDef;
-    private String functionName;
+    private List<Pair<FunctionName, FunctionArgsDef>> functions;
+
+    private final NodePosition pos;
+
+    public GrantRevokePrivilegeObjects() {
+        this(NodePosition.ZERO);
+    }
+
+    public GrantRevokePrivilegeObjects(NodePosition pos) {
+        this.pos = pos;
+    }
+
 
     public List<List<String>> getPrivilegeObjectNameTokensList() {
         return privilegeObjectNameTokensList;
@@ -51,32 +59,16 @@ public class GrantRevokePrivilegeObjects implements ParseNode {
         this.userPrivilegeObjectList = userPrivilegeObjectList;
     }
 
-    public boolean isAllDB() {
-        return isAllDB;
+    public List<Pair<FunctionName, FunctionArgsDef>> getFunctions() {
+        return functions;
     }
 
-    public String getDbName() {
-        return dbName;
+    public void setFunctions(List<Pair<FunctionName, FunctionArgsDef>> functions) {
+        this.functions = functions;
     }
 
-    public void setAllPrivilegeObject(boolean isAllDB, String dbName) {
-        this.isAllDB = isAllDB;
-        this.dbName = dbName;
-    }
-
-    public String getFunctionName() {
-        return functionName;
-    }
-
-    public void setFunctionName(String functionName) {
-        this.functionName = functionName;
-    }
-
-    public FunctionArgsDef getFunctionArgsDef() {
-        return functionArgsDef;
-    }
-
-    public void setFunctionArgsDef(FunctionArgsDef functionArgsDef) {
-        this.functionArgsDef = functionArgsDef;
+    @Override
+    public NodePosition getPos() {
+        return pos;
     }
 }

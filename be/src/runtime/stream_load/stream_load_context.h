@@ -49,6 +49,7 @@
 #include "runtime/stream_load/load_stream_mgr.h"
 #include "runtime/stream_load/stream_load_executor.h"
 #include "service/backend_options.h"
+#include "util/concurrent_limiter.h"
 #include "util/string_util.h"
 #include "util/time.h"
 #include "util/uid_util.h"
@@ -63,6 +64,7 @@ public:
     explicit KafkaLoadInfo(const TKafkaLoadInfo& t_info)
             : brokers(t_info.brokers),
               topic(t_info.topic),
+              confluent_schema_registry_url(t_info.confluent_schema_registry_url),
               begin_offset(t_info.partition_begin_offset),
               properties(t_info.properties) {
         // The offset(begin_offset) sent from FE is the starting offset,
@@ -83,6 +85,7 @@ public:
 public:
     std::string brokers;
     std::string topic;
+    std::string confluent_schema_registry_url;
 
     // partition -> begin offset, inclusive.
     std::map<int32_t, int64_t> begin_offset;
@@ -148,7 +151,7 @@ public:
 
     ~StreamLoadContext() noexcept {
         if (need_rollback) {
-            _exec_env->stream_load_executor()->rollback_txn(this);
+            (void)_exec_env->stream_load_executor()->rollback_txn(this);
             need_rollback = false;
         }
 
@@ -166,6 +169,8 @@ public:
     void ref() { _refs.fetch_add(1); }
     // If unref() returns true, this object should be delete
     bool unref() { return _refs.fetch_sub(1) == 1; }
+
+    bool check_and_set_http_limiter(ConcurrentLimiter* limiter);
 
 public:
     // 1) Before the stream load receiving thread exits, Fragment may have been destructed.
@@ -196,6 +201,8 @@ public:
     double max_filter_ratio = 0.0;
     int32_t timeout_second = -1;
     AuthInfo auth;
+
+    int64_t log_rejected_record_num = 0;
 
     // the following members control the max progress of a consuming
     // process. if any of them reach, the consuming will finish.
@@ -233,6 +240,7 @@ public:
     int64_t last_active_ts = 0;
 
     std::string error_url;
+    std::string rejected_record_path;
     // if label already be used, set existing job's status here
     // should be RUNNING or FINISHED
     std::string existing_job_status;
@@ -264,6 +272,9 @@ public:
     ByteBufferPtr buffer = nullptr;
 
     TStreamLoadPutRequest request;
+
+    int64_t load_deadline_sec = -1;
+    std::unique_ptr<ConcurrentLimiterGuard> _http_limiter_guard;
 
 public:
     bool is_channel_stream_load_context() { return channel_id != -1; }

@@ -34,14 +34,10 @@
 
 #include "runtime/data_stream_recvr.h"
 
-#include <fmt/format.h>
 #include <util/time.h>
 
 #include <condition_variable>
 #include <deque>
-#include <memory>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include "column/chunk.h"
@@ -53,7 +49,6 @@
 #include "runtime/exec_env.h"
 #include "runtime/sender_queue.h"
 #include "runtime/sorted_chunks_merger.h"
-#include "serde/protobuf_serde.h"
 #include "util/compression/block_compression.h"
 #include "util/debug_util.h"
 #include "util/defer_op.h"
@@ -69,8 +64,8 @@ using std::make_pair;
 
 namespace starrocks {
 
-Status DataStreamRecvr::create_merger(RuntimeState* state, const SortExecExprs* exprs, const std::vector<bool>* is_asc,
-                                      const std::vector<bool>* is_null_first) {
+Status DataStreamRecvr::create_merger(RuntimeState* state, RuntimeProfile* profile, const SortExecExprs* exprs,
+                                      const std::vector<bool>* is_asc, const std::vector<bool>* is_null_first) {
     DCHECK(_is_merging);
     _chunks_merger = std::make_unique<SortedChunksMerger>(state, _keep_order);
     ChunkSuppliers chunk_suppliers;
@@ -94,7 +89,7 @@ Status DataStreamRecvr::create_merger(RuntimeState* state, const SortExecExprs* 
 
     RETURN_IF_ERROR(_chunks_merger->init(chunk_suppliers, chunk_probe_suppliers, chunk_has_suppliers,
                                          &(exprs->lhs_ordering_expr_ctxs()), is_asc, is_null_first));
-    _chunks_merger->set_profile(_profile.get());
+    _chunks_merger->set_profile(profile);
     return Status::OK();
 }
 
@@ -103,7 +98,11 @@ Status DataStreamRecvr::create_merger_for_pipeline(RuntimeState* state, const So
                                                    const std::vector<bool>* is_null_first) {
     DCHECK(_is_merging);
     _chunks_merger = nullptr;
-    _cascade_merger = std::make_unique<CascadeChunkMerger>(state);
+    if (exprs->is_constant_lhs_ordering()) {
+        _cascade_merger = std::make_unique<ConstChunkMerger>(state);
+    } else {
+        _cascade_merger = std::make_unique<CascadeChunkMerger>(state);
+    }
 
     std::vector<ChunkProvider> providers;
     for (SenderQueue* q : _sender_queues) {
@@ -129,9 +128,32 @@ Status DataStreamRecvr::create_merger_for_pipeline(RuntimeState* state, const So
     return Status::OK();
 }
 
+std::vector<merge_path::MergePathChunkProvider> DataStreamRecvr::create_merge_path_chunk_providers() {
+    DCHECK(_is_merging);
+    std::vector<merge_path::MergePathChunkProvider> chunk_providers;
+    for (SenderQueue* q : _sender_queues) {
+        chunk_providers.emplace_back([q](bool only_check_if_has_data, ChunkPtr* chunk, bool* eos) {
+            if (!q->has_chunk()) {
+                return false;
+            }
+
+            if (!only_check_if_has_data) {
+                Chunk* chunk_ptr;
+                if (q->try_get_chunk(&chunk_ptr)) {
+                    chunk->reset(chunk_ptr);
+                } else {
+                    *eos = true;
+                }
+            }
+            return true;
+        });
+    }
+    return chunk_providers;
+}
+
 DataStreamRecvr::DataStreamRecvr(DataStreamMgr* stream_mgr, RuntimeState* runtime_state, const RowDescriptor& row_desc,
                                  const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id, int num_senders,
-                                 bool is_merging, int total_buffer_limit, std::shared_ptr<RuntimeProfile> profile,
+                                 bool is_merging, int total_buffer_limit,
                                  std::shared_ptr<QueryStatisticsRecvr> sub_plan_query_statistics_recvr,
                                  bool is_pipeline, int32_t degree_of_parallelism, bool keep_order,
                                  PassThroughChunkBuffer* pass_through_chunk_buffer)
@@ -142,49 +164,55 @@ DataStreamRecvr::DataStreamRecvr(DataStreamMgr* stream_mgr, RuntimeState* runtim
           _row_desc(row_desc),
           _is_merging(is_merging),
           _num_buffered_bytes(0),
-          _profile(std::move(profile)),
           _instance_profile(runtime_state->runtime_profile_ptr()),
           _query_mem_tracker(runtime_state->query_mem_tracker_ptr()),
           _instance_mem_tracker(runtime_state->instance_mem_tracker_ptr()),
           _sub_plan_query_statistics_recvr(std::move(sub_plan_query_statistics_recvr)),
           _is_pipeline(is_pipeline),
-          _degree_of_parallelism(degree_of_parallelism),
           _keep_order(keep_order),
           _pass_through_context(pass_through_chunk_buffer, fragment_instance_id, dest_node_id) {
     // Create one queue per sender if is_merging is true.
     int num_queues = is_merging ? num_senders : 1;
     _sender_queues.reserve(num_queues);
     int num_sender_per_queue = is_merging ? 1 : num_senders;
+    DCHECK_GE(degree_of_parallelism, 1);
     for (int i = 0; i < num_queues; ++i) {
         SenderQueue* queue = nullptr;
         if (_is_pipeline) {
             queue = _sender_queue_pool.add(
-                    new PipelineSenderQueue(this, num_sender_per_queue, _is_merging ? 1 : _degree_of_parallelism));
+                    new PipelineSenderQueue(this, num_sender_per_queue, _is_merging ? 1 : degree_of_parallelism));
         } else {
             queue = _sender_queue_pool.add(new NonPipelineSenderQueue(this, num_sender_per_queue));
         }
         _sender_queues.push_back(queue);
     }
 
-    // Initialize the counters
-    _bytes_received_counter = ADD_COUNTER(_profile, "BytesReceived", TUnit::BYTES);
-    _bytes_pass_through_counter = ADD_COUNTER(_profile, "BytesPassThrough", TUnit::BYTES);
-    _request_received_counter = ADD_COUNTER(_profile, "RequestReceived", TUnit::UNIT);
-    _closure_block_timer = ADD_TIMER(_profile, "ClosureBlockTime");
-    _closure_block_counter = ADD_COUNTER(_profile, "ClosureBlockCount", TUnit::UNIT);
-    _deserialize_chunk_timer = ADD_TIMER(_profile, "DeserializeChunkTime");
-    _decompress_chunk_timer = ADD_TIMER(_profile, "DecompressChunkTime");
-    _process_total_timer = ADD_TIMER(_profile, "ReceiverProcessTotalTime");
-
-    _sender_total_timer = ADD_TIMER(_profile, "SenderTotalTime");
-    _sender_wait_lock_timer = ADD_TIMER(_profile, "SenderWaitLockTime");
-
-    _buffer_unplug_counter = ADD_COUNTER(_profile, "BufferUnplugCount", TUnit::UNIT);
+    _metrics.resize(degree_of_parallelism);
 
     _pass_through_context.init();
     if (runtime_state->query_options().__isset.transmission_encode_level) {
         _encode_level = runtime_state->query_options().transmission_encode_level;
     }
+}
+
+void DataStreamRecvr::bind_profile(int32_t driver_sequence, RuntimeProfile* profile) {
+    DCHECK(profile != nullptr);
+    DCHECK_GE(driver_sequence, 0);
+    DCHECK_LT(driver_sequence, _metrics.size());
+    auto& statistics = _metrics[driver_sequence];
+
+    statistics.bytes_received_counter = ADD_COUNTER(profile, "BytesReceived", TUnit::BYTES);
+    statistics.bytes_pass_through_counter = ADD_COUNTER(profile, "BytesPassThrough", TUnit::BYTES);
+    statistics.request_received_counter = ADD_COUNTER(profile, "RequestReceived", TUnit::UNIT);
+    statistics.closure_block_timer = ADD_TIMER(profile, "ClosureBlockTime");
+    statistics.closure_block_counter = ADD_COUNTER(profile, "ClosureBlockCount", TUnit::UNIT);
+    statistics.deserialize_chunk_timer = ADD_TIMER(profile, "DeserializeChunkTime");
+    statistics.decompress_chunk_timer = ADD_TIMER(profile, "DecompressChunkTime");
+    statistics.process_total_timer = ADD_TIMER(profile, "ReceiverProcessTotalTime");
+    statistics.wait_lock_timer = ADD_TIMER(profile, "WaitLockTime");
+    statistics.buffer_unplug_counter = ADD_COUNTER(profile, "BufferUnplugCount", TUnit::UNIT);
+    statistics.peak_buffer_mem_bytes = profile->AddHighWaterMarkCounter(
+            "PeakBufferMemoryBytes", TUnit::BYTES, RuntimeProfile::Counter::create_strategy(TUnit::BYTES));
 }
 
 Status DataStreamRecvr::get_next(ChunkPtr* chunk, bool* eos) {
@@ -194,7 +222,10 @@ Status DataStreamRecvr::get_next(ChunkPtr* chunk, bool* eos) {
 
 Status DataStreamRecvr::get_next_for_pipeline(ChunkPtr* chunk, std::atomic<bool>* eos, bool* should_exit) {
     DCHECK(_cascade_merger);
-    return _cascade_merger->get_next(chunk, eos, should_exit);
+    ChunkUniquePtr chunk_ptr;
+    RETURN_IF_ERROR(_cascade_merger->get_next(&chunk_ptr, eos, should_exit));
+    *chunk = std::move(chunk_ptr);
+    return Status::OK();
 }
 
 bool DataStreamRecvr::is_data_ready() {
@@ -209,17 +240,17 @@ Status DataStreamRecvr::add_chunks(const PTransmitChunkParams& request, ::google
     MemTracker* prev_tracker = tls_thread_status.set_mem_tracker(_instance_mem_tracker.get());
     DeferOp op([&] { tls_thread_status.set_mem_tracker(prev_tracker); });
 
-    SCOPED_TIMER(_process_total_timer);
-    SCOPED_TIMER(_sender_total_timer);
-    COUNTER_UPDATE(_request_received_counter, 1);
+    auto& metrics = get_metrics_round_robin();
+    SCOPED_TIMER(metrics.process_total_timer);
+    COUNTER_UPDATE(metrics.request_received_counter, 1);
     int use_sender_id = _is_merging ? request.sender_id() : 0;
     // Add all batches to the same queue if _is_merging is false.
 
     if (_keep_order) {
         DCHECK(_is_pipeline);
-        return _sender_queues[use_sender_id]->add_chunks_and_keep_order(request, done);
+        return _sender_queues[use_sender_id]->add_chunks_and_keep_order(request, metrics, done);
     } else {
-        return _sender_queues[use_sender_id]->add_chunks(request, done);
+        return _sender_queues[use_sender_id]->add_chunks(request, metrics, done);
     }
 }
 
@@ -244,11 +275,13 @@ void DataStreamRecvr::close() {
     _mgr = nullptr;
     _chunks_merger.reset();
     _cascade_merger.reset();
-
-    _closure_block_timer->update(_closure_block_timer->value() / std::max(1, _degree_of_parallelism));
+    _close = true;
 }
 
 DataStreamRecvr::~DataStreamRecvr() {
+    if (!_close) {
+        close();
+    }
     DCHECK(_mgr == nullptr) << "Must call close()";
 }
 

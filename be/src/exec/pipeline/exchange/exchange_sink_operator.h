@@ -75,13 +75,14 @@ public:
 
     Status push_chunk(RuntimeState* state, const ChunkPtr& chunk) override;
 
+    void update_metrics(RuntimeState* state) override;
+
     // For the first chunk , serialize the chunk data and meta to ChunkPB both.
     // For other chunk, only serialize the chunk data to ChunkPB.
     Status serialize_chunk(const Chunk* chunk, ChunkPB* dst, bool* is_first_chunk, int num_receivers = 1);
 
-    // Return the physical bytes of attachment and chunks data ref.
-    std::shared_ptr<ChunksDataRef> construct_brpc_attachment(const PTransmitChunkParamsPtr& _chunk_request,
-                                                             butil::IOBuf& attachment);
+    // Return the physical bytes of attachment.
+    int64_t construct_brpc_attachment(const PTransmitChunkParamsPtr& _chunk_request, butil::IOBuf& attachment);
 
 private:
     bool _is_large_chunk(size_t sz) const {
@@ -173,9 +174,14 @@ private:
 
     RuntimeProfile::Counter* _serialize_chunk_timer = nullptr;
     RuntimeProfile::Counter* _shuffle_hash_timer = nullptr;
+    RuntimeProfile::Counter* _shuffle_chunk_append_counter = nullptr;
+    RuntimeProfile::Counter* _shuffle_chunk_append_timer = nullptr;
     RuntimeProfile::Counter* _compress_timer = nullptr;
     RuntimeProfile::Counter* _bytes_pass_through_counter = nullptr;
-    RuntimeProfile::Counter* _uncompressed_bytes_counter = nullptr;
+    RuntimeProfile::Counter* _sender_input_bytes_counter = nullptr;
+    RuntimeProfile::Counter* _serialized_bytes_counter = nullptr;
+    RuntimeProfile::Counter* _compressed_bytes_counter = nullptr;
+    RuntimeProfile::HighWaterMarkCounter* _pass_through_buffer_peak_mem_usage = nullptr;
 
     std::atomic<bool> _is_finished = false;
     std::atomic<bool> _is_cancelled = false;

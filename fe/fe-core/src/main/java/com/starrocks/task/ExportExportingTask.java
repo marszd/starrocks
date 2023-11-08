@@ -36,7 +36,6 @@ package com.starrocks.task;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import com.starrocks.common.MarkedCountDownLatch;
 import com.starrocks.common.Status;
 import com.starrocks.common.UserException;
 import com.starrocks.common.Version;
@@ -45,12 +44,13 @@ import com.starrocks.common.util.DebugUtil;
 import com.starrocks.common.util.ProfileManager;
 import com.starrocks.common.util.RuntimeProfile;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.common.util.concurrent.MarkedCountDownLatch;
 import com.starrocks.fs.HdfsUtil;
 import com.starrocks.load.ExportChecker;
 import com.starrocks.load.ExportFailMsg;
 import com.starrocks.load.ExportJob;
-import com.starrocks.qe.Coordinator;
 import com.starrocks.qe.QeProcessorImpl;
+import com.starrocks.qe.scheduler.Coordinator;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TStatusCode;
 import com.starrocks.thrift.TUniqueId;
@@ -77,7 +77,7 @@ public class ExportExportingTask extends PriorityLeaderTask {
     public ExportExportingTask(ExportJob job) {
         this.job = job;
         this.signature = job.getId();
-        this.subTasksDoneSignal = new MarkedCountDownLatch<Integer, Integer>(job.getCoordList().size());
+        this.subTasksDoneSignal = new MarkedCountDownLatch<>(job.getCoordList().size());
     }
 
     @Override
@@ -216,7 +216,7 @@ public class ExportExportingTask extends PriorityLeaderTask {
                 profile.addChild(p);
             }
         }
-        ProfileManager.getInstance().pushProfile(profile);
+        ProfileManager.getInstance().pushProfile(null, profile);
     }
 
     private Status moveTmpFiles() {
@@ -336,7 +336,7 @@ public class ExportExportingTask extends PriorityLeaderTask {
                     failMsg = e.getMessage();
                     TUniqueId queryId = coord.getQueryId();
                     LOG.warn("export sub task internal error. task idx: {}, task query id: {}",
-                            taskIdx, getQueryId(), e);
+                            taskIdx, queryId, e);
                 }
 
                 if (i < RETRY_NUM - 1) {
@@ -346,13 +346,14 @@ public class ExportExportingTask extends PriorityLeaderTask {
                     // because the request is considered as a repeat request.
                     // we make the high part of query id unchanged to facilitate tracing problem by log.
                     TUniqueId newQueryId = new TUniqueId(oldQueryId.hi, uuid.getLeastSignificantBits());
+                    String errorMsg = coord.getExecStatus().getErrorMsg();
                     if (exportJob.needResetCoord()) {
                         try {
                             Coordinator newCoord = exportJob.resetCoord(taskIdx, newQueryId);
                             coord = newCoord;
                         } catch (UserException e) {
                             // still use old coord if there are any problems when reseting Coord
-                            LOG.warn("fail to reset coord for task idx: {}, task query id: {}, reason: {}", taskIdx, 
+                            LOG.warn("fail to reset coord for task idx: {}, task query id: {}, reason: {}", taskIdx,
                                     getQueryId(), e.getMessage());
                             coord.clearExportStatus();
                         }
@@ -362,7 +363,7 @@ public class ExportExportingTask extends PriorityLeaderTask {
                     coord.setQueryId(newQueryId);
                     LOG.warn(
                             "export sub task fail. err: {}. task idx: {}, task query id: {}. retry: {}, new query id: {}",
-                            coord.getExecStatus().getErrorMsg(), taskIdx, DebugUtil.printId(oldQueryId), i,
+                            errorMsg, taskIdx, DebugUtil.printId(oldQueryId), i,
                             DebugUtil.printId(coord.getQueryId()));
                 }
             }
@@ -372,7 +373,7 @@ public class ExportExportingTask extends PriorityLeaderTask {
             }
 
             coord.getQueryProfile().getCounterTotalTime().setValue(TimeUtils.getEstimatedTime(job.getStartTimeMs()));
-            coord.endProfile();
+            coord.collectProfileSync();
             synchronized (fragmentProfiles) {
                 fragmentProfiles.add(coord.getQueryProfile());
             }
@@ -394,7 +395,7 @@ public class ExportExportingTask extends PriorityLeaderTask {
                 throw new UserException("timeout");
             }
 
-            coord.setTimeout(leftTimeSecond);
+            coord.setTimeoutSecond(leftTimeSecond);
             coord.exec();
 
             if (coord.join(leftTimeSecond)) {

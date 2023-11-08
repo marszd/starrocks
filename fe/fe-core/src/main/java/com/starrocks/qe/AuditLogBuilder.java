@@ -69,7 +69,7 @@ public class AuditLogBuilder extends Plugin implements AuditPlugin {
 
     @Override
     public boolean eventFilter(EventType type) {
-        return type == EventType.AFTER_QUERY;
+        return type == EventType.AFTER_QUERY || type == EventType.CONNECTION;
     }
 
     @Override
@@ -104,6 +104,9 @@ public class AuditLogBuilder extends Plugin implements AuditPlugin {
 
                 // Ignore -1 by default, ignore 0 if annotated with ignore_zero
                 Object value = f.get(event);
+                if (af.ignore_zero() && value == null) {
+                    continue;
+                }
                 if (value instanceof Long) {
                     long longValue = (Long) value;
                     if (longValue == -1 || (longValue == 0 && af.ignore_zero())) {
@@ -126,21 +129,25 @@ public class AuditLogBuilder extends Plugin implements AuditPlugin {
             }
 
             String auditLog = sb.toString();
-            AuditLog.getQueryAudit().log(auditLog);
-            // slow query
-            if (queryTime > Config.qe_slow_log_ms) {
-                AuditLog.getSlowAudit().log(auditLog);
-            }
+            if (event.type == EventType.CONNECTION) {
+                AuditLog.getConnectionAudit().log(auditLog);
+            } else {
+                AuditLog.getQueryAudit().log(auditLog);
+                // slow query
+                if (queryTime > Config.qe_slow_log_ms) {
+                    AuditLog.getSlowAudit().log(auditLog);
+                }
 
-            if (isBigQuery(event)) {
-                sb.append("|bigQueryLogCPUSecondThreshold=").append(event.bigQueryLogCPUSecondThreshold);
-                sb.append("|bigQueryLogScanBytesThreshold=").append(event.bigQueryLogScanBytesThreshold);
-                sb.append("|bigQueryLogScanRowsThreshold=").append(event.bigQueryLogScanRowsThreshold);
-                String bigQueryLog = sb.toString();
-                AuditLog.getBigQueryAudit().log(bigQueryLog);
+                if (isBigQuery(event)) {
+                    sb.append("|bigQueryLogCPUSecondThreshold=").append(event.bigQueryLogCPUSecondThreshold);
+                    sb.append("|bigQueryLogScanBytesThreshold=").append(event.bigQueryLogScanBytesThreshold);
+                    sb.append("|bigQueryLogScanRowsThreshold=").append(event.bigQueryLogScanRowsThreshold);
+                    String bigQueryLog = sb.toString();
+                    AuditLog.getBigQueryAudit().log(bigQueryLog);
+                }
             }
         } catch (Exception e) {
-            LOG.debug("failed to process audit event", e);
+            LOG.warn("failed to process audit event", e);
         }
     }
 

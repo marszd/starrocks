@@ -36,9 +36,14 @@ package com.starrocks.load.loadv2;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Sets;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.AuthorizationInfo;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.ExternalOlapTable;
+import com.starrocks.catalog.HiveTable;
+import com.starrocks.catalog.IcebergTable;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.system.SystemTable;
 import com.starrocks.common.Config;
 import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.UserException;
@@ -47,7 +52,7 @@ import com.starrocks.load.FailMsg;
 import com.starrocks.load.FailMsg.CancelType;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TLoadJobType;
-import com.starrocks.thrift.TUniqueId;
+import com.starrocks.thrift.TReportExecStatusParams;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -64,6 +69,7 @@ import java.util.Set;
 public class InsertLoadJob extends LoadJob {
     private static final Logger LOG = LogManager.getLogger(LoadJob.class);
 
+    @SerializedName("tid")
     private long tableId;
     private long estimateScanRow;
     private TLoadJobType loadType;
@@ -74,7 +80,8 @@ public class InsertLoadJob extends LoadJob {
         this.jobType = EtlJobType.INSERT;
     }
 
-    public InsertLoadJob(String label, long dbId, long tableId, long createTimestamp, long estimateScanRow, TLoadJobType type) 
+    public InsertLoadJob(String label, long dbId, long tableId, long createTimestamp,
+                         long estimateScanRow, TLoadJobType type, long timeout)
             throws MetaNotFoundException {
         super(dbId, label);
         this.tableId = tableId;
@@ -84,6 +91,7 @@ public class InsertLoadJob extends LoadJob {
         this.jobType = EtlJobType.INSERT;
         this.estimateScanRow = estimateScanRow;
         this.loadType = type;
+        this.timeoutSecond = timeout;
     }
 
     // only used for test
@@ -121,7 +129,6 @@ public class InsertLoadJob extends LoadJob {
                 this.failMsg = new FailMsg(CancelType.LOAD_RUN_FAIL, failMsg);
                 this.progress = 0;
             }
-            this.timeoutSecond = Config.insert_load_default_timeout_second;
             this.authorizationInfo = gatherAuthInfo();
             this.loadingStatus.setTrackingUrl(trackingUrl);
         } finally {
@@ -138,15 +145,14 @@ public class InsertLoadJob extends LoadJob {
         if (database == null) {
             throw new MetaNotFoundException("Database " + dbId + "has been deleted");
         }
-        return new AuthorizationInfo(database.getFullName(), getTableNames());
+        return new AuthorizationInfo(database.getFullName(), getTableNames(false));
     }
 
     @Override
-    public void updateProgess(Long beId, TUniqueId loadId, TUniqueId fragmentId, 
-            long sinkRows, long sinkBytes, long sourceRows, long sourceBytes, boolean isDone) {
+    public void updateProgress(TReportExecStatusParams params) {
         writeLock();
         try {
-            super.updateProgess(beId, loadId, fragmentId, sinkRows, sinkBytes, sourceRows, sourceBytes, isDone);
+            super.updateProgress(params);
             if (!loadingStatus.getLoadStatistic().getLoadFinish()) {
                 if (this.loadType == TLoadJobType.INSERT_QUERY) {
                     progress = (int) ((double) loadingStatus.getLoadStatistic().totalSourceLoadRows() 
@@ -181,16 +187,42 @@ public class InsertLoadJob extends LoadJob {
     }
 
     @Override
-    public Set<String> getTableNames() throws MetaNotFoundException {
+    public Set<String> getTableNames(boolean noThrow) throws MetaNotFoundException {
         Database database = GlobalStateMgr.getCurrentState().getDb(dbId);
         if (database == null) {
             throw new MetaNotFoundException("Database " + dbId + "has been deleted");
         }
         Table table = database.getTable(tableId);
         if (table == null) {
-            throw new MetaNotFoundException("Failed to find table " + tableId + " in db " + dbId);
+            if (noThrow) {
+                return Sets.newHashSet();
+            } else {
+                throw new MetaNotFoundException("Failed to find table " + tableId + " in db " + dbId);
+            }
         }
         return Sets.newHashSet(table.getName());
+    }
+
+    @Override
+    public boolean hasTxn() {
+        Database database = GlobalStateMgr.getCurrentState().getDb(dbId);
+        if (database == null) {
+            return true;
+        }
+
+        Table table = database.getTable(tableId);
+        if (table == null) {
+            return true;
+        }
+
+        if (table instanceof SystemTable
+                || table instanceof IcebergTable
+                || table instanceof HiveTable
+                || table instanceof ExternalOlapTable) {
+            return false;
+        } else {
+            return true;
+        }
     }
 
     @Override

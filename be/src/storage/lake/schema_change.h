@@ -31,6 +31,8 @@ public:
 
     Status process_alter_tablet(const TAlterTabletReqV2& request);
 
+    // for update tablet meta
+    Status process_update_tablet_meta(const TUpdateTabletMetaInfoReq& request);
     DISALLOW_COPY_AND_MOVE(SchemaChangeHandler);
 
 private:
@@ -38,7 +40,9 @@ private:
         Tablet* base_tablet;
         Tablet* new_tablet;
         int64_t version;
+        int64_t txn_id;
         MaterializedViewParamMap materialized_params_map;
+        std::unique_ptr<TExpr> where_expr;
         bool sc_sorting = false;
         bool sc_directly = false;
         std::unique_ptr<ChunkChanger> chunk_changer = nullptr;
@@ -46,6 +50,8 @@ private:
 
     Status do_process_alter_tablet(const TAlterTabletReqV2& request);
     Status convert_historical_rowsets(const SchemaChangeParams& sc_params, TxnLogPB_OpSchemaChange* op_schema_change);
+
+    Status do_process_update_tablet_meta(const TTabletMetaInfo& request, int64_t txn_id);
 
     TabletManager* _tablet_manager;
 };

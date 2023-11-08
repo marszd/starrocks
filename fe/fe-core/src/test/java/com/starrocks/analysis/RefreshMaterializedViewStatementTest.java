@@ -22,9 +22,6 @@ import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
 import com.starrocks.pseudocluster.PseudoCluster;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.scheduler.Task;
-import com.starrocks.scheduler.TaskBuilder;
-import com.starrocks.scheduler.TaskManager;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
@@ -55,14 +52,19 @@ public class RefreshMaterializedViewStatementTest {
         cluster = PseudoCluster.getInstance();
 
         FeConstants.runningUnitTest = true;
-        FeConstants.default_scheduler_interval_millisecond = 100;
+        Config.alter_scheduler_interval_millisecond = 100;
         Config.dynamic_partition_enable = true;
         Config.dynamic_partition_check_interval_seconds = 1;
         Config.enable_experimental_mv = true;
+
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
         starRocksAssert = new StarRocksAssert(connectContext);
         starRocksAssert.withDatabase("test").useDatabase("test");
+
+        starRocksAssert.withTable("create table table_name_tmp_1 ( c1 bigint NOT NULL, c2 string not null, c3 int not null ) " +
+                " DISTRIBUTED BY HASH(c1) BUCKETS 1 " +
+                " PROPERTIES(\"replication_num\" = \"1\");");
     }
 
     @AfterClass
@@ -76,16 +78,25 @@ public class RefreshMaterializedViewStatementTest {
         try {
             UtFrameUtils.parseStmtWithNewParser(sql, connectContext);
         } catch (Exception e) {
-            Assert.assertEquals("Can not find materialized view:no_exists", e.getMessage());
+            Assert.assertEquals("Getting analyzing error at line 1, column 26. Detail message: " +
+                    "Can not find materialized view:no_exists.", e.getMessage());
+        }
+    }
+
+    @Test
+    public void testRereshNotMaterializedView() {
+        String sql = "REFRESH MATERIALIZED VIEW table_name_tmp_1;";
+        try {
+            UtFrameUtils.parseStmtWithNewParser(sql, connectContext);
+        } catch (Exception e) {
+            Assert.assertEquals("Getting analyzing error at line 1, column 26. Detail message: " +
+                    "Can not refresh non materialized view:table_name_tmp_1.", e.getMessage());
         }
     }
 
     @Test
     public void testRefreshMaterializedView() throws Exception {
-        cluster.runSql("test",
-                "create table table_name_tmp_1 ( c1 bigint NOT NULL, c2 string not null, c3 int not null ) " +
-                        " DISTRIBUTED BY HASH(c1) BUCKETS 1 " +
-                        " PROPERTIES(\"replication_num\" = \"1\");");
+
         Database db = starRocksAssert.getCtx().getGlobalStateMgr().getDb("test");
         starRocksAssert.withMaterializedView("create materialized view mv1 distributed by hash(`c1`) " +
                 " refresh manual" +
@@ -96,15 +107,8 @@ public class RefreshMaterializedViewStatementTest {
         Table t2 = db.getTable("mv1");
         Assert.assertNotNull(t2);
         MaterializedView mv1 = (MaterializedView) t2;
+        cluster.runSql("test", "refresh materialized view mv1 with sync mode");
 
-        TaskManager taskManager = GlobalStateMgr.getCurrentState().getTaskManager();
-        final String mvTaskName = TaskBuilder.getMvTaskName(mv1.getId());
-        if (!taskManager.containTask(mvTaskName)) {
-            Task task = TaskBuilder.buildMvTask(mv1, "test");
-            TaskBuilder.updateTaskInfo(task, mv1);
-            taskManager.createTask(task, false);
-        }
-        taskManager.executeTaskSync(mvTaskName);
         MaterializedView.MvRefreshScheme refreshScheme = mv1.getRefreshScheme();
         Assert.assertNotNull(refreshScheme);
         System.out.println("visibleVersionMap:" + refreshScheme.getAsyncRefreshContext().getBaseTableVisibleVersionMap());

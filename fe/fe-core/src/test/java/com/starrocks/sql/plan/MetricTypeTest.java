@@ -32,7 +32,7 @@ public class MetricTypeTest extends PlanTestBase {
                         "PREAGGREGATION: OFF. Reason: Aggregate Operator not match: COUNT <--> BITMAP_UNION");
 
         starRocksAssert.query("select group_concat(id2) from test.bitmap_table;")
-                .analysisError("No matching function with signature: group_concat(bitmap).");
+                .analysisError("No matching function with signature: group_concat(bitmap");
 
         starRocksAssert.query("select sum(id2) from test.bitmap_table;").analysisError(
                 "No matching function with signature: sum(bitmap).");
@@ -40,12 +40,12 @@ public class MetricTypeTest extends PlanTestBase {
         starRocksAssert.query("select avg(id2) from test.bitmap_table;")
                 .analysisError("No matching function with signature: avg(bitmap).");
 
-        starRocksAssert.query("select max(id2) from test.bitmap_table;").analysisError(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+        starRocksAssert.query("select max(id2) from test.bitmap_table;").analysisError(Type.NOT_SUPPORT_AGG_ERROR_MSG);
 
-        starRocksAssert.query("select min(id2) from test.bitmap_table;").analysisError(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+        starRocksAssert.query("select min(id2) from test.bitmap_table;").analysisError(Type.NOT_SUPPORT_AGG_ERROR_MSG);
 
         starRocksAssert.query("select count(*) from test.bitmap_table group by id2;")
-                .analysisError(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+                .analysisError(Type.NOT_SUPPORT_GROUP_BY_ERROR_MSG);
 
         starRocksAssert.query("select count(*) from test.bitmap_table where id2 = 1;").analysisError(
                 "bitmap", "not support binary predicate");
@@ -61,7 +61,7 @@ public class MetricTypeTest extends PlanTestBase {
                 "PREAGGREGATION: OFF. Reason: Aggregate Operator not match: COUNT <--> HLL_UNION");
 
         starRocksAssert.query("select group_concat(id2) from test.hll_table;")
-                .analysisError("No matching function with signature: group_concat(hll).");
+                .analysisError("No matching function with signature: group_concat(hll");
 
         starRocksAssert.query("select sum(id2) from test.hll_table;")
                 .analysisError("No matching function with signature: sum(hll).");
@@ -69,14 +69,14 @@ public class MetricTypeTest extends PlanTestBase {
         starRocksAssert.query("select avg(id2) from test.hll_table;")
                 .analysisError("No matching function with signature: avg(hll).");
 
-        starRocksAssert.query("select max(id2) from test.hll_table;").analysisError(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+        starRocksAssert.query("select max(id2) from test.hll_table;").analysisError(Type.NOT_SUPPORT_AGG_ERROR_MSG);
 
-        starRocksAssert.query("select min(id2) from test.hll_table;").analysisError(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+        starRocksAssert.query("select min(id2) from test.hll_table;").analysisError(Type.NOT_SUPPORT_AGG_ERROR_MSG);
 
-        starRocksAssert.query("select min(id2) from test.hll_table;").analysisError(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+        starRocksAssert.query("select min(id2) from test.hll_table;").analysisError(Type.NOT_SUPPORT_AGG_ERROR_MSG);
 
         starRocksAssert.query("select count(*) from test.hll_table group by id2;")
-                .analysisError(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+                .analysisError(Type.NOT_SUPPORT_GROUP_BY_ERROR_MSG);
 
         starRocksAssert.query("select count(*) from test.hll_table where id2 = 1").analysisError(
                 "hll", "not support binary predicate");

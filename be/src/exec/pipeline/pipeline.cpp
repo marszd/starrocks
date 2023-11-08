@@ -14,6 +14,7 @@
 
 #include "exec/pipeline/pipeline.h"
 
+#include "exec/pipeline/operator.h"
 #include "exec/pipeline/pipeline_driver.h"
 #include "exec/pipeline/scan/connector_scan_operator.h"
 #include "exec/pipeline/stream_pipeline_driver.h"
@@ -29,7 +30,7 @@ size_t Pipeline::degree_of_parallelism() const {
 void Pipeline::count_down_driver(RuntimeState* state) {
     bool all_drivers_finished = ++_num_finished_drivers == _drivers.size();
     if (all_drivers_finished) {
-        state->fragment_ctx()->count_down_pipeline(state);
+        state->fragment_ctx()->count_down_pipeline();
     }
 }
 
@@ -90,17 +91,9 @@ void Pipeline::instantiate_drivers(RuntimeState* state) {
             scan_operator->set_workgroup(workgroup);
             scan_operator->set_query_ctx(query_ctx->get_shared_ptr());
             if (dynamic_cast<ConnectorScanOperator*>(scan_operator) != nullptr) {
-                if (workgroup != nullptr) {
-                    scan_operator->set_scan_executor(state->exec_env()->connector_scan_executor_with_workgroup());
-                } else {
-                    scan_operator->set_scan_executor(state->exec_env()->connector_scan_executor_without_workgroup());
-                }
+                scan_operator->set_scan_executor(state->exec_env()->connector_scan_executor());
             } else {
-                if (workgroup != nullptr) {
-                    scan_operator->set_scan_executor(state->exec_env()->scan_executor_with_workgroup());
-                } else {
-                    scan_operator->set_scan_executor(state->exec_env()->scan_executor_without_workgroup());
-                }
+                scan_operator->set_scan_executor(state->exec_env()->scan_executor());
             }
         }
     }
@@ -120,7 +113,12 @@ void Pipeline::setup_drivers_profile(const DriverPtr& driver) {
     auto& operators = driver->operators();
     for (int32_t i = operators.size() - 1; i >= 0; --i) {
         auto& curr_op = operators[i];
-        driver->runtime_profile()->add_child(curr_op->get_runtime_profile(), true, nullptr);
+        driver->runtime_profile()->add_child(curr_op->runtime_profile(), true, nullptr);
+        if (curr_op->is_combinatorial_operator()) {
+            curr_op->for_each_child_operator([&](Operator* child) {
+                driver->runtime_profile()->add_child(child->runtime_profile(), true, nullptr);
+            });
+        }
     }
 }
 
@@ -140,6 +138,40 @@ Status Pipeline::reset_epoch(RuntimeState* state) {
         RETURN_IF_ERROR(stream_driver->reset_epoch(state));
     }
     return Status::OK();
+}
+
+struct OutputAmplificationAddCalculator {
+    size_t operator()(size_t accumulate, size_t value) const { return accumulate + value; }
+};
+
+struct OutputAmplificationMaxCalculator {
+    size_t operator()(size_t accumulate, size_t value) const { return std::max(accumulate, value); }
+};
+
+template <typename Calculator>
+size_t calculate_output_amplification(const Drivers& drivers) {
+    Calculator calculator;
+    size_t result = 0;
+    for (const auto& driver : drivers) {
+        result = calculator(result, driver->sink_operator()->output_amplification_factor());
+    }
+    return std::max<size_t>(1, result);
+}
+
+size_t Pipeline::output_amplification_factor() const {
+    if (_drivers.empty()) {
+        return 1;
+    }
+
+    auto* first_sink = _drivers[0]->sink_operator();
+    switch (first_sink->intra_pipeline_amplification_type()) {
+    case Operator::OutputAmplificationType::ADD:
+        return calculate_output_amplification<OutputAmplificationAddCalculator>(_drivers);
+    case Operator::OutputAmplificationType::MAX:
+        return calculate_output_amplification<OutputAmplificationMaxCalculator>(_drivers);
+    }
+
+    return 1;
 }
 
 } // namespace starrocks::pipeline

@@ -33,36 +33,36 @@ public class SelectConstTest extends PlanTestBase {
                 "     constant exprs: \n" +
                 "         NULL");
         assertPlanContains("select v1,v2 from t0 union all select 1,2", "  4:Project\n" +
-                "  |  <slot 7> : CAST(1 AS BIGINT)\n" +
-                "  |  <slot 8> : CAST(2 AS BIGINT)\n" +
+                "  |  <slot 7> : 1\n" +
+                "  |  <slot 8> : 2\n" +
                 "  |  \n" +
                 "  3:UNION\n" +
                 "     constant exprs: \n" +
                 "         NULL");
         assertPlanContains("select v1,v2 from t0 union select 1,2", "  4:Project\n" +
-                "  |  <slot 7> : CAST(1 AS BIGINT)\n" +
-                "  |  <slot 8> : CAST(2 AS BIGINT)\n" +
+                "  |  <slot 7> : 1\n" +
+                "  |  <slot 8> : 2\n" +
                 "  |  \n" +
                 "  3:UNION\n" +
                 "     constant exprs: \n" +
                 "         NULL");
         assertPlanContains("select v1,v2 from t0 except select 1,2", "EXCEPT", "  4:Project\n" +
-                "  |  <slot 7> : CAST(1 AS BIGINT)\n" +
-                "  |  <slot 8> : CAST(2 AS BIGINT)\n" +
+                "  |  <slot 7> : 1\n" +
+                "  |  <slot 8> : 2\n" +
                 "  |  \n" +
                 "  3:UNION\n" +
                 "     constant exprs: \n" +
                 "         NULL");
         assertPlanContains("select v1,v2 from t0 intersect select 1,2", "INTERSECT", "  4:Project\n" +
-                "  |  <slot 7> : CAST(1 AS BIGINT)\n" +
-                "  |  <slot 8> : CAST(2 AS BIGINT)\n" +
+                "  |  <slot 7> : 1\n" +
+                "  |  <slot 8> : 2\n" +
                 "  |  \n" +
                 "  3:UNION\n" +
                 "     constant exprs: \n" +
                 "         NULL");
         assertPlanContains("select v1,v2,b from t0 inner join (select 1 as a,2 as b) t on v1 = a", "  2:Project\n" +
                 "  |  <slot 6> : 2\n" +
-                "  |  <slot 7> : CAST(1 AS BIGINT)\n" +
+                "  |  <slot 7> : 1\n" +
                 "  |  \n" +
                 "  1:UNION\n" +
                 "     constant exprs: \n" +
@@ -71,11 +71,20 @@ public class SelectConstTest extends PlanTestBase {
 
     @Test
     public void testValuesNodePredicate() throws Exception {
-        assertPlanContains("select database()", "<slot 2> : DATABASE()");
-        assertPlanContains("select schema()", "<slot 2> : SCHEMA()");
+        assertPlanContains("select database()", "<slot 2> : 'test'");
+        assertPlanContains("select schema()", "<slot 2> : 'test'");
         assertPlanContains("select user()", "<slot 2> : USER()");
         assertPlanContains("select current_user()", "<slot 2> : CURRENT_USER()");
         assertPlanContains("select connection_id()", "<slot 2> : CONNECTION_ID()");
+    }
+
+    @Test
+    public void testFromUnixtime() throws Exception {
+        assertPlanContains("select from_unixtime(10)", "'1970-01-01 08:00:10'");
+        assertPlanContains("select from_unixtime(1024)", "'1970-01-01 08:17:04'");
+        assertPlanContains("select from_unixtime(32678)", "'1970-01-01 17:04:38'");
+        assertPlanContains("select from_unixtime(102400000)", "'1973-03-31 12:26:40'");
+        assertPlanContains("select from_unixtime(253402243100)", "'9999-12-31 15:58:20'");
     }
 
     @Test
@@ -94,9 +103,9 @@ public class SelectConstTest extends PlanTestBase {
 
     @Test
     public void testSubquery() throws Exception {
-        assertPlanContains("select * from t0 where v3 in (select 2)", "LEFT SEMI JOIN", "<slot 7> : CAST(2 AS BIGINT)");
+        assertPlanContains("select * from t0 where v3 in (select 2)", "LEFT SEMI JOIN", "<slot 7> : 2");
         assertPlanContains("select * from t0 where v3 not in (select 2)", "NULL AWARE LEFT ANTI JOIN",
-                "<slot 7> : CAST(2 AS BIGINT)");
+                "<slot 7> : 2");
         assertPlanContains("select * from t0 where exists (select 9)", "  1:UNION\n" +
                 "     constant exprs: \n" +
                 "         NULL");

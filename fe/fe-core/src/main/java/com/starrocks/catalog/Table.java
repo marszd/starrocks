@@ -41,13 +41,13 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.DescriptorTable.ReferencedPartitionInfo;
-import com.starrocks.common.FeMetaVersion;
+import com.starrocks.catalog.system.SystemTable;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.lake.LakeMaterializedView;
 import com.starrocks.lake.LakeTable;
 import com.starrocks.persist.gson.GsonPostProcessable;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.sql.ast.CreateTableStmt;
 import com.starrocks.thrift.TTableDescriptor;
 import org.apache.commons.lang.NotImplementedException;
 import org.apache.logging.log4j.LogManager;
@@ -63,6 +63,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import javax.annotation.Nullable;
 
 /**
@@ -73,27 +74,71 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
 
     // 1. Native table:
     //   1.1 Local: OLAP, MATERIALIZED_VIEW
-    //   1.2 Lake: LAKE
+    //   1.2 Cloud native: LAKE, LAKE_MATERIALIZED_VIEW
     // 2. System table: SCHEMA
     // 3. View: INLINE_VIEW, VIEW
     // 4. External table: MYSQL, OLAP_EXTERNAL, BROKER, ELASTICSEARCH, HIVE, ICEBERG, HUDI, ODBC, JDBC
     public enum TableType {
+        @SerializedName("MYSQL")
         MYSQL,
+        @SerializedName("OLAP")
         OLAP,
+        @SerializedName("OLAP_EXTERNAL")
         OLAP_EXTERNAL,
+        @SerializedName("SCHEMA")
         SCHEMA,
+        @SerializedName("INLINE_VIEW")
         INLINE_VIEW,
+        @SerializedName("VIEW")
         VIEW,
+        @SerializedName("BROKER")
         BROKER,
+        @SerializedName("ELASTICSEARCH")
         ELASTICSEARCH,
+        @SerializedName("HIVE")
         HIVE,
+        @SerializedName("ICEBERG")
         ICEBERG,
+        @SerializedName("HUDI")
         HUDI,
+        @SerializedName("JDBC")
         JDBC,
+        @SerializedName("MATERIALIZED_VIEW")
         MATERIALIZED_VIEW,
-        LAKE,
+        @SerializedName("LAKE") // for backward and rollback compatibility
+        CLOUD_NATIVE,
+        @SerializedName("DELTALAKE")
         DELTALAKE,
-        FILE
+        @SerializedName("FILE")
+        FILE,
+        @SerializedName("LAKE_MATERIALIZED_VIEW") // for backward and rollback compatibility
+        CLOUD_NATIVE_MATERIALIZED_VIEW,
+        @SerializedName("TABLE_FUNCTION")
+        TABLE_FUNCTION,
+        @SerializedName("PAIMON")
+        PAIMON,
+        @SerializedName("HIVE_VIEW")
+        HIVE_VIEW;
+
+        public static String serialize(TableType type) {
+            if (type == CLOUD_NATIVE) {
+                return "LAKE"; // for rollback compatibility
+            }
+            if (type == CLOUD_NATIVE_MATERIALIZED_VIEW) {
+                return "LAKE_MATERIALIZED_VIEW"; // for rollback compatibility
+            }
+            return type.name();
+        }
+
+        public static TableType deserialize(String serializedName) {
+            if ("LAKE".equals(serializedName)) {
+                return CLOUD_NATIVE; // for backward compatibility
+            }
+            if ("LAKE_MATERIALIZED_VIEW".equals(serializedName)) {
+                return CLOUD_NATIVE_MATERIALIZED_VIEW; // for backward compatibility
+            }
+            return TableType.valueOf(serializedName);
+        }
     }
 
     @SerializedName(value = "id")
@@ -106,29 +151,32 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
     protected long createTime;
     /*
      *  fullSchema and nameToColumn should contain all columns, both visible and shadow.
-     *  eg. for OlapTable, when doing schema change, there will be some shadow columns which are not visible
+     *  e.g. for OlapTable, when doing schema change, there will be some shadow columns which are not visible
      *      to query but visible to load process.
      *  If you want to get all visible columns, you should call getBaseSchema() method, which is override in
-     *  sub classes.
+     *  subclasses.
      *
      *  NOTICE: the order of this fullSchema is meaningless to OlapTable
      */
     /**
-     * The fullSchema of OlapTable includes the base columns and the SHADOW_NAME_PRFIX columns.
+     * The fullSchema of OlapTable includes the base columns and the SHADOW_NAME_PREFIX columns.
      * The properties of base columns in fullSchema are same as properties in baseIndex.
      * For example:
      * Table (c1 int, c2 int, c3 int)
      * Schema change (c3 to bigint)
-     * When OlapTable is changing schema, the fullSchema is (c1 int, c2 int, c3 int, SHADOW_NAME_PRFIX_c3 bigint)
+     * When OlapTable is changing schema, the fullSchema is (c1 int, c2 int, c3 int, SHADOW_NAME_PREFIX_c3 bigint)
      * The fullSchema of OlapTable is mainly used by Scanner of Load job.
      * <p>
      * If you want to get the mv columns, you should call getIndexToSchema in Subclass OlapTable.
      */
+    // If we are simultaneously executing multiple light schema change tasks, there may be occasional concurrent 
+    // read-write operations between these tasks with a relatively low probability. 
+    // Therefore, we choose to use a CopyOnWriteArrayList.
     @SerializedName(value = "fullSchema")
-    protected List<Column> fullSchema;
+    protected List<Column> fullSchema = new CopyOnWriteArrayList<>();
     // tree map for case-insensitive lookup.
     /**
-     * The nameToColumn of OlapTable includes the base columns and the SHADOW_NAME_PRFIX columns.
+     * The nameToColumn of OlapTable includes the base columns and the SHADOW_NAME_PREFIX columns.
      */
     protected Map<String, Column> nameToColumn;
 
@@ -141,13 +189,23 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
     // not serialized field
     // record all materialized views based on this Table
     @SerializedName(value = "mvs")
-    private Set<MvId> relatedMaterializedViews;
+    protected Set<MvId> relatedMaterializedViews;
+
+    // unique constraints for mv rewrite
+    // a table may have multi unique constraints
+    protected List<UniqueConstraint> uniqueConstraints;
+
+    // foreign key constraint for mv rewrite
+    protected List<ForeignKeyConstraint> foreignKeyConstraints;
+
+    protected Map<PartitionKey, Long> partitionKeyToId;
 
     public Table(TableType type) {
         this.type = type;
         this.fullSchema = Lists.newArrayList();
         this.nameToColumn = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
         this.relatedMaterializedViews = Sets.newConcurrentHashSet();
+        this.partitionKeyToId = Maps.newHashMap();
     }
 
     public Table(long id, String tableName, TableType type, List<Column> fullSchema) {
@@ -165,10 +223,12 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
             }
         } else {
             // Only view in with-clause have null base
-            Preconditions.checkArgument(type == TableType.VIEW, "Table has no columns");
+            Preconditions.checkArgument(type == TableType.VIEW || type == TableType.HIVE_VIEW,
+                    "Table has no columns");
         }
         this.createTime = Instant.now().getEpochSecond();
         this.relatedMaterializedViews = Sets.newConcurrentHashSet();
+        this.partitionKeyToId = Maps.newHashMap();
     }
 
     public void setTypeRead(boolean isTypeRead) {
@@ -179,12 +239,31 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
         return id;
     }
 
+    /**
+     * Get the unique id of table in string format, since we already ensure
+     * the uniqueness of id for internal table, we just convert it to string
+     * and return, for external table it's up to the implementation of connector.
+     *
+     * @return unique id of table in string format
+     */
+    public String getUUID() {
+        return Long.toString(id);
+    }
+
     public void setId(long id) {
         this.id = id;
     }
 
+    public String getCatalogName() {
+        return "default";
+    }
+
     public String getName() {
         return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
     }
 
     public String getTableIdentifier() {
@@ -203,20 +282,52 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
         return type == TableType.OLAP;
     }
 
-    public boolean isMaterializedView() {
+    public boolean isOlapExternalTable() {
+        return type == TableType.OLAP_EXTERNAL;
+    }
+
+    public boolean isOlapMaterializedView() {
         return type == TableType.MATERIALIZED_VIEW;
     }
 
-    public boolean isLakeTable() {
-        return type == TableType.LAKE;
+    public boolean isView() {
+        return type == TableType.VIEW;
     }
 
-    public boolean isLocalTable() {
-        return isOlapTable() || isMaterializedView();
+    public boolean isHiveView() {
+        return type == TableType.HIVE_VIEW;
+    }
+
+    public boolean isOlapTableOrMaterializedView() {
+        return isOlapTable() || isOlapMaterializedView();
+    }
+
+    public boolean isCloudNativeTable() {
+        return type == TableType.CLOUD_NATIVE;
+    }
+
+    public boolean isCloudNativeMaterializedView() {
+        return type == TableType.CLOUD_NATIVE_MATERIALIZED_VIEW;
+    }
+
+    public boolean isCloudNativeTableOrMaterializedView() {
+        return isCloudNativeTable() || isCloudNativeMaterializedView();
+    }
+
+    public boolean isMaterializedView() {
+        return isOlapMaterializedView() || isCloudNativeMaterializedView();
+    }
+
+    public boolean isNativeTableOrMaterializedView() {
+        return isOlapTableOrMaterializedView() || isCloudNativeTableOrMaterializedView();
     }
 
     public boolean isNativeTable() {
-        return isLocalTable() || isLakeTable();
+        return isOlapTable() || isCloudNativeTable();
+    }
+
+    public boolean isExternalTableWithFileSystem() {
+        return isHiveTable() || isIcebergTable() || isHudiTable() || isDeltalakeTable() || isPaimonTable();
     }
 
     public boolean isHiveTable() {
@@ -235,9 +346,32 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
         return type == TableType.DELTALAKE;
     }
 
+    public boolean isPaimonTable() {
+        return type == TableType.PAIMON;
+    }
+
+    public boolean isJDBCTable() {
+        return type == TableType.JDBC;
+    }
+
+    public boolean isTableFunctionTable() {
+        return type == TableType.TABLE_FUNCTION;
+    }
+
     // for create table
-    public boolean isOlapOrLakeTable() {
-        return isOlapTable() || isLakeTable();
+    public boolean isOlapOrCloudNativeTable() {
+        return isOlapTable() || isCloudNativeTable();
+    }
+
+    public boolean isExprPartitionTable() {
+        if (this instanceof OlapTable) {
+            OlapTable olapTable = (OlapTable) this;
+            if (olapTable.getPartitionInfo().getType() == PartitionType.EXPR_RANGE_V2) {
+                PartitionInfo partitionInfo = olapTable.getPartitionInfo();
+                return partitionInfo instanceof ExpressionRangePartitionInfoV2;
+            }
+        }
+        return false;
     }
 
     public List<Column> getFullSchema() {
@@ -261,6 +395,10 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
         return nameToColumn.get(name);
     }
 
+    public boolean containColumn(String columnName) {
+        return nameToColumn.containsKey(columnName);
+    }
+
     public List<Column> getColumns() {
         return new ArrayList<>(nameToColumn.values());
     }
@@ -269,13 +407,22 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
         return createTime;
     }
 
+    public Map<String, Column> getNameToColumn() {
+        return nameToColumn;
+    }
+
+    public String getTableLocation() {
+        String msg = "The getTableLocation() method needs to be implemented.";
+        throw new NotImplementedException(msg);
+    }
+
     public TTableDescriptor toThrift(List<ReferencedPartitionInfo> partitions) {
         return null;
     }
 
     public static Table read(DataInput in) throws IOException {
-        Table table = null;
-        TableType type = TableType.valueOf(Text.readString(in));
+        Table table;
+        TableType type = TableType.deserialize(Text.readString(in));
         if (type == TableType.OLAP) {
             table = new OlapTable();
         } else if (type == TableType.MYSQL) {
@@ -302,8 +449,12 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
             table = MaterializedView.read(in);
             table.setTypeRead(true);
             return table;
-        } else if (type == TableType.LAKE) {
+        } else if (type == TableType.CLOUD_NATIVE) {
             table = LakeTable.read(in);
+            table.setTypeRead(true);
+            return table;
+        } else if (type == TableType.CLOUD_NATIVE_MATERIALIZED_VIEW) {
+            table = LakeMaterializedView.read(in);
             table.setTypeRead(true);
             return table;
         } else {
@@ -318,7 +469,7 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
     @Override
     public void write(DataOutput out) throws IOException {
         // ATTN: must write type first
-        Text.writeString(out, type.name());
+        Text.writeString(out, TableType.serialize(type));
 
         // write last check time
         super.write(out);
@@ -358,22 +509,17 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
             this.nameToColumn.put(column.getName(), column);
         }
 
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_63) {
-            comment = Text.readString(in);
-        } else {
-            comment = "";
-        }
+        comment = Text.readString(in);
 
         // read create time
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_64) {
-            this.createTime = in.readLong();
-        } else {
-            this.createTime = -1L;
-        }
+        this.createTime = in.readLong();
     }
 
     @Override
     public void gsonPostProcess() throws IOException {
+        for (Column column : fullSchema) {
+            this.nameToColumn.put(column.getName(), column);
+        }
         relatedMaterializedViews = Sets.newConcurrentHashSet();
     }
 
@@ -409,6 +555,10 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
         return Collections.emptyList();
     }
 
+    public PhysicalPartition getPhysicalPartition(long partitionId) {
+        return null;
+    }
+
     public Set<String> getDistributionColumnNames() {
         return Collections.emptySet();
     }
@@ -418,36 +568,60 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
             return "StarRocks";
         } else if (this instanceof MysqlTable) {
             return "MySQL";
-        } else if (this instanceof SchemaTable) {
+        } else if (this instanceof SystemTable) {
             return "MEMORY";
+        } else if (this instanceof HiveTable) {
+            return "Hive";
+        } else if (this instanceof HudiTable) {
+            return "Hudi";
+        } else if (this instanceof IcebergTable) {
+            return "Iceberg";
+        } else if (this instanceof DeltaLakeTable) {
+            return "DeltaLake";
+        } else if (this instanceof EsTable) {
+            return "Elasticsearch";
+        } else if (this instanceof JDBCTable) {
+            return "JDBC";
+        } else if (this instanceof FileTable) {
+            return "File";
         } else {
             return null;
         }
     }
 
     public String getMysqlType() {
-        if (this instanceof View) {
-            return "VIEW";
+        switch (type) {
+            case INLINE_VIEW:
+            case VIEW:
+            case MATERIALIZED_VIEW:
+            case CLOUD_NATIVE_MATERIALIZED_VIEW:
+                return "VIEW";
+            case SCHEMA:
+                return "SYSTEM VIEW";
+            default:
+                // external table also returns "BASE TABLE" for BI compatibility
+                return "BASE TABLE";
         }
-        if (this instanceof MaterializedView) {
-            return "VIEW";
-        }
-        return "BASE TABLE";
     }
 
     public String getComment() {
         if (!Strings.isNullOrEmpty(comment)) {
             return comment;
         }
-        return type.name();
+        return "";
+    }
+
+    // Attention: cause the remove escape character in parser phase, when you want to print the
+    // comment, you need add the escape character back
+    public String getDisplayComment() {
+        if (!Strings.isNullOrEmpty(comment)) {
+            return CatalogUtils.addEscapeCharacter(comment);
+        }
+        return "";
     }
 
     public void setComment(String comment) {
         this.comment = Strings.nullToEmpty(comment);
-    }
-
-    public CreateTableStmt toCreateTableStmt(String dbName) {
-        throw new NotImplementedException();
     }
 
     @Override
@@ -466,13 +640,13 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
      *   2.1 If is clone between bes or group is not stable, table can not be scheduled.
      *   2.2 If is local balance and group is stable, table can be scheduled.
      * 3. (deprecated). if table's state is ROLLUP or SCHEMA_CHANGE, but alter job's state is FINISHING, we should also
-     *      schedule the tablet to repair it(only for VERSION_IMCOMPLETE case, this will be checked in
+     *      schedule the tablet to repair it(only for VERSION_INCOMPLETE case, this will be checked in
      *      TabletScheduler).
      * 4. Even if table's state is ROLLUP or SCHEMA_CHANGE, check it. Because we can repair the tablet of base index.
      * 5. PRIMARY_KEYS table does not support local balance.
      */
     public boolean needSchedule(boolean isLocalBalance) {
-        if (!isLocalTable()) {
+        if (!isOlapTableOrMaterializedView()) {
             return false;
         }
 
@@ -481,25 +655,35 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
             boolean isGroupUnstable = colocateIndex.isGroupUnstable(colocateIndex.getGroup(getId()));
             if (!isLocalBalance || isGroupUnstable) {
                 LOG.debug(
-                        "table {} is a colocate table, skip tablet checker. is local migration: {}, is group unstable: {}",
+                        "table {} is a colocate table, skip tablet checker. " +
+                                "is local migration: {}, is group unstable: {}",
                         name, isLocalBalance, isGroupUnstable);
                 return false;
             }
         }
 
-        OlapTable olapTable = (OlapTable) this;
-        if (isLocalBalance && olapTable.getKeysType() == KeysType.PRIMARY_KEYS) {
-            return false;
-        }
-
         return true;
+    }
+
+    public boolean hasAutoIncrementColumn() {
+        List<Column> columns = this.getFullSchema();
+        for (Column col : columns) {
+            if (col.isAutoIncrement()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
      * onCreate is called when this table is created
      */
-    public void onCreate() {
+    public void onReload() {
         // Do nothing by default.
+    }
+
+    public void onCreate(Database database) {
+        onReload();
     }
 
     /**
@@ -556,7 +740,61 @@ public class Table extends MetaObject implements Writable, GsonPostProcessable {
         return true;
     }
 
+    public List<Column> getPartitionColumns() {
+        throw new NotImplementedException();
+    }
+
     public List<String> getPartitionColumnNames() {
         return Lists.newArrayList();
+    }
+
+    public boolean supportsUpdate() {
+        return false;
+    }
+
+    public boolean supportInsert() {
+        return false;
+    }
+
+    public boolean hasUniqueConstraints() {
+        List<UniqueConstraint> uniqueConstraint = getUniqueConstraints();
+        return uniqueConstraint != null;
+    }
+
+    public void setUniqueConstraints(List<UniqueConstraint> uniqueConstraints) {
+        this.uniqueConstraints = uniqueConstraints;
+    }
+
+    public List<UniqueConstraint> getUniqueConstraints() {
+        return this.uniqueConstraints;
+    }
+
+    public void setForeignKeyConstraints(List<ForeignKeyConstraint> foreignKeyConstraints) {
+        this.foreignKeyConstraints = foreignKeyConstraints;
+    }
+
+    public List<ForeignKeyConstraint> getForeignKeyConstraints() {
+        return this.foreignKeyConstraints;
+    }
+
+    public synchronized List<Long> allocatePartitionIdByKey(List<PartitionKey> keys) {
+        long size = partitionKeyToId.size();
+        List<Long> ret = new ArrayList<>();
+        for (PartitionKey key : keys) {
+            Long v = partitionKeyToId.get(key);
+            if (v == null) {
+                partitionKeyToId.put(key, size);
+                v = size;
+                size += 1;
+            }
+            ret.add(v);
+        }
+        return ret;
+    }
+
+    public boolean isTable() {
+        return !type.equals(TableType.MATERIALIZED_VIEW) &&
+                !type.equals(TableType.CLOUD_NATIVE_MATERIALIZED_VIEW) &&
+                !type.equals(TableType.VIEW);
     }
 }

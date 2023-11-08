@@ -31,6 +31,7 @@ import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.DateLiteral;
 import com.starrocks.analysis.DecimalLiteral;
 import com.starrocks.analysis.DictMappingExpr;
+import com.starrocks.analysis.DictQueryExpr;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FloatLiteral;
 import com.starrocks.analysis.FunctionCallExpr;
@@ -50,11 +51,14 @@ import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.SubfieldExpr;
 import com.starrocks.analysis.Subquery;
+import com.starrocks.analysis.TableName;
 import com.starrocks.analysis.VarBinaryLiteral;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.Type;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.ast.ArrayExpr;
 import com.starrocks.sql.ast.LambdaFunctionExpr;
+import com.starrocks.sql.ast.MapExpr;
 import com.starrocks.sql.optimizer.operator.scalar.ArrayOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ArraySliceOperator;
 import com.starrocks.sql.optimizer.operator.scalar.BetweenPredicateOperator;
@@ -68,11 +72,13 @@ import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CompoundPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.DictMappingOperator;
+import com.starrocks.sql.optimizer.operator.scalar.DictQueryOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ExistsPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.InPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.IsNullPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.LambdaFunctionOperator;
 import com.starrocks.sql.optimizer.operator.scalar.LikePredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.MapOperator;
 import com.starrocks.sql.optimizer.operator.scalar.PredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperatorVisitor;
@@ -105,7 +111,6 @@ public class ScalarOperatorToExpr {
     public static class FormatterContext {
         private final Map<ColumnRefOperator, Expr> colRefToExpr;
         private final Map<ColumnRefOperator, ScalarOperator> projectOperatorMap;
-        private boolean implicitCast = false;
 
         public FormatterContext(Map<ColumnRefOperator, Expr> variableToSlotRef) {
             this.colRefToExpr = variableToSlotRef;
@@ -118,9 +123,6 @@ public class ScalarOperatorToExpr {
             this.projectOperatorMap = projectOperatorMap;
         }
 
-        public void setImplicitCast(boolean isImplicit) {
-            this.implicitCast = isImplicit;
-        }
     }
 
     public static class Formatter extends ScalarOperatorVisitor<Expr, FormatterContext> {
@@ -128,6 +130,16 @@ public class ScalarOperatorToExpr {
 
         Formatter(BuildExpr buildExpr) {
             this.buildExpr = buildExpr;
+        }
+
+        /**
+         * For now, backend cannot see the TYPE_NULL and other derived types, like array<null>
+         * So we need to do some hack when transforming ScalarOperator to Expr.
+         */
+        private static void hackTypeNull(Expr expr) {
+            // For primitive types, this can be any legitimate type, for simplicity, we pick boolean.
+            Type type = AnalyzerUtils.replaceNullType2Boolean(expr.getType());
+            expr.setType(type);
         }
 
         @Override
@@ -141,47 +153,58 @@ public class ScalarOperatorToExpr {
             Expr expr = context.colRefToExpr.get(node);
             if (context.projectOperatorMap.containsKey(node) && expr == null) {
                 expr = buildExpr.build(context.projectOperatorMap.get(node), context);
-                if (expr.getType().isNull()) {
-                    // NULL_TYPE hack, this can be any legitimate type, for simplicity, we pick boolean.
-                    expr.setType(Type.BOOLEAN);
-                }
+                hackTypeNull(expr);
                 context.colRefToExpr.put(node, expr);
                 return expr;
             }
 
             if (expr.getType().isNull()) {
-                // NULL_TYPE hack, this can be any legitimate type, for simplicity, we pick boolean.
-                expr.setType(Type.BOOLEAN);
+                hackTypeNull(expr);
             }
             return expr;
         }
 
         @Override
         public Expr visitSubfield(SubfieldOperator node, FormatterContext context) {
-            return new SubfieldExpr(buildExpr.build(node.getChild(0), context), node.getType(), node.getFieldNames());
+            SubfieldExpr expr = new SubfieldExpr(buildExpr.build(node.getChild(0), context), node.getType(),
+                    node.getFieldNames());
+            hackTypeNull(expr);
+            return expr;
         }
 
         @Override
         public Expr visitArray(ArrayOperator node, FormatterContext context) {
-            // NULL_TYPE hack, itemType can be any legitimate type, for simplicity, we pick boolean.
-            Type finalType = Type.ARRAY_NULL.equals(node.getType()) ? Type.ARRAY_BOOLEAN : node.getType();
-            return new ArrayExpr(finalType,
+            ArrayExpr expr = new ArrayExpr(node.getType(),
                     node.getChildren().stream().map(e -> buildExpr.build(e, context)).collect(Collectors.toList()));
+            hackTypeNull(expr);
+            return expr;
+        }
+
+        @Override
+        public Expr visitMap(MapOperator node, FormatterContext context) {
+            MapExpr expr = new MapExpr(node.getType(),
+                    node.getChildren().stream().map(e -> buildExpr.build(e, context)).collect(Collectors.toList()));
+            hackTypeNull(expr);
+            return expr;
         }
 
         @Override
         public Expr visitCollectionElement(CollectionElementOperator node, FormatterContext context) {
-            return new CollectionElementExpr(node.getType(), buildExpr.build(node.getChild(0), context),
-                    buildExpr.build(node.getChild(1), context));
+            CollectionElementExpr expr =
+                    new CollectionElementExpr(node.getType(), buildExpr.build(node.getChild(0), context),
+                            buildExpr.build(node.getChild(1), context));
+            hackTypeNull(expr);
+            return expr;
         }
 
         @Override
         public Expr visitArraySlice(ArraySliceOperator node, FormatterContext context) {
-            ArraySliceExpr arraySliceExpr = new ArraySliceExpr(buildExpr.build(node.getChild(0), context),
+            ArraySliceExpr expr = new ArraySliceExpr(buildExpr.build(node.getChild(0), context),
                     buildExpr.build(node.getChild(1), context),
                     buildExpr.build(node.getChild(2), context));
-            arraySliceExpr.setType(node.getType());
-            return arraySliceExpr;
+            expr.setType(node.getType());
+            hackTypeNull(expr);
+            return expr;
         }
 
         @Override
@@ -190,12 +213,8 @@ public class ScalarOperatorToExpr {
                 Type type = literal.getType();
                 if (literal.isNull()) {
                     NullLiteral nullLiteral = new NullLiteral();
-                    if (literal.getType().isNull()) {
-                        // NULL_TYPE hack, this can be any legitimate type, for simplicity, we pick boolean.
-                        nullLiteral.setType(Type.BOOLEAN);
-                    } else {
-                        nullLiteral.setType(literal.getType());
-                    }
+                    nullLiteral.setType(literal.getType());
+                    hackTypeNull(nullLiteral);
                     nullLiteral.setOriginType(Type.NULL);
                     return nullLiteral;
                 }
@@ -267,47 +286,9 @@ public class ScalarOperatorToExpr {
         }
 
         public Expr visitBinaryPredicate(BinaryPredicateOperator predicate, FormatterContext context) {
-            BinaryPredicate call;
-            switch (predicate.getBinaryType()) {
-                case EQ:
-                    call = new BinaryPredicate(BinaryPredicate.Operator.EQ,
-                            buildExpr.build(predicate.getChildren().get(0), context),
-                            buildExpr.build(predicate.getChildren().get(1), context));
-                    break;
-                case NE:
-                    call = new BinaryPredicate(BinaryPredicate.Operator.NE,
-                            buildExpr.build(predicate.getChildren().get(0), context),
-                            buildExpr.build(predicate.getChildren().get(1), context));
-                    break;
-                case GE:
-                    call = new BinaryPredicate(BinaryPredicate.Operator.GE,
-                            buildExpr.build(predicate.getChildren().get(0), context),
-                            buildExpr.build(predicate.getChildren().get(1), context));
-                    break;
-                case GT:
-                    call = new BinaryPredicate(BinaryPredicate.Operator.GT,
-                            buildExpr.build(predicate.getChildren().get(0), context),
-                            buildExpr.build(predicate.getChildren().get(1), context));
-                    break;
-                case LE:
-                    call = new BinaryPredicate(BinaryPredicate.Operator.LE,
-                            buildExpr.build(predicate.getChildren().get(0), context),
-                            buildExpr.build(predicate.getChildren().get(1), context));
-                    break;
-                case LT:
-                    call = new BinaryPredicate(BinaryPredicate.Operator.LT,
-                            buildExpr.build(predicate.getChildren().get(0), context),
-                            buildExpr.build(predicate.getChildren().get(1), context));
-                    break;
-                case EQ_FOR_NULL:
-                    call = new BinaryPredicate(BinaryPredicate.Operator.EQ_FOR_NULL,
-                            buildExpr.build(predicate.getChildren().get(0), context),
-                            buildExpr.build(predicate.getChildren().get(1), context));
-                    break;
-                default:
-                    return null;
-            }
-
+            BinaryPredicate call = new BinaryPredicate(predicate.getBinaryType(),
+                    buildExpr.build(predicate.getChildren().get(0), context),
+                    buildExpr.build(predicate.getChildren().get(1), context));
             call.setType(Type.BOOLEAN);
             return call;
         }
@@ -381,7 +362,8 @@ public class ScalarOperatorToExpr {
                 expr = new LikePredicate(LikePredicate.Operator.LIKE, child1, child2);
             }
 
-            expr.setFn(Expr.getBuiltinFunction(expr.getOp().name(), new Type[] {child1.getType(), child2.getType()},
+            expr.setFn(Expr.getBuiltinFunction(expr.getOp().name(),
+                    new Type[] {child1.getType(), child2.getType()},
                     Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
 
             expr.setType(Type.BOOLEAN);
@@ -474,10 +456,12 @@ public class ScalarOperatorToExpr {
                             buildExpr.build(call.getChildren().get(1), context));
                     break;
                 // FixMe(kks): InformationFunction shouldn't be CallOperator
+                case "catalog":
                 case "database":
                 case "schema":
                 case "user":
                 case "current_user":
+                case "current_role":
                     callExpr = new InformationFunction(fnName,
                             ((ConstantOperator) call.getChild(0)).getVarchar(),
                             0);
@@ -502,13 +486,16 @@ public class ScalarOperatorToExpr {
                     break;
             }
             callExpr.setType(call.getType());
+            hackTypeNull(callExpr);
             return callExpr;
         }
 
         @Override
         public Expr visitCastOperator(CastOperator operator, FormatterContext context) {
-            CastExpr expr = new CastExpr(operator.getType(), buildExpr.build(operator.getChild(0), context));
-            expr.setImplicit(context.implicitCast);
+            CastExpr expr =
+                    new CastExpr(operator.getType(), buildExpr.build(operator.getChild(0), context));
+            expr.setImplicit(operator.isImplicit());
+            hackTypeNull(expr);
             return expr;
         }
 
@@ -534,6 +521,7 @@ public class ScalarOperatorToExpr {
 
             CaseExpr result = new CaseExpr(caseExpr, list, elseExpr);
             result.setType(operator.getType());
+            hackTypeNull(result);
             return result;
         }
 
@@ -545,6 +533,8 @@ public class ScalarOperatorToExpr {
             for (ColumnRefOperator ref : operator.getRefColumns()) {
                 SlotRef slot = new SlotRef(new SlotDescriptor(
                         new SlotId(ref.getId()), ref.getName(), ref.getType(), ref.isNullable()));
+                slot.setTblName(new TableName(TableName.LAMBDA_FUNC_TABLE, TableName.LAMBDA_FUNC_TABLE));
+                hackTypeNull(slot);
                 context.colRefToExpr.put(ref, slot);
                 arguments.add(slot);
             }
@@ -556,6 +546,7 @@ public class ScalarOperatorToExpr {
                 ColumnRefOperator ref = kv.getKey();
                 SlotRef slot = new SlotRef(new SlotDescriptor(
                         new SlotId(ref.getId()), ref.getName(), ref.getType(), ref.isNullable()));
+                hackTypeNull(slot);
                 commonSubOperatorMap.put(slot, buildExpr.build(kv.getValue(), context));
                 context.colRefToExpr.put(ref, slot);
             }
@@ -565,8 +556,9 @@ public class ScalarOperatorToExpr {
             newArguments.add(lambdaExpr);
             newArguments.addAll(arguments);
 
-            Expr result = new LambdaFunctionExpr(newArguments, commonSubOperatorMap);
+            LambdaFunctionExpr result = new LambdaFunctionExpr(newArguments, commonSubOperatorMap);
             result.setType(Type.FUNCTION);
+            result.checkValidAfterToExpr();
             return result;
         }
 
@@ -595,6 +587,7 @@ public class ScalarOperatorToExpr {
             }
             Expr result = new DictMappingExpr(dictExpr, callExpr);
             result.setType(operator.getType());
+            hackTypeNull(result);
             return result;
         }
 
@@ -608,6 +601,14 @@ public class ScalarOperatorToExpr {
             Subquery subquery = new Subquery(operator.getQueryStatement());
             subquery.setUseSemiAnti(operator.getApplyOperator().isUseSemiAnti());
             return subquery;
+        }
+
+        @Override
+        public Expr visitDictQueryOperator(DictQueryOperator operator, FormatterContext context) {
+            List<Expr> arg = operator.getChildren().stream()
+                    .map(expr -> buildExpr.build(expr, context))
+                    .collect(Collectors.toList());
+            return new DictQueryExpr(arg, operator.getDictQueryExpr(), operator.getFn());
         }
     }
 

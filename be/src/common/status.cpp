@@ -62,6 +62,7 @@ const char* Status::copy_state_with_extra_ctx(const char* state, Slice ctx) {
 }
 
 Status::Status(const TStatus& s) {
+    must_check();
     if (s.status_code != TStatusCode::OK) {
         if (s.error_msgs.empty()) {
             _state = assemble_state(s.status_code, Slice(), Slice());
@@ -72,6 +73,7 @@ Status::Status(const TStatus& s) {
 }
 
 Status::Status(const StatusPB& s) {
+    must_check();
     auto code = (TStatusCode::type)s.status_code();
     if (code != TStatusCode::OK) {
         if (s.error_msgs_size() == 0) {
@@ -128,6 +130,7 @@ bool Status::in_directory_of_inject(const std::string& direct_name) {
 #endif
 
 void Status::to_thrift(TStatus* s) const {
+    mark_checked();
     s->error_msgs.clear();
     if (_state == nullptr) {
         s->status_code = TStatusCode::OK;
@@ -140,6 +143,7 @@ void Status::to_thrift(TStatus* s) const {
 }
 
 void Status::to_protobuf(StatusPB* s) const {
+    mark_checked();
     s->clear_error_msgs();
     if (_state == nullptr) {
         s->set_status_code((int)TStatusCode::OK);
@@ -151,6 +155,7 @@ void Status::to_protobuf(StatusPB* s) const {
 }
 
 std::string Status::code_as_string() const {
+    mark_checked();
     if (_state == nullptr) {
         return "OK";
     }
@@ -213,6 +218,10 @@ std::string Status::code_as_string() const {
         return "Data quality error";
     case TStatusCode::RESOURCE_BUSY:
         return "Resource busy";
+    case TStatusCode::SR_EAGAIN:
+        return "Resource temporarily unavailable";
+    case TStatusCode::REMOTE_FILE_NOT_FOUND:
+        return "Remote file not found";
     default: {
         char tmp[30];
         snprintf(tmp, sizeof(tmp), "Unknown code(%d): ", static_cast<int>(code()));
@@ -223,6 +232,7 @@ std::string Status::code_as_string() const {
 }
 
 std::string Status::to_string() const {
+    mark_checked();
     std::string result(code_as_string());
     if (_state == nullptr) {
         return result;
@@ -235,6 +245,7 @@ std::string Status::to_string() const {
 }
 
 Slice Status::message() const {
+    mark_checked();
     if (_state == nullptr) {
         return {};
     }
@@ -245,6 +256,7 @@ Slice Status::message() const {
 }
 
 Slice Status::detailed_message() const {
+    mark_checked();
     if (_state == nullptr) {
         return {};
     }
@@ -257,26 +269,29 @@ Slice Status::detailed_message() const {
     return {_state + 5, length};
 }
 Status Status::clone_and_prepend(const Slice& msg) const {
+    mark_checked();
     if (ok()) {
         return *this;
     }
     auto msg2 = message();
     std::string_view msg_view(reinterpret_cast<const char*>(msg.data), msg.size);
     std::string_view msg_view2(reinterpret_cast<const char*>(msg2.data), msg2.size);
-    return {code(), fmt::format("{}:{}", msg_view, msg_view2)};
+    return {code(), fmt::format("{}: {}", msg_view, msg_view2)};
 }
 
 Status Status::clone_and_append(const Slice& msg) const {
+    mark_checked();
     if (ok()) {
         return *this;
     }
     auto msg2 = message();
     std::string_view msg_view(reinterpret_cast<const char*>(msg.data), msg.size);
     std::string_view msg_view2(reinterpret_cast<const char*>(msg2.data), msg2.size);
-    return {code(), fmt::format("{}:{}", msg_view2, msg_view)};
+    return {code(), fmt::format("{}: {}", msg_view2, msg_view)};
 }
 
 Status Status::clone_and_append_context(const char* filename, int line, const char* expr) const {
+    mark_checked();
     if (UNLIKELY(ok())) {
         return *this;
     }

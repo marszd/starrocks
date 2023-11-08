@@ -21,7 +21,7 @@ namespace starrocks::pipeline {
 SortedAggregateStreamingSourceOperator::SortedAggregateStreamingSourceOperator(
         OperatorFactory* factory, int32_t id, int32_t plan_node_id, int32_t driver_sequence,
         std::shared_ptr<SortedStreamingAggregator> aggregator)
-        : SourceOperator(factory, id, "sorted_aggregate_streaming_source", plan_node_id, driver_sequence),
+        : SourceOperator(factory, id, "sorted_aggregate_streaming_source", plan_node_id, false, driver_sequence),
           _aggregator(std::move(aggregator)) {
     _aggregator->ref();
 }
@@ -69,9 +69,6 @@ StatusOr<ChunkPtr> SortedAggregateStreamingSourceOperator::pull_chunk(RuntimeSta
     ChunkPtr chunk;
     if (!_aggregator->is_chunk_buffer_empty()) {
         chunk = _aggregator->poll_chunk_buffer();
-    } else {
-        ASSIGN_OR_RETURN(chunk, _aggregator->pull_eos_chunk());
-        _aggregator->set_ht_eos();
     }
     if (chunk == nullptr) {
         return chunk;

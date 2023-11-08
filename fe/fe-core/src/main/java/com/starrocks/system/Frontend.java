@@ -34,8 +34,9 @@
 
 package com.starrocks.system;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.Config;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.ha.BDBHA;
@@ -48,9 +49,13 @@ import java.io.DataOutput;
 import java.io.IOException;
 
 public class Frontend implements Writable {
+    @SerializedName(value = "r")
     private FrontendNodeType role;
+    @SerializedName(value = "n")
     private String nodeName;
+    @SerializedName(value = "h")
     private String host;
+    @SerializedName(value = "e")
     private int editLogPort;
 
     private int queryPort;
@@ -129,6 +134,16 @@ public class Frontend implements Writable {
         this.editLogPort = editLogPort;
     }
 
+    @VisibleForTesting
+    public void setRpcPort(int rpcPort) {
+        this.rpcPort = rpcPort;
+    }
+
+    @VisibleForTesting
+    public void setAlive(boolean isAlive) {
+        this.isAlive = isAlive;
+    }
+
     /**
      * handle Frontend's heartbeat response.
      * Because the replayed journal id is very likely to be changed at each heartbeat response,
@@ -137,6 +152,8 @@ public class Frontend implements Writable {
      */
     public boolean handleHbResponse(FrontendHbResponse hbResponse, boolean isReplay) {
         boolean isChanged = false;
+        boolean prevIsAlive = isAlive;
+        long prevStartTime = startTime;
         if (hbResponse.getStatus() == HbStatus.OK) {
             if (!isAlive && !isReplay) {
                 if (GlobalStateMgr.getCurrentState().getHaProtocol() instanceof BDBHA) {
@@ -181,6 +198,15 @@ public class Frontend implements Writable {
                 heartbeatRetryTimes = 0;
             }
         }
+
+        if (!GlobalStateMgr.isCheckpointThread()) {
+            if (prevIsAlive && !isAlive) {
+                GlobalStateMgr.getCurrentState().getSlotManager().notifyFrontendDeadAsync(nodeName);
+            } else if (prevStartTime != 0 && prevStartTime != startTime) {
+                GlobalStateMgr.getCurrentState().getSlotManager().notifyFrontendRestartAsync(nodeName, startTime);
+            }
+        }
+
         return isChanged;
     }
 
@@ -196,11 +222,7 @@ public class Frontend implements Writable {
         role = FrontendNodeType.valueOf(Text.readString(in));
         host = Text.readString(in);
         editLogPort = in.readInt();
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_41) {
-            nodeName = Text.readString(in);
-        } else {
-            nodeName = GlobalStateMgr.genFeNodeName(host, editLogPort, true /* old style */);
-        }
+        nodeName = Text.readString(in);
     }
 
     public static Frontend read(DataInput in) throws IOException {

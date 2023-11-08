@@ -1,5 +1,164 @@
 # StarRocks version 2.3
 
+## 2.3.16
+
+Release date: August 4, 2023
+
+### Bug Fixes
+
+Fixed the following issue:
+
+FE memory leak caused by blocked LabelCleaner threads. [#28311](https://github.com/StarRocks/starrocks/pull/28311) [#28636](https://github.com/StarRocks/starrocks/pull/28636)
+
+## 2.3.15
+
+Release date: July 31, 2023
+
+## Improvements
+
+- Optimized tablet scheduling logic to prevent tablets remaining pending for a long period or an FE crashing under certain circumstances. [#21647](https://github.com/StarRocks/starrocks/pull/21647) [#23062](https://github.com/StarRocks/starrocks/pull/23062) [#25785](https://github.com/StarRocks/starrocks/pull/25785)
+- Optimized the scheduling logic of TabletChecker to prevent the checker from repeatedly scheduling tablets that are not repaired. [#27648](https://github.com/StarRocks/starrocks/pull/27648)
+- The partition metadata records visibleTxnId, which corresponds to the visible version of tablet replicas. When the version of a replica is inconsistent with others, it is easier to trace the transaction that created this version. [#27924](https://github.com/StarRocks/starrocks/pull/27924)
+
+### Bug Fixes
+
+Fixed the following issues:
+
+- Incorrect table-level scan statistics in the FEs cause inaccurate metrics related to table queries and loading. [#28022](https://github.com/StarRocks/starrocks/pull/28022)
+- BEs may crash if the Join key is a large BINARY column. [#25084](https://github.com/StarRocks/starrocks/pull/25084)
+- An aggregate operator may trigger thread safety issues in certain scenarios, causing BEs to crash. [#26092](https://github.com/StarRocks/starrocks/pull/26092)
+- The version number for a tablet is inconsistent between the BE and FE after data is restored by using [RESTORE](../sql-reference/sql-statements/data-definition/RESTORE.md). [#26518](https://github.com/StarRocks/starrocks/pull/26518/files)
+- Partitions cannot be automatically created after the table is recovered by using [RECOVER](../sql-reference/sql-statements/data-definition/RECOVER.md). [#26813](https://github.com/StarRocks/starrocks/pull/26813)
+- The loading transaction is stuck in the Pending state and DDL statements are hung if data to be loaded using INSERT INTO does not meet quality requirements and the strict mode is enabled for data loading. [#27140](https://github.com/StarRocks/starrocks/pull/27140)
+- Some INSERT jobs return `[42000][1064] Dict Decode failed, Dict can't take cover all key :0` if low-cardinality optimization is enabled. [#27395](https://github.com/StarRocks/starrocks/pull/27395)
+- In certain cases, the INSERT INTO SELECT operation times out when the Pipeline is not enabled. [#26594](https://github.com/StarRocks/starrocks/pull/26594)
+- The query returns no data when the query condition is `WHERE partition_column < xxx` and the value in `xxx` is only accurate to the hour, not to minute and second, for example, `2023-7-21 22`. [#27780](https://github.com/StarRocks/starrocks/pull/27780)
+
+## 2.3.14
+
+Release date: June 28, 2023
+
+### Improvements
+
+- Optimized the error message returned when CREATE TABLE times out and added parameter tuning tips. [#24510](https://github.com/StarRocks/starrocks/pull/24510)
+- Optimized the memory usage for the Primary Key tables with a large number of accumulated tablet versions. [#20760](https://github.com/StarRocks/starrocks/pull/20760)
+- The synchronization of StarRocks external table metadata has been changed to occur during data loading. [#24739](https://github.com/StarRocks/starrocks/pull/24739)
+- Removed the dependency of NetworkTime on system clocks to fix incorrect NetworkTime caused by inconsistent system clocks across servers. [#24858](https://github.com/StarRocks/starrocks/pull/24858)
+
+### Bug Fixes
+
+Fixed the following issues:
+
+- When low cardinality dictionary optimization is applied for small tables that undergo frequent TRUNCATE operations, queries may encounter errors. [#23185](https://github.com/StarRocks/starrocks/pull/23185)
+- BEs may crash when a view that contains UNION whose first child is a constant NULL is queried. [#13792](https://github.com/StarRocks/starrocks/pull/13792)  
+- In some cases, a query based on Bitmap Index may return an error. [#23484](https://github.com/StarRocks/starrocks/pull/23484)
+- The result of rounding a DOUBLE or FLOAT value into a DECIMAL value in BEs is inconsistent with the result in FEs. [#23152](https://github.com/StarRocks/starrocks/pull/23152)
+- A schema change sometimes may be hung if data loading occurs simultaneously with the schema change. [#23456](https://github.com/StarRocks/starrocks/pull/23456)
+- When you load a Parquet file into StarRocks by using Broker Load, Spark connector or Flink connector, BE OOM issues may occur. [#25254](https://github.com/StarRocks/starrocks/pull/25254)
+- The error message `unknown error` is returned when a constant is specified in the ORDER BY clause and there is a LIMIT clause in the query. [#25538](https://github.com/StarRocks/starrocks/pull/25538)
+
+## 2.3.13
+
+Release date: June 1, 2023
+
+### Improvements
+
+- Optimized the error message reported when INSERT INTO ... SELECT expires due to a small `thrift_server_max_worker_thread` value. [#21964](https://github.com/StarRocks/starrocks/pull/21964)
+- Reduced memory consumption and optimized performance for multi-table joins that use the `bitmap_contains` function. [#20617](https://github.com/StarRocks/starrocks/pull/20617) [#20653](https://github.com/StarRocks/starrocks/pull/20653)
+
+### Bug Fixes
+
+The following bugs are fixed:
+
+- Truncating partitions fails because the TRUNCATE operation is case-sensitive to partition names. [#21809](https://github.com/StarRocks/starrocks/pull/21809)
+- Loading int96 timestamp data from Parquet files causes data overflow. [#22355](https://github.com/StarRocks/starrocks/issues/22355)
+- Decommissioning a BE fails after a materialized view is dropped. [#22743](https://github.com/StarRocks/starrocks/issues/22743)
+- When the execution plan for a query includes a Broadcast Join followed by a Bucket Shuffle Join, such as `SELECT * FROM t1 JOIN [Broadcast] t2 ON t1.a = t2.b JOIN [Bucket] t3 ON t2.b = t3.c`, and the data of the equijoin key of the left table in the Broadcast Join is deleted before the data is sent to Bucket Shuffle Join, a BE may crash. [#23227](https://github.com/StarRocks/starrocks/pull/23227)
+- When the execution plan for a query includes a Cross Join followed by a Hash Join, and the right table of the Hash Join within a fragment instance is empty, the returned result may be incorrect. [#23877](https://github.com/StarRocks/starrocks/pull/23877)
+- Decommissioning a BE fails due to failures in creating temporary partitions for materialized views. [#22745](https://github.com/StarRocks/starrocks/pull/22745)
+- If a SQL statement contains a STRING value with multiple escape characters, the SQL statement cannot be parsed. [#23119](https://github.com/StarRocks/starrocks/issues/23119)
+- Querying the data with the maximum value in the partition column fails. [#23153](https://github.com/StarRocks/starrocks/issues/23153)
+- Load jobs fail after StarRocks rolls back from v2.4 to v2.3. [#23642](https://github.com/StarRocks/starrocks/pull/23642)
+- Issues related to column pruning and reuse. [#16624](https://github.com/StarRocks/starrocks/issues/16624)
+
+## 2.3.12
+
+Release date: April 25, 2023
+
+### Improvements
+
+Supports implicit conversion if the returned value of an expression can be converted to a valid Boolean value. [# 21792](https://github.com/StarRocks/starrocks/pull/21792)
+
+### Bug Fixes
+
+The following bugs are fixed:
+
+- If a user's LOAD_PRIV is granted at the table level, an error message `Access denied; you need (at least one of) the LOAD privilege(s) for this operation`  is returned at transaction rollback in the event of a load job failure. [# 21129](https://github.com/StarRocks/starrocks/issues/21129)
+- After ALTER SYSTEM DROP BACKEND is executed to drop a BE, the replicas of tables whose replication number is set to 2 on that BE cannot be repaired. In this situation, data loads into these tables fail. [# 20681](https://github.com/StarRocks/starrocks/pull/20681)
+- NPE is returned when an unsupported data type is used in CREATE TABLE. [# 20999](https://github.com/StarRocks/starrocks/issues/20999)
+- The shortcircut logic of the Broadcast Join is abnormal, leading to incorrect query results. [# 20952](https://github.com/StarRocks/starrocks/issues/20952)
+- Disk usage may increase significantly after materialized views are used. [# 20590](https://github.com/StarRocks/starrocks/pull/20590)
+- The Audit Loader plugin cannot be completely uninstalled. [# 20468](https://github.com/StarRocks/starrocks/issues/20468)
+- The number of rows displayed in the result of `INSERT INTO XXX SELECT` may not match the result of `SELECT COUNT(*) FROM XXX`. [# 20084](https://github.com/StarRocks/starrocks/issues/20084)
+- If a subquery uses window functions and its parent query uses the GROUP BY clause, the query result cannot be aggregated. [# 19725](https://github.com/StarRocks/starrocks/issues/19725)
+- When a BE is started, the BE process exists but all the BE’s ports cannot be open. [# 19347](https://github.com/StarRocks/starrocks/pull/19347)
+- If the disk I/O is exceedingly high, transactions on Primary Key tables are slowly committed, and consequently queries on these tables may return an error "backend not found". [# 18835](https://github.com/StarRocks/starrocks/issues/18835)
+
+## 2.3.11
+
+Release date: March 28, 2023
+
+### Improvements
+
+- Executing complex queries that contain many expressions usually generates a large number of `ColumnRefOperators`. Originally, StarRocks uses `BitSet` to store `ColumnRefOperator::id`, which consumes a large amount of memory. In order to reduce memory usage, StarRocks now uses `RoaringBitMap` to store `ColumnRefOperator::id`. [#16499](https://github.com/StarRocks/starrocks/pull/16499)
+- A new I/O scheduling strategy is introduced to reduce the performance impact of large queries on small queries. To enable the new I/O scheduling strategy, configure the BE static parameter `pipeline_scan_queue_mode=1` in **be.conf** and then restart BEs. [#19009](https://github.com/StarRocks/starrocks/pull/19009)
+
+### Bug Fixes
+
+The following bugs are fixed:
+
+- A table whose expired data is not properly recycled occupies a relatively large portion of disk space. [#19796](https://github.com/StarRocks/starrocks/pull/19796)
+- The error message displayed in the following scenario is not informative: A Broker Load job loads Parquet files into StarRocks and a `NULL` value is loaded into a NOT NULL column. [#19885](https://github.com/StarRocks/starrocks/pull/19885)
+- Frequently creating a large number of temporary partitions to replace existing partitions leads to memory leaks and Full GC on the FE nodes. [#19283](https://github.com/StarRocks/starrocks/pull/19283)
+- For Colocation tables, the replica status can be manually specified as `bad` by using statements like `ADMIN SET REPLICA STATUS PROPERTIES ("tablet_id" = "10003", "backend_id" = "10001", "status" = "bad");`. If the number of BEs is less than or equal to the number of replicas, the corrupted replica cannot be repaired. [#19443](https://github.com/StarRocks/starrocks/pull/19443)
+- When the request `INSERT INTO SELECT` is sent to a Follower FE, the parameter `parallel_fragment_exec_instance_num` does not take effect. [#18841](https://github.com/StarRocks/starrocks/pull/18841)
+- When the operator `<=>` is used to compare a value with a `NULL` value, the comparison result is incorrect. [#19210](https://github.com/StarRocks/starrocks/pull/19210)
+- The query concurrency metric decreases slowly when the concurrency limit of a resource group is continuously reached. [#19363](https://github.com/StarRocks/starrocks/pull/19363)
+- Highly concurrent data load jobs may cause the error `"get database read lock timeout, database=xxx"`. [#16748](https://github.com/StarRocks/starrocks/pull/16748) [#18992](https://github.com/StarRocks/starrocks/pull/18992)
+
+## 2.3.10
+
+Release date: March 9, 2023
+
+### Improvements
+
+Optimized the inference of `storage_medium`. When BEs use both SSD and HDD as storage devices,  if the property `storage_cooldown_time` is specified, StarRocks sets `storage_medium` to `SSD`. Otherwise, StarRocks sets `storage_medium` to `HDD`. [#18649](https://github.com/StarRocks/starrocks/pull/18649)
+
+### Bug Fixes
+
+The following bugs are fixed:
+
+- A query may fail if ARRAY data from Parquet files in data lakes is queried. [#17626](https://github.com/StarRocks/starrocks/pull/17626) [#17788](https://github.com/StarRocks/starrocks/pull/17788) [#18051](https://github.com/StarRocks/starrocks/pull/18051)
+- The Stream Load job initiated by a program is hung and the FE does not receive the HTTP request sent by the program. [#18559](https://github.com/StarRocks/starrocks/pull/18559)
+- An error may occur when an Elasticsearch external table is queried. [#13727](https://github.com/StarRocks/starrocks/pull/13727)
+- BEs may crash if an expression encounters an error during initialization. [#11396](https://github.com/StarRocks/starrocks/pull/11396)
+- A query may fail if the SQL statement uses an empty array literal `[]`. [#18550](https://github.com/StarRocks/starrocks/pull/18550)
+- After StarRocks is upgraded from version 2.2 and later to version 2.3.9 and later, an error `No match for <expr> with operand types xxx and xxx` may occur when a Routine Load job is created with a calculation expression specified in the `COLUMN` parameter. [#17856](https://github.com/StarRocks/starrocks/pull/17856)
+- A load job is hung after a BE restarts. [#18488](https://github.com/StarRocks/starrocks/pull/18488)
+- When a SELECT statement uses an OR operator in the WHERE clause, extra partitions are scanned. [#18610](https://github.com/StarRocks/starrocks/pull/18610)
+
+## 2.3.9
+
+Release date: February 20, 2023
+
+### Bug Fixes
+
+- During a schema change, if a tablet clone is triggered and the BE nodes on which the tablet replicas reside change, the schema change fails. [#16948](https://github.com/StarRocks/starrocks/pull/16948)
+- The string returned by the group_concat() function is truncated. [#16948](https://github.com/StarRocks/starrocks/pull/16948)
+- When you use Broker Load to load data from HDFS through Tencent Big Data Suite (TBDS), an error `invalid hadoop.security.authentication.tbds.securekey` occurs, indicating that StarrRocks cannot access HDFS by using the authentication information provided by TBDS. [#14125](https://github.com/StarRocks/starrocks/pull/14125) [#15693](https://github.com/StarRocks/starrocks/pull/15693)
+- In some cases, CBO may use incorrect logic to compare whether two operators are equivalent. [#17227](https://github.com/StarRocks/starrocks/pull/17227) [#17199](https://github.com/StarRocks/starrocks/pull/17199)
+- When you connect to a non-Leader FE node and send the SQL statement `USE <catalog_name>.<database_name>`, the non-Leader FE node forwards the SQL statement, with `<catalog_name>` excluded, to the Leader FE node. As a result, the Leader FE node chooses to use the `default_catalog` and eventually fails to find the specified database. [#17302](https://github.com/StarRocks/starrocks/pull/17302)
+
 ## 2.3.8
 
 Release date: February 2, 2023
@@ -36,6 +195,10 @@ Release date: December 22, 2022
 
 - The Pipeline execution engine supports INSERT INTO statements. To enable it, set the FE configuration item `enable_pipeline_load_for_insert` to `true`.  [#14723](https://github.com/StarRocks/starrocks/pull/14723)
 - The memory used by Compaction for the primary key table is reduced. [#13861](https://github.com/StarRocks/starrocks/pull/13861)  [#13862](https://github.com/StarRocks/starrocks/pull/13862)
+
+### Behavior Change
+
+- Deprecated the FE parameter `default_storage_medium`. The storage medium of a table is automatically inferred by the system. [#14394](https://github.com/StarRocks/starrocks/pull/14394)
 
 ### Bug Fixes
 
@@ -192,16 +355,15 @@ Release date: July 29, 2022
 
 ### New Features
 
-- The Primary Key model supports complete DELETE WHERE syntax. For more information, see [DELETE](../sql-reference/sql-statements/data-manipulation/DELETE.md#delete-and-primary-key-model).
-
-- The Primary Key model supports persistent primary key indexes. You can choose to persist the primary key index on disk rather than in memory, significantly reducing memory usage. For more information, see [Primary Key model](../table_design/Data_model.md#how-to-use-it-3).
+- The Primary Key table supports complete DELETE WHERE syntax. For more information, see [DELETE](../sql-reference/sql-statements/data-manipulation/DELETE.md#delete-data-by-primary-key).
+- The Primary Key table supports persistent primary key indexes. You can choose to persist the primary key index on disk rather than in memory, significantly reducing memory usage. For more information, see [Primary Key table](../table_design/table_types/primary_key_table.md).
 - Global dictionary can be updated during real-time data ingestion，optimizing query performance and delivering 2X query performance for string data.
-- The CREATE TABLE AS SELECT statement can be executed asynchronously. For more information, see [CREATE TABLE AS SELECT](../sql-reference/sql-statements/data-definition/CREATE%20TABLE%20AS%20SELECT.md).
+- The CREATE TABLE AS SELECT statement can be executed asynchronously. For more information, see [CREATE TABLE AS SELECT](../sql-reference/sql-statements/data-definition/CREATE_TABLE_AS_SELECT.md).
 - Support the following resource group-related features:
   - Monitor resource groups: You can view the resource group of the query in the audit log and obtain the metrics of the resource group by calling APIs. For more information, see [Monitor and Alerting](../administration/Monitor_and_Alert.md#monitor-and-alerting).
   - Limit the consumption of large queries on CPU, memory, and I/O resources: You can route queries to specific resource groups based on the classifiers or by configuring session variables. For more information, see [Resource group](../administration/resource_group.md).
 - JDBC external tables can be used to conveniently query data in Oracle, PostgreSQL, MySQL, SQLServer, ClickHouse, and other databases. StarRocks also supports predicate pushdown, improving query performance. For more information, see [External table for a JDBC-compatible database](../data_source/External_table.md#external-table-for-a-JDBC-compatible-database).
-- [Preview] A new Data Source Connector framework is released to support external catalogs. You can use external catalogs to directly access and query Hive data without creating external tables. For more information, see [Use catalogs to manage internal and external data](https://docs.starrocks.io/en-us/2.3/data_source/Manage_data).
+- [Preview] A new Data Source Connector framework is released to support external catalogs. You can use external catalogs to directly access and query Hive data without creating external tables. For more information, see [Use catalogs to manage internal and external data](../data_source/catalog/query_external_data.md).
 - Added the following functions:
   - [window_funnel](../sql-reference/sql-functions/aggregate-functions/window_funnel.md)
   - [ntile](../sql-reference/sql-functions/Window_function.md)
@@ -218,7 +380,7 @@ Release date: July 29, 2022
   - Equivalence comparison operators that contain functions can use Zone Map indexes when these operators are pushed down to scan operators.
 - Optimized Apache Hive™ external tables.
   - When Apache Hive™ tables are stored in Parquet, ORC, or CSV format, schema changes caused by ADD COLUMN or REPLACE COLUMN on Hive can be synchronized to StarRocks when you execute the REFRESH statement on the corresponding Hive external table. For more information, see [Hive external table](../data_source/External_table.md#hive-external-table).
-  - `hive.metastore.uris` can be modified for Hive resources. For more information, see [ALTER RESOURCE](../sql-reference/sql-statements/data-definition/ALTER%20RESOURCE.md).
+  - `hive.metastore.uris` can be modified for Hive resources. For more information, see [ALTER RESOURCE](../sql-reference/sql-statements/data-definition/ALTER_RESOURCE.md).
 - Optimized the performance of Apache Iceberg external tables. A custom catalog can be used to create an Iceberg resource. For more information, see [Apache Iceberg external table](../data_source/External_table.md#apache-iceberg-external-table).
 - Optimized the performance of Elasticsearch external tables. Sniffing the addresses of the data nodes in an Elasticsearch cluster can be disabled. For more information, see [Elasticsearch external table](../data_source/External_table.md#elasticsearch-external-table).
 - When the sum() function accepts a numeric string, it implicitly converts the numeric string.
@@ -237,5 +399,9 @@ Fixed the following bugs:
 
 - StarGo, a cluster management tool, can deploy, start, upgrade, and roll back clusters and manage multiple clusters. For more information, see [Deploy StarRocks with StarGo](../administration/stargo.md).
 - The pipeline engine is enabled by default when you upgrade StarRocks to version 2.3 or deploy StarRocks. The pipeline engine can improve the performance of simple queries in high concurrency scenarios and complex queries. If you detect significant performance regressions when using StarRocks 2.3, you can disable the pipeline engine by executing the `SET GLOBAL` statement to set `enable_pipeline_engine` to `false`.
-- The [SHOW GRANTS](../sql-reference/sql-statements/account-management/SHOW%20GRANTS.md) statement is compatible with the MySQL syntax and displays the privileges assigned to a user in the form of GRANT statements.
+- The [SHOW GRANTS](../sql-reference/sql-statements/account-management/SHOW_GRANTS.md) statement is compatible with the MySQL syntax and displays the privileges assigned to a user in the form of GRANT statements.
 - It is recommended that the memory_limitation_per_thread_for_schema_change ( BE configuration item)  use the default value 2 GB, and data is written to disk when data volume exceeds this limit. Therefore, if you have previously set this parameter to a larger value, it is recommended that you set it to 2 GB, otherwise a schema change task may take up a large amount of memory.
+
+### Upgrade notes
+
+To roll back to the previous version that was used before the upgrade, add the `ignore_unknown_log_id` parameter to the **fe.conf** file of each FE and set the parameter to `true`. The parameter is required because new types of logs are added in StarRocks v2.2.0. If you do not add the parameter, you cannot roll back to the previous version. We recommend that you set the `ignore_unknown_log_id` parameter to `false` in the **fe.conf** file of each FE after checkpoints are created. Then, restart the FEs to restore the FEs to the previous configurations.

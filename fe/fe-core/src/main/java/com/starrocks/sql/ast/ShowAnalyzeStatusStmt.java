@@ -19,14 +19,15 @@ import com.google.common.collect.Lists;
 import com.starrocks.analysis.Predicate;
 import com.starrocks.analysis.RedirectStatus;
 import com.starrocks.catalog.Column;
-import com.starrocks.catalog.Database;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.MetaNotFoundException;
-import com.starrocks.privilege.PrivilegeManager;
+import com.starrocks.privilege.AccessDeniedException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ShowResultSetMetaData;
-import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.common.MetaUtils;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.statistic.AnalyzeStatus;
 import com.starrocks.statistic.StatisticUtils;
 import com.starrocks.statistic.StatsConstants;
@@ -35,8 +36,14 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 public class ShowAnalyzeStatusStmt extends ShowStmt {
+
     public ShowAnalyzeStatusStmt(Predicate predicate) {
-        setPredicate(predicate);
+        this(predicate, NodePosition.ZERO);
+    }
+
+    public ShowAnalyzeStatusStmt(Predicate predicate, NodePosition pos) {
+        super(pos);
+        this.predicate = predicate;
     }
 
     private static final ShowResultSetMetaData META_DATA =
@@ -57,25 +64,20 @@ public class ShowAnalyzeStatusStmt extends ShowStmt {
     public static List<String> showAnalyzeStatus(ConnectContext context,
                                                  AnalyzeStatus analyzeStatus) throws MetaNotFoundException {
         List<String> row = Lists.newArrayList("", "", "", "ALL", "", "", "", "", "", "", "");
-        long dbId = analyzeStatus.getDbId();
-        long tableId = analyzeStatus.getTableId();
         List<String> columns = analyzeStatus.getColumns();
 
         row.set(0, String.valueOf(analyzeStatus.getId()));
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
-        if (db == null) {
-            throw new MetaNotFoundException("No found database: " + dbId);
-        }
-        row.set(1, db.getOriginName());
-        Table table = db.getTable(tableId);
-        if (table == null) {
-            throw new MetaNotFoundException("No found table: " + tableId);
-        }
-        row.set(2, table.getName());
+        row.set(1, analyzeStatus.getCatalogName() + "." + analyzeStatus.getDbName());
+        row.set(2, analyzeStatus.getTableName());
+
+        Table table = MetaUtils.getTable(analyzeStatus.getCatalogName(), analyzeStatus.getDbName(),
+                analyzeStatus.getTableName());
 
         // In new privilege framework(RBAC), user needs any action on the table to show analysis status for it.
-        if (context.getGlobalStateMgr().isUsingNewPrivilege() &&
-                !PrivilegeManager.checkAnyActionOnTable(context, db.getOriginName(), table.getName())) {
+        try {
+            Authorizer.checkAnyActionOnTableLikeObject(context.getCurrentUserIdentity(),
+                    context.getCurrentRoleIds(), analyzeStatus.getDbName(), table);
+        } catch (AccessDeniedException e) {
             return null;
         }
 

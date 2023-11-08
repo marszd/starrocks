@@ -124,7 +124,8 @@ static bool is_format_support_streaming(TFileFormatType::type format) {
     }
 }
 
-StreamLoadAction::StreamLoadAction(ExecEnv* exec_env) : _exec_env(exec_env) {
+StreamLoadAction::StreamLoadAction(ExecEnv* exec_env, ConcurrentLimiter* limiter)
+        : _exec_env(exec_env), _http_concurrent_limiter(limiter) {
     StarRocksMetrics::instance()->metrics()->register_metric("streaming_load_requests_total",
                                                              &streaming_load_requests_total);
     StarRocksMetrics::instance()->metrics()->register_metric("streaming_load_bytes", &streaming_load_bytes);
@@ -145,15 +146,15 @@ void StreamLoadAction::handle(HttpRequest* req) {
     if (ctx->status.ok()) {
         ctx->status = _handle(ctx);
         if (!ctx->status.ok() && ctx->status.code() != TStatusCode::PUBLISH_TIMEOUT) {
-            LOG(WARNING) << "Fail to handle streaming load, id=" << ctx->id
-                         << " errmsg=" << ctx->status.get_error_msg();
+            LOG(WARNING) << "Fail to handle streaming load, id=" << ctx->id << " errmsg=" << ctx->status.get_error_msg()
+                         << " " << ctx->brief();
         }
     }
     ctx->load_cost_nanos = MonotonicNanos() - ctx->start_nanos;
 
     if (!ctx->status.ok() && ctx->status.code() != TStatusCode::PUBLISH_TIMEOUT) {
         if (ctx->need_rollback) {
-            _exec_env->stream_load_executor()->rollback_txn(ctx);
+            (void)_exec_env->stream_load_executor()->rollback_txn(ctx);
             ctx->need_rollback = false;
         }
         if (ctx->body_sink != nullptr) {
@@ -186,7 +187,7 @@ Status StreamLoadAction::_handle(StreamLoadContext* ctx) {
     } else {
         if (ctx->buffer != nullptr && ctx->buffer->pos > 0) {
             ctx->buffer->flip();
-            ctx->body_sink->append(std::move(ctx->buffer));
+            RETURN_IF_ERROR(ctx->body_sink->append(std::move(ctx->buffer)));
             ctx->buffer = nullptr;
         }
         RETURN_IF_ERROR(ctx->body_sink->finish());
@@ -199,7 +200,6 @@ Status StreamLoadAction::_handle(StreamLoadContext* ctx) {
     int64_t commit_and_publish_start_time = MonotonicNanos();
     RETURN_IF_ERROR(_exec_env->stream_load_executor()->commit_txn(ctx));
     ctx->commit_and_publish_txn_cost_nanos = MonotonicNanos() - commit_and_publish_start_time;
-
     return Status::OK();
 }
 
@@ -220,7 +220,19 @@ int StreamLoadAction::on_header(HttpRequest* req) {
         ctx->label = generate_uuid_string();
     }
 
-    LOG(INFO) << "new income streaming load request." << ctx->brief() << ", db=" << ctx->db << ", tbl=" << ctx->table;
+    if (config::enable_http_stream_load_limit && !ctx->check_and_set_http_limiter(_http_concurrent_limiter)) {
+        LOG(WARNING) << "income streaming load request hit limit." << ctx->brief() << ", db=" << ctx->db
+                     << ", tbl=" << ctx->table;
+        ctx->status =
+                Status::ResourceBusy(fmt::format("Stream Load exceed http cuncurrent limit {}, please try again later",
+                                                 config::be_http_num_workers - 1));
+        auto str = ctx->to_json();
+        HttpChannel::send_reply(req, str);
+        return -1;
+    } else {
+        LOG(INFO) << "new income streaming load request." << ctx->brief() << ", db=" << ctx->db
+                  << ", tbl=" << ctx->table;
+    }
 
     VLOG(1) << "streaming load request: " << req->debug_string();
 
@@ -228,7 +240,7 @@ int StreamLoadAction::on_header(HttpRequest* req) {
     if (!st.ok()) {
         ctx->status = st;
         if (ctx->need_rollback) {
-            _exec_env->stream_load_executor()->rollback_txn(ctx);
+            (void)_exec_env->stream_load_executor()->rollback_txn(ctx);
             ctx->need_rollback = false;
         }
         if (ctx->body_sink != nullptr) {
@@ -311,7 +323,6 @@ Status StreamLoadAction::_on_header(HttpRequest* http_req, StreamLoadContext* ct
     int64_t begin_txn_start_time = MonotonicNanos();
     RETURN_IF_ERROR(_exec_env->stream_load_executor()->begin_txn(ctx));
     ctx->begin_txn_cost_nanos = MonotonicNanos() - begin_txn_start_time;
-
     // process put file
     return _process_put(http_req, ctx);
 }
@@ -368,6 +379,7 @@ void StreamLoadAction::on_chunk_data(HttpRequest* req) {
         }
         ctx->buffer->pos += remove_bytes;
         ctx->receive_bytes += remove_bytes;
+        ctx->total_receive_bytes += remove_bytes;
     }
     ctx->total_received_data_cost_nanos += (MonotonicNanos() - start_read_data_time);
 }
@@ -426,11 +438,15 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
         request.__set_rowDelimiter(http_req->header(HTTP_ROW_DELIMITER));
     }
     if (!http_req->header(HTTP_SKIP_HEADER).empty()) {
-        auto skip_header = std::stoll(http_req->header(HTTP_SKIP_HEADER));
-        if (skip_header < 0) {
-            return Status::InvalidArgument("skip_header must be equal or greater than 0");
+        try {
+            auto skip_header = std::stoll(http_req->header(HTTP_SKIP_HEADER));
+            if (skip_header < 0) {
+                return Status::InvalidArgument("skip_header must be equal or greater than 0");
+            }
+            request.__set_skipHeader(skip_header);
+        } catch (const std::invalid_argument& e) {
+            return Status::InvalidArgument("Invalid csv load skip_header format");
         }
-        request.__set_skipHeader(skip_header);
     }
     if (!http_req->header(HTTP_TRIM_SPACE).empty()) {
         if (boost::iequals(http_req->header(HTTP_TRIM_SPACE), "false")) {
@@ -516,6 +532,15 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     if (!http_req->header(HTTP_MERGE_CONDITION).empty()) {
         request.__set_merge_condition(http_req->header(HTTP_MERGE_CONDITION));
     }
+    if (!http_req->header(HTTP_PARTIAL_UPDATE_MODE).empty()) {
+        if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "row") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::ROW_MODE);
+        } else if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "auto") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::AUTO_MODE);
+        } else if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "column") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::COLUMN_UPSERT_MODE);
+        }
+    }
     if (!http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE).empty()) {
         request.__set_transmission_compression_type(http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE));
     }
@@ -527,10 +552,24 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
             return Status::InvalidArgument("Invalid load_dop format");
         }
     }
+    if (!http_req->header(HTTP_LOG_REJECTED_RECORD_NUM).empty()) {
+        try {
+            auto log_rejected_record_num = std::stoll(http_req->header(HTTP_LOG_REJECTED_RECORD_NUM));
+            if (log_rejected_record_num < -1) {
+                return Status::InvalidArgument("log_rejected_record_num must be equal or greater than -1");
+            }
+            request.__set_log_rejected_record_num(log_rejected_record_num);
+        } catch (const std::invalid_argument& e) {
+            return Status::InvalidArgument("Invalid log_rejected_record_num format");
+        }
+    }
+    int32_t rpc_timeout_ms = config::txn_commit_rpc_timeout_ms;
     if (ctx->timeout_second != -1) {
         request.__set_timeout(ctx->timeout_second);
+        rpc_timeout_ms = std::min(ctx->timeout_second * 1000 / 2, rpc_timeout_ms);
+        rpc_timeout_ms = std::max(ctx->timeout_second * 1000 / 4, rpc_timeout_ms);
     }
-    request.__set_thrift_rpc_timeout_ms(config::thrift_rpc_timeout_ms);
+    request.__set_thrift_rpc_timeout_ms(rpc_timeout_ms);
     // plan this load
     TNetworkAddress master_addr = get_master_address();
 #ifndef BE_TEST
@@ -541,7 +580,8 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
     int64_t stream_load_put_start_time = MonotonicNanos();
     RETURN_IF_ERROR(ThriftRpcHelper::rpc<FrontendServiceClient>(
             master_addr.hostname, master_addr.port,
-            [&request, ctx](FrontendServiceConnection& client) { client->streamLoadPut(ctx->put_result, request); }));
+            [&request, ctx](FrontendServiceConnection& client) { client->streamLoadPut(ctx->put_result, request); },
+            rpc_timeout_ms));
     ctx->stream_load_put_cost_nanos = MonotonicNanos() - stream_load_put_start_time;
 #else
     ctx->put_result = k_stream_load_put_result;
@@ -565,7 +605,6 @@ Status StreamLoadAction::_process_put(HttpRequest* http_req, StreamLoadContext* 
         }
         ctx->put_result.params.query_options.mem_limit = exec_mem_limit;
     }
-
     return _exec_env->stream_load_executor()->execute_plan_fragment(ctx);
 }
 

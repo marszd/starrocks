@@ -12,24 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.catalog;
 
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.io.Text;
+import com.starrocks.connector.ColumnTypeConverter;
 import com.starrocks.connector.HdfsEnvironment;
 import com.starrocks.connector.RemoteFileDesc;
 import com.starrocks.connector.RemotePathKey;
 import com.starrocks.connector.exception.StarRocksConnectorException;
 import com.starrocks.connector.hive.HiveRemoteFileIO;
+import com.starrocks.connector.hive.HiveStorageFormat;
 import com.starrocks.connector.hive.RemoteFileInputFormat;
+import com.starrocks.connector.hive.TextFileFormatDesc;
+import com.starrocks.credential.azure.AzureCloudConfigurationProvider;
 import com.starrocks.thrift.TColumn;
 import com.starrocks.thrift.TFileTable;
 import com.starrocks.thrift.TTableDescriptor;
@@ -42,18 +47,37 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 public class FileTable extends Table {
-    private static final String JSON_KEY_FILE_PATH = "path";
-    private static final String JSON_KEY_FORMAT = "format";
+    public static final String JSON_KEY_FILE_PATH = "path";
+    public static final String JSON_KEY_FORMAT = "format";
     private static final String JSON_RECURSIVE_DIRECTORIES = "enable_recursive_listing";
     private static final String JSON_KEY_FILE_PROPERTIES = "fileProperties";
+
+    public static final String JSON_KEY_COLUMN_SEPARATOR = "column_separator";
+    public static final String JSON_KEY_ROW_DELIMITER = "row_delimiter";
+    public static final String JSON_KEY_COLLECTION_DELIMITER = "collection_delimiter";
+    public static final String JSON_KEY_MAP_DELIMITER = "map_delimiter";
+
+    private static final ImmutableMap<String, RemoteFileInputFormat> SUPPORTED_FORMAT = ImmutableMap.of(
+            "parquet", RemoteFileInputFormat.PARQUET,
+            "orc", RemoteFileInputFormat.ORC,
+            "text", RemoteFileInputFormat.TEXT,
+            "avro", RemoteFileInputFormat.AVRO,
+            "rctext", RemoteFileInputFormat.RCTEXT,
+            "rcbinary", RemoteFileInputFormat.RCBINARY,
+            "sequence", RemoteFileInputFormat.SEQUENCE);
+
+    @SerializedName(value = "fp")
     private Map<String, String> fileProperties = Maps.newHashMap();
+
     public FileTable() {
         super(TableType.FILE);
     }
 
-    public FileTable(long id, String name, List<Column> fullSchema, Map<String, String> properties) throws DdlException {
+    public FileTable(long id, String name, List<Column> fullSchema, Map<String, String> properties)
+            throws DdlException {
         super(id, name, TableType.FILE, fullSchema);
         this.fileProperties = properties;
         validate(properties);
@@ -73,9 +97,12 @@ public class FileTable extends Table {
         if (Strings.isNullOrEmpty(format)) {
             throw new DdlException("format is null. Please add properties(format='xxx') when create table");
         }
-        if (!format.equalsIgnoreCase("parquet") && !format.equalsIgnoreCase("orc")) {
+
+        if (!SUPPORTED_FORMAT.containsKey(format)) {
             throw new DdlException("not supported format: " + format);
         }
+        // Put path into fileProperties, so that we can get storage account in AzureStorageCloudConfiguration
+        fileProperties.put(AzureCloudConfigurationProvider.AZURE_PATH_KEY, path);
     }
 
     public String getTableLocation() {
@@ -83,10 +110,9 @@ public class FileTable extends Table {
     }
 
     public RemoteFileInputFormat getFileFormat() {
-        if (fileProperties.get(JSON_KEY_FORMAT).equalsIgnoreCase("parquet")) {
-            return RemoteFileInputFormat.PARQUET;
-        } else if (fileProperties.get(JSON_KEY_FORMAT).equalsIgnoreCase("orc")) {
-            return RemoteFileInputFormat.ORC;
+        String format = fileProperties.get(JSON_KEY_FORMAT).toLowerCase();
+        if (SUPPORTED_FORMAT.containsKey(format)) {
+            return SUPPORTED_FORMAT.get(format);
         } else {
             return RemoteFileInputFormat.UNKNOWN;
         }
@@ -96,12 +122,13 @@ public class FileTable extends Table {
         return fileProperties;
     }
 
-    public List<RemoteFileDesc> getFileDescs() throws DdlException {
-        HdfsEnvironment hdfsEnvironment = new HdfsEnvironment(fileProperties, null);
+    public List<RemoteFileDesc> getFileDescsFromHdfs() throws DdlException {
+        HdfsEnvironment hdfsEnvironment = new HdfsEnvironment(fileProperties);
         Configuration configuration = hdfsEnvironment.getConfiguration();
         HiveRemoteFileIO remoteFileIO = new HiveRemoteFileIO(configuration);
         boolean recursive = Boolean.parseBoolean(fileProperties.getOrDefault(JSON_RECURSIVE_DIRECTORIES, "false"));
         RemotePathKey pathKey = new RemotePathKey(getTableLocation(), recursive, Optional.empty());
+
         try {
             Map<RemotePathKey, List<RemoteFileDesc>> result = remoteFileIO.getRemoteFiles(pathKey);
             if (result.isEmpty()) {
@@ -118,8 +145,29 @@ public class FileTable extends Table {
             }
             return remoteFileDescs;
         } catch (StarRocksConnectorException e) {
-            throw new DdlException("doesn't get file with path: " + getTableLocation());
+            throw new DdlException("doesn't get file with path: " + getTableLocation(), e);
         }
+    }
+
+    public List<RemoteFileDesc> getFileDescs() throws DdlException {
+        List<RemoteFileDesc> fileDescs = getFileDescsFromHdfs();
+
+        RemoteFileInputFormat format = getFileFormat();
+        TextFileFormatDesc textFileFormatDesc = null;
+        if (format.equals(RemoteFileInputFormat.TEXT)) {
+            textFileFormatDesc = new TextFileFormatDesc(
+                    fileProperties.getOrDefault(JSON_KEY_COLUMN_SEPARATOR, "\t"),
+                    fileProperties.getOrDefault(JSON_KEY_ROW_DELIMITER, "\n"),
+                    fileProperties.getOrDefault(JSON_KEY_COLLECTION_DELIMITER, ","),
+                    fileProperties.getOrDefault(JSON_KEY_MAP_DELIMITER, ":")
+            );
+        }
+        if (textFileFormatDesc != null) {
+            for (RemoteFileDesc f : fileDescs) {
+                f.setTextFileFormatDesc(textFileFormatDesc);
+            }
+        }
+        return fileDescs;
     }
 
     private boolean checkFileName(String fileDescName) {
@@ -141,6 +189,21 @@ public class FileTable extends Table {
         TTableDescriptor tTableDescriptor = new TTableDescriptor(id, TTableType.FILE_TABLE, fullSchema.size(),
                 0, "", "");
         tTableDescriptor.setFileTable(tFileTable);
+
+        HiveStorageFormat storageFormat = HiveStorageFormat.get(fileProperties.get(JSON_KEY_FORMAT));
+        tFileTable.setSerde_lib(storageFormat.getSerde());
+        tFileTable.setInput_format(storageFormat.getInputFormat());
+
+        String columnNames = fullSchema.stream().map(Column::getName).collect(Collectors.joining(","));
+        //when create table with string type, sr will change string to varchar(65533) in parser, but hive need string.
+        // we have no choice but to transfer varchar(65533) into string explicitly in external table for avro/rcfile/sequence
+        String columnTypes = fullSchema.stream().map(Column::getType).map(ColumnTypeConverter::toHiveType)
+                .map(type -> type.replace("varchar(65533)", "string"))
+                .collect(Collectors.joining("#"));
+
+        tFileTable.setHive_column_names(columnNames);
+        tFileTable.setHive_column_types(columnTypes);
+
         return tTableDescriptor;
     }
 
@@ -175,7 +238,7 @@ public class FileTable extends Table {
     }
 
     @Override
-    public void onCreate() {
+    public void onReload() {
     }
 
     @Override

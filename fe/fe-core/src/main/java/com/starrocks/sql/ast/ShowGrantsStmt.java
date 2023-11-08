@@ -15,11 +15,10 @@
 
 package com.starrocks.sql.ast;
 
-import com.starrocks.analysis.UserIdentity;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.qe.ShowResultSetMetaData;
-import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.parser.NodePosition;
 
 /*
  *  SHOW ALL GRANTS;
@@ -35,17 +34,7 @@ import com.starrocks.server.GlobalStateMgr;
 // SHOW GRANTS;
 // SHOW GRANTS FOR user@'xxx'
 public class ShowGrantsStmt extends ShowStmt {
-
     private static final ShowResultSetMetaData META_DATA;
-
-    static {
-        ShowResultSetMetaData.Builder builder = ShowResultSetMetaData.builder();
-        builder.addColumn(new Column("UserIdentity", ScalarType.createVarchar(100)));
-        builder.addColumn(new Column("Grants", ScalarType.createVarchar(400)));
-        META_DATA = builder.build();
-    }
-
-    private static final ShowResultSetMetaData META_DATA_V2;
 
     static {
         ShowResultSetMetaData.Builder builder = ShowResultSetMetaData.builder();
@@ -54,19 +43,23 @@ public class ShowGrantsStmt extends ShowStmt {
         builder.addColumn(new Column("Catalog", ScalarType.createVarchar(400)));
         builder.addColumn(new Column("Grants", ScalarType.createVarchar(400)));
 
-        META_DATA_V2 = builder.build();
+        META_DATA = builder.build();
     }
 
     private UserIdentity userIdent;
     private final String role;
 
     public ShowGrantsStmt(UserIdentity userIdent) {
-        this.userIdent = userIdent;
-        this.role = null;
+        this(userIdent, null, NodePosition.ZERO);
     }
 
     public ShowGrantsStmt(String role) {
-        this.userIdent = null;
+        this(null, role, NodePosition.ZERO);
+    }
+
+    public ShowGrantsStmt(UserIdentity userIdent, String role, NodePosition pos) {
+        super(pos);
+        this.userIdent = userIdent;
         this.role = role;
     }
 
@@ -84,11 +77,7 @@ public class ShowGrantsStmt extends ShowStmt {
 
     @Override
     public ShowResultSetMetaData getMetaData() {
-        if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-            return META_DATA_V2;
-        } else {
-            return META_DATA;
-        }
+        return META_DATA;
     }
 
     @Override

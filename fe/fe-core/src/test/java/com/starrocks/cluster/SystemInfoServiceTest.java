@@ -39,17 +39,18 @@ import com.starrocks.analysis.Analyzer;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.FeConstants;
+import com.starrocks.common.UserException;
 import com.starrocks.lake.StarOSAgent;
 import com.starrocks.persist.EditLog;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
 import com.starrocks.sql.ast.AddBackendClause;
 import com.starrocks.sql.ast.AlterSystemStmt;
 import com.starrocks.sql.ast.DropBackendClause;
 import com.starrocks.system.Backend;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.system.SystemInfoService;
 import mockit.Expectations;
 import mockit.Mock;
@@ -58,6 +59,7 @@ import mockit.Mocked;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.jupiter.api.Assertions;
 
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
@@ -66,6 +68,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 public class SystemInfoServiceTest {
 
@@ -135,10 +139,6 @@ public class SystemInfoServiceTest {
                 GlobalStateMgr.getCurrentInvertedIndex();
                 minTimes = 0;
                 result = invertedIndex;
-
-                GlobalStateMgr.getCurrentStateJournalVersion();
-                minTimes = 0;
-                result = FeConstants.META_VERSION;
             }
         };
 
@@ -203,19 +203,19 @@ public class SystemInfoServiceTest {
     @Test(expected = AnalysisException.class)
     public void validHostAndPortTest1() throws Exception {
         createHostAndPort(1);
-        systemInfoService.validateHostAndPort(hostPort);
+        systemInfoService.validateHostAndPort(hostPort, false);
     }
 
     @Test(expected = AnalysisException.class)
     public void validHostAndPortTest3() throws Exception {
         createHostAndPort(3);
-        systemInfoService.validateHostAndPort(hostPort);
+        systemInfoService.validateHostAndPort(hostPort, false);
     }
 
     @Test
     public void validHostAndPortTest4() throws Exception {
         createHostAndPort(4);
-        systemInfoService.validateHostAndPort(hostPort);
+        systemInfoService.validateHostAndPort(hostPort, false);
     }
 
     @Test
@@ -248,6 +248,28 @@ public class SystemInfoServiceTest {
     }
 
     @Test
+    public void addComputeNodeTest() throws AnalysisException {
+        clearAllBackend();
+        AddBackendClause stmt = new AddBackendClause(Lists.newArrayList("192.168.0.1:1234"));
+        com.starrocks.sql.analyzer.Analyzer.analyze(new AlterSystemStmt(stmt), new ConnectContext(null));
+
+        try {
+            GlobalStateMgr.getCurrentSystemInfo().addComputeNodes(stmt.getHostPortPairs());
+        } catch (DdlException e) {
+            Assert.fail();
+        }
+
+        Assert.assertNotNull(GlobalStateMgr.getCurrentSystemInfo().
+                getComputeNodeWithHeartbeatPort("192.168.0.1", 1234));
+
+        try {
+            GlobalStateMgr.getCurrentSystemInfo().addBackends(stmt.getHostPortPairs());
+        } catch (DdlException e) {
+            Assert.assertTrue(e.getMessage().contains("Compute node already exists with same host"));
+        }
+    }
+
+    @Test
     public void removeBackendTest() throws AnalysisException {
         clearAllBackend();
         AddBackendClause stmt = new AddBackendClause(Lists.newArrayList("192.168.0.1:1234"));
@@ -273,8 +295,13 @@ public class SystemInfoServiceTest {
             Assert.assertTrue(e.getMessage().contains("does not exist"));
         }
 
-        // test removeWorker
-        Config.integrate_starmgr = true;
+        new MockUp<RunMode>() {
+            @Mock
+            public RunMode getCurrentRunMode() {
+                return RunMode.SHARED_DATA;
+            }
+        };
+
         StarOSAgent starosAgent = new StarOSAgent();
         new Expectations(starosAgent) {
             {
@@ -320,8 +347,6 @@ public class SystemInfoServiceTest {
         } catch (DdlException e) {
             Assert.assertTrue(e.getMessage().contains("does not exist"));
         }
-
-        Config.integrate_starmgr = false;
     }
 
     @Test
@@ -350,6 +375,57 @@ public class SystemInfoServiceTest {
         dis.close();
 
         deleteDir(dir);
+    }
+
+    @Test
+    public void testSeqChooseComputeNodes() {
+        clearAllBackend();
+        AddBackendClause stmt = new AddBackendClause(Lists.newArrayList("192.168.0.1:1234"));
+        com.starrocks.sql.analyzer.Analyzer.analyze(new AlterSystemStmt(stmt), new ConnectContext(null));
+
+        try {
+            GlobalStateMgr.getCurrentSystemInfo().addComputeNodes(stmt.getHostPortPairs());
+        } catch (DdlException e) {
+            Assert.fail();
+        }
+
+        Assert.assertNotNull(GlobalStateMgr.getCurrentSystemInfo().
+                getComputeNodeWithHeartbeatPort("192.168.0.1", 1234));
+
+        List<Long> longList = GlobalStateMgr.getCurrentSystemInfo().seqChooseComputeNodes(1, false, false);
+        Assert.assertEquals(1, longList.size());
+        ComputeNode computeNode = new ComputeNode();
+        computeNode.setHost("192.168.0.1");
+        computeNode.setHttpPort(9030);
+        computeNode.setAlive(true);
+        GlobalStateMgr.getCurrentSystemInfo().addComputeNode(computeNode);
+        List<Long> computeNods = GlobalStateMgr.getCurrentSystemInfo().seqChooseComputeNodes(1, true, false);
+        Assert.assertEquals(1, computeNods.size());
+
+        // test seqChooseBackendOrComputeId func
+        Exception exception = Assertions.assertThrows(UserException.class, () -> {
+            GlobalStateMgr.getCurrentSystemInfo().seqChooseBackendOrComputeId();
+        });
+        Assert.assertTrue(exception.getMessage().contains("No backend alive."));
+
+        new MockUp<RunMode>() {
+            @Mock
+            public RunMode getCurrentRunMode() {
+                return RunMode.SHARED_DATA;
+            }
+        };
+        new MockUp<SystemInfoService>() {
+            @Mock
+            public List<Long> seqChooseComputeNodes(int computeNodeNum,
+                                                    boolean needAvailable, boolean isCreate) {
+                return new ArrayList<>();
+            }
+        };
+
+        exception = Assert.assertThrows(UserException.class, () -> {
+            GlobalStateMgr.getCurrentSystemInfo().seqChooseBackendOrComputeId();
+        });
+        Assert.assertTrue(exception.getMessage().contains("No backend or compute node alive."));
     }
 
 }

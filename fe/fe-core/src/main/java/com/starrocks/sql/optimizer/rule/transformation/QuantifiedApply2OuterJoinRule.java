@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.rule.transformation;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.catalog.Type;
 import com.starrocks.sql.analyzer.SemanticException;
@@ -109,10 +109,7 @@ public class QuantifiedApply2OuterJoinRule extends TransformationRule {
         }
 
         joinOnPredicate.add(
-                new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, inPredicate.getChildren()));
-
-        List<ColumnRefOperator> correlationColumnRefs = Utils.extractColumnRef(inPredicate.getChild(0));
-        correlationColumnRefs.addAll(apply.getCorrelationColumnRefs());
+                new BinaryPredicateOperator(BinaryType.EQ, inPredicate.getChildren()));
 
         // check correlation filter
         if (!SubqueryUtils.checkAllIsBinaryEQ(joinOnPredicate)) {
@@ -122,6 +119,15 @@ public class QuantifiedApply2OuterJoinRule extends TransformationRule {
             //  a. outer-key < inner key -> outer-key < aggregate MAX(key)
             //  b. outer-key > inner key -> outer-key > aggregate MIN(key)
             throw new SemanticException(SubqueryUtils.EXIST_NON_EQ_PREDICATE);
+        }
+
+        ColumnRefSet outerRefs = input.getInputs().get(0).getOutputColumns();
+        if (!SubqueryUtils.checkUniqueCorrelation(apply.getCorrelationConjuncts(), outerRefs)) {
+            // e.g. select * from t1 where t1.v1 in (select t2.v1 from t2 where t2.v2 + t1.v3 = t1.v2)
+            // the correlation predicate (t2.v2 + t1.v3) = t1.v2, we can't promise (t2.v2 + t1.v3) is unique value
+            // after distinct (t2.v2), our implementation required the result must be 1-1 relation in count value join
+            throw new SemanticException("IN subquery not supported the correlation predicate of the WHERE clause " +
+                    "that used multiple outer-table columns at the same time");
         }
 
         CorrelationOuterJoinTransformer transformer = new CorrelationOuterJoinTransformer(input, context);
@@ -171,7 +177,7 @@ public class QuantifiedApply2OuterJoinRule extends TransformationRule {
 
             this.inPredicate = BinaryPredicateOperator.eq(in.getChild(0), in.getChild(1));
             this.correlationPredicate = apply.getCorrelationConjuncts();
-            this.cteId = factory.getNextRelationId();
+            this.cteId = context.getCteContext().getNextCteId();
 
             this.distinctAggregateOutputs = Lists.newArrayList();
         }
@@ -262,11 +268,8 @@ public class QuantifiedApply2OuterJoinRule extends TransformationRule {
             CorrelatedPredicateRewriter inPredRewriter = new CorrelatedPredicateRewriter(
                     Utils.extractColumnRef(inPredicate.getChild(0)), context);
 
-            correlationPredicate = SubqueryUtils.rewritePredicateAndExtractColumnRefs(
-                    correlationPredicate, corPredRewriter);
-
-            inPredicate = (BinaryPredicateOperator) SubqueryUtils.rewritePredicateAndExtractColumnRefs(
-                    inPredicate, inPredRewriter);
+            correlationPredicate = corPredRewriter.rewrite(correlationPredicate);
+            inPredicate = (BinaryPredicateOperator) inPredRewriter.rewrite(inPredicate);
 
             // update used columns
             Preconditions.checkState(inPredRewriter.getColumnRefToExprMap().keySet().size() == 1);

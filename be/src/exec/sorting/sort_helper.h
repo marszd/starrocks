@@ -15,6 +15,7 @@
 #pragma once
 
 #include <algorithm>
+#include <concepts>
 
 #include "column/nullable_column.h"
 #include "column/type_traits.h"
@@ -71,6 +72,24 @@ struct SorterComparator<TimestampValue> {
             return x;
         } else {
             return x > 0 ? 1 : -1;
+        }
+    }
+};
+
+template <typename T>
+concept FloatingPoint = std::is_floating_point_v<T>;
+
+template <FloatingPoint T>
+struct SorterComparator<T> {
+    static int compare(T lhs, T rhs) {
+        lhs = std::isnan(lhs) ? 0 : lhs;
+        rhs = std::isnan(rhs) ? 0 : rhs;
+        if (lhs == rhs) {
+            return 0;
+        } else if (lhs < rhs) {
+            return -1;
+        } else {
+            return 1;
         }
     }
 };
@@ -187,7 +206,7 @@ static inline Status sort_and_tie_helper_nullable(const std::atomic<bool>& cance
 }
 
 template <class DataComparator, class PermutationType>
-static inline Status sort_and_tie_helper(const bool& cancel, const Column* column, bool is_asc_order,
+static inline Status sort_and_tie_helper(const std::atomic<bool>& cancel, const Column* column, bool is_asc_order,
                                          PermutationType& permutation, Tie& tie, DataComparator cmp,
                                          std::pair<int, int> range, bool build_tie, size_t limit = 0,
                                          size_t* limited = nullptr) {
@@ -218,16 +237,16 @@ static inline Status sort_and_tie_helper(const bool& cancel, const Column* colum
             *limited = limit + equal_count;
         } else {
             if (is_asc_order) {
-                ::pdqsort(cancel, begin, end, lesser);
+                ::pdqsort(begin, end, lesser);
             } else {
-                ::pdqsort(cancel, begin, end, greater);
+                ::pdqsort(begin, end, greater);
             }
         }
     };
 
     TieIterator iterator(tie, range.first, range.second);
     while (iterator.next()) {
-        if (UNLIKELY(cancel)) {
+        if (UNLIKELY(cancel.load(std::memory_order_acquire))) {
             return Status::Cancelled("Sort cancelled");
         }
         int range_first = iterator.range_first;

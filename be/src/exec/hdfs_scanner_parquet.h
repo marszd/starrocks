@@ -17,6 +17,9 @@
 #include "exec/hdfs_scanner.h"
 
 namespace starrocks {
+namespace parquet {
+class FileReader;
+}
 
 class HdfsParquetScanner final : public HdfsScanner {
 public:
@@ -31,6 +34,7 @@ public:
 
 private:
     std::shared_ptr<parquet::FileReader> _reader = nullptr;
+    std::set<int64_t> _need_skip_rowids;
 };
 
 } // namespace starrocks

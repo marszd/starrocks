@@ -23,6 +23,7 @@ import com.starrocks.analysis.AnalyticExpr;
 import com.starrocks.analysis.AnalyticWindow;
 import com.starrocks.analysis.ArithmeticExpr;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.BoolLiteral;
 import com.starrocks.analysis.CaseExpr;
 import com.starrocks.analysis.CaseWhenClause;
@@ -37,6 +38,8 @@ import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.FunctionName;
 import com.starrocks.analysis.FunctionParams;
 import com.starrocks.analysis.GroupByClause;
+import com.starrocks.analysis.GroupingFunctionCallExpr;
+import com.starrocks.analysis.InformationFunction;
 import com.starrocks.analysis.IntLiteral;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.analysis.LargeIntLiteral;
@@ -49,7 +52,10 @@ import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.SubfieldExpr;
 import com.starrocks.analysis.Subquery;
 import com.starrocks.analysis.TableName;
+import com.starrocks.analysis.TimestampArithmeticExpr;
 import com.starrocks.analysis.TypeDef;
+import com.starrocks.analysis.VarBinaryLiteral;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
@@ -62,6 +68,8 @@ import com.starrocks.sql.ast.CTERelation;
 import com.starrocks.sql.ast.ExceptRelation;
 import com.starrocks.sql.ast.IntersectRelation;
 import com.starrocks.sql.ast.JoinRelation;
+import com.starrocks.sql.ast.LambdaArgument;
+import com.starrocks.sql.ast.LambdaFunctionExpr;
 import com.starrocks.sql.ast.QualifiedName;
 import com.starrocks.sql.ast.QueryRelation;
 import com.starrocks.sql.ast.QueryStatement;
@@ -72,21 +80,28 @@ import com.starrocks.sql.ast.SelectRelation;
 import com.starrocks.sql.ast.SetQualifier;
 import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.SubqueryRelation;
+import com.starrocks.sql.ast.TableFunctionRelation;
 import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.ast.UnionRelation;
+import com.starrocks.sql.ast.UnitIdentifier;
+import com.starrocks.sql.ast.ValueList;
 import com.starrocks.sql.ast.ValuesRelation;
 import com.starrocks.sql.parser.ParsingException;
 import io.trino.sql.tree.AliasedRelation;
 import io.trino.sql.tree.AllColumns;
 import io.trino.sql.tree.ArithmeticBinaryExpression;
+import io.trino.sql.tree.ArithmeticUnaryExpression;
 import io.trino.sql.tree.ArrayConstructor;
 import io.trino.sql.tree.AstVisitor;
 import io.trino.sql.tree.BetweenPredicate;
+import io.trino.sql.tree.BinaryLiteral;
 import io.trino.sql.tree.BooleanLiteral;
 import io.trino.sql.tree.Cast;
 import io.trino.sql.tree.CoalesceExpression;
 import io.trino.sql.tree.ComparisonExpression;
 import io.trino.sql.tree.Cube;
+import io.trino.sql.tree.CurrentTime;
+import io.trino.sql.tree.CurrentUser;
 import io.trino.sql.tree.DataType;
 import io.trino.sql.tree.DateTimeDataType;
 import io.trino.sql.tree.DereferenceExpression;
@@ -94,6 +109,7 @@ import io.trino.sql.tree.DoubleLiteral;
 import io.trino.sql.tree.Except;
 import io.trino.sql.tree.ExistsPredicate;
 import io.trino.sql.tree.Explain;
+import io.trino.sql.tree.ExplainAnalyze;
 import io.trino.sql.tree.ExplainType;
 import io.trino.sql.tree.Expression;
 import io.trino.sql.tree.Extract;
@@ -103,23 +119,32 @@ import io.trino.sql.tree.GenericDataType;
 import io.trino.sql.tree.GenericLiteral;
 import io.trino.sql.tree.GroupBy;
 import io.trino.sql.tree.GroupingElement;
+import io.trino.sql.tree.GroupingOperation;
 import io.trino.sql.tree.GroupingSets;
 import io.trino.sql.tree.Identifier;
+import io.trino.sql.tree.IfExpression;
 import io.trino.sql.tree.InListExpression;
 import io.trino.sql.tree.InPredicate;
 import io.trino.sql.tree.Intersect;
+import io.trino.sql.tree.IntervalLiteral;
 import io.trino.sql.tree.IsNotNullPredicate;
 import io.trino.sql.tree.IsNullPredicate;
 import io.trino.sql.tree.Join;
 import io.trino.sql.tree.JoinCriteria;
 import io.trino.sql.tree.JoinOn;
 import io.trino.sql.tree.JoinUsing;
+import io.trino.sql.tree.JsonArray;
+import io.trino.sql.tree.JsonArrayElement;
+import io.trino.sql.tree.JsonQuery;
+import io.trino.sql.tree.LambdaArgumentDeclaration;
+import io.trino.sql.tree.LambdaExpression;
 import io.trino.sql.tree.LikePredicate;
 import io.trino.sql.tree.Limit;
 import io.trino.sql.tree.LogicalExpression;
 import io.trino.sql.tree.LongLiteral;
 import io.trino.sql.tree.Node;
 import io.trino.sql.tree.NotExpression;
+import io.trino.sql.tree.NullIfExpression;
 import io.trino.sql.tree.NumericParameter;
 import io.trino.sql.tree.Query;
 import io.trino.sql.tree.QuerySpecification;
@@ -136,7 +161,12 @@ import io.trino.sql.tree.SubqueryExpression;
 import io.trino.sql.tree.SubscriptExpression;
 import io.trino.sql.tree.Table;
 import io.trino.sql.tree.TableSubquery;
+import io.trino.sql.tree.TimestampLiteral;
+import io.trino.sql.tree.Trim;
+import io.trino.sql.tree.TryExpression;
 import io.trino.sql.tree.Union;
+import io.trino.sql.tree.Unnest;
+import io.trino.sql.tree.Values;
 import io.trino.sql.tree.WhenClause;
 import io.trino.sql.tree.Window;
 import io.trino.sql.tree.WindowFrame;
@@ -157,6 +187,7 @@ import static com.starrocks.analysis.AnalyticWindow.BoundaryType.FOLLOWING;
 import static com.starrocks.analysis.AnalyticWindow.BoundaryType.PRECEDING;
 import static com.starrocks.analysis.AnalyticWindow.BoundaryType.UNBOUNDED_FOLLOWING;
 import static com.starrocks.analysis.AnalyticWindow.BoundaryType.UNBOUNDED_PRECEDING;
+import static com.starrocks.sql.common.ErrorMsgProxy.PARSER_ERROR_MSG;
 import static java.util.stream.Collectors.toList;
 
 public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
@@ -175,14 +206,14 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
                     .put(Join.Type.IMPLICIT, JoinOperator.INNER_JOIN)
                     .build();
 
-    private static final ImmutableMap<ComparisonExpression.Operator, BinaryPredicate.Operator> COMPARISON_OPERATOR_MAP =
-            ImmutableMap.<ComparisonExpression.Operator, BinaryPredicate.Operator>builder().
-                    put(ComparisonExpression.Operator.EQUAL, BinaryPredicate.Operator.EQ)
-                    .put(ComparisonExpression.Operator.LESS_THAN, BinaryPredicate.Operator.LT)
-                    .put(ComparisonExpression.Operator.LESS_THAN_OR_EQUAL, BinaryPredicate.Operator.LE)
-                    .put(ComparisonExpression.Operator.GREATER_THAN, BinaryPredicate.Operator.GT)
-                    .put(ComparisonExpression.Operator.GREATER_THAN_OR_EQUAL, BinaryPredicate.Operator.GE)
-                    .put(ComparisonExpression.Operator.NOT_EQUAL, BinaryPredicate.Operator.NE)
+    private static final ImmutableMap<ComparisonExpression.Operator, BinaryType> COMPARISON_OPERATOR_MAP =
+            ImmutableMap.<ComparisonExpression.Operator, BinaryType>builder().
+                    put(ComparisonExpression.Operator.EQUAL, BinaryType.EQ)
+                    .put(ComparisonExpression.Operator.LESS_THAN, BinaryType.LT)
+                    .put(ComparisonExpression.Operator.LESS_THAN_OR_EQUAL, BinaryType.LE)
+                    .put(ComparisonExpression.Operator.GREATER_THAN, BinaryType.GT)
+                    .put(ComparisonExpression.Operator.GREATER_THAN_OR_EQUAL, BinaryType.GE)
+                    .put(ComparisonExpression.Operator.NOT_EQUAL, BinaryType.NE)
                     .build();
 
     private static final ImmutableMap<ArithmeticBinaryExpression.Operator, ArithmeticExpr.Operator> BINARY_OPERATOR_MAP =
@@ -213,6 +244,14 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
     }
 
     @Override
+    protected ParseNode visitNode(Node node, ParseTreeContext context) {
+        if (node instanceof JsonArrayElement) {
+            return visit(((JsonArrayElement) node).getValue(), context);
+        }
+        return null;
+    }
+
+    @Override
     protected ParseNode visitExplain(Explain node, ParseTreeContext context) {
         QueryStatement queryStatement = (QueryStatement) visit(node.getStatement(), context);
 
@@ -232,6 +271,13 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
         } else {
             queryStatement.setIsExplain(true, StatementBase.ExplainLevel.NORMAL);
         }
+        return queryStatement;
+    }
+
+    @Override
+    protected ParseNode visitExplainAnalyze(ExplainAnalyze node, ParseTreeContext context) {
+        QueryStatement queryStatement = (QueryStatement) visit(node.getStatement(), context);
+        queryStatement.setIsExplain(true, StatementBase.ExplainLevel.ANALYZE);
         return queryStatement;
     }
 
@@ -294,15 +340,7 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
 
         // from == null means a statement without from or from dual, add a single row of null values here
         if (from == null) {
-            ArrayList<Expr> row = new ArrayList<>();
-            List<String> columnNames = new ArrayList<>();
-            row.add(NullLiteral.create(Type.NULL));
-            columnNames.add("");
-            List<ArrayList<Expr>> rows = new ArrayList<>();
-            rows.add(row);
-            ValuesRelation valuesRelation = new ValuesRelation(rows, columnNames);
-            valuesRelation.setNullValues(true);
-            from = valuesRelation;
+            from = ValuesRelation.newDualRelation();
         }
 
         SelectRelation resultSelectRelation = new SelectRelation(
@@ -325,7 +363,92 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
     protected ParseNode visitAliasedRelation(AliasedRelation node, ParseTreeContext context) {
         Relation relation = (Relation) visit(node.getRelation(), context);
         relation.setAlias(new TableName(null, node.getAlias().getValue()));
+        List<String> columnNames = getColumnNames(Optional.ofNullable(node.getColumnNames()));
+        if (columnNames != null && !columnNames.isEmpty()) {
+            relation.setColumnOutputNames(columnNames);
+
+            if (relation instanceof SubqueryRelation) {
+                // set value relation alias name here, otherwise sr optimizer will lose the alias name
+                SubqueryRelation subqueryRelation = (SubqueryRelation) relation;
+                if (subqueryRelation.getQueryStatement().getQueryRelation() instanceof ValuesRelation) {
+                    ValuesRelation valuesRelation = (ValuesRelation) subqueryRelation.getQueryStatement().getQueryRelation();
+                    valuesRelation.setColumnOutputNames(columnNames);
+                }
+            }
+        }
         return relation;
+    }
+
+    @Override
+    protected ParseNode visitValues(Values node, ParseTreeContext context) {
+        if (node.getRows().isEmpty()) {
+            return null;
+        } else {
+            List<Expr> rows = visit(node.getRows(), context, Expr.class);
+            List<ValueList> valueLists = Lists.newArrayList();
+
+            if (node.getRows().get(0) instanceof Row) {
+                // (values (1,2),(3,4),(5,6)), has three rows, each row is row function call
+                for (Expr rowFnCall : rows) {
+                    valueLists.add(new ValueList(rowFnCall.getChildren()));
+                }
+            } else {
+                // (values 1,2,3,4,5,6), has six rows, each row has one int value
+                for (Expr value : rows) {
+                    valueLists.add(new ValueList(Lists.newArrayList(value)));
+                }
+            }
+            List<List<Expr>> records = valueLists.stream().map(ValueList::getRow).collect(toList());
+
+            List<String> colNames = Lists.newArrayList();
+            for (int i = 0; i < records.get(0).size(); ++i) {
+                colNames.add("column_" + i);
+            }
+
+            return new ValuesRelation(records, colNames);
+        }
+    }
+
+    @Override
+    protected ParseNode visitUnnest(Unnest node, ParseTreeContext context) {
+        List<Expr> arguments = visit(node.getExpressions(), context, Expr.class);
+        List<Expr> expressions = new ArrayList<>();
+
+        for (Expr arg : arguments) {
+            if (arg instanceof ArrayExpr) {
+                if (!arg.getChildren().isEmpty()) {
+                    // need to covert array[row(1,2), row(3,4))] to array[1,3], array[2,4], so SR could unnest it
+                    Expr firstArrayElement = arg.getChildren().get(0);
+                    if (firstArrayElement instanceof FunctionCallExpr && ((FunctionCallExpr) firstArrayElement).getFnName().
+                            getFunction().equalsIgnoreCase("row")) {
+                        List<List<Expr>> items = new ArrayList<>();
+                        for (Expr row : arg.getChildren()) {
+                            int rowIndex = 0;
+                            for (Expr literal : row.getChildren()) {
+                                if (items.size() <= rowIndex) {
+                                    items.add(new ArrayList<>());
+                                    items.get(rowIndex).add(literal);
+                                } else {
+                                    items.get(rowIndex).add(literal);
+                                }
+                                ++rowIndex;
+                            }
+                        }
+
+                        for (List<Expr> item : items) {
+                            Expr arrayExpr = new ArrayExpr(null, item);
+                            expressions.add(arrayExpr);
+                        }
+                        continue;
+                    }
+                }
+            }
+            expressions.add(arg);
+        }
+
+        FunctionCallExpr functionCallExpr = new FunctionCallExpr("unnest", expressions);
+        TableFunctionRelation tableFunctionRelation = new TableFunctionRelation(functionCallExpr);
+        return tableFunctionRelation;
     }
 
     @Override
@@ -382,6 +505,12 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
         }
 
         return new GroupByClause(groupingSets, GroupByClause.GroupingType.GROUPING_SETS);
+    }
+
+    @Override
+    protected ParseNode visitGroupingOperation(GroupingOperation node, ParseTreeContext context) {
+        List<Expr> arguments = visit(node.getGroupingColumns(), context, Expr.class);
+        return new GroupingFunctionCallExpr("grouping", arguments);
     }
 
     @Override
@@ -550,17 +679,19 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
     protected ParseNode visitFunctionCall(FunctionCall node, ParseTreeContext context) {
         List<Expr> arguments = visit(node.getArguments(), context, Expr.class);
 
-        FunctionCallExpr callExpr;
+        Expr callExpr;
         Expr convertedFunctionCall = Trino2SRFunctionCallTransformer.convert(node.getName().toString(), arguments);
         if (convertedFunctionCall != null) {
-            callExpr = (FunctionCallExpr) convertedFunctionCall;
+            callExpr = convertedFunctionCall;
         } else if (DISTINCT_FUNCTION.contains(node.getName().toString())) {
             callExpr = visitDistinctFunctionCall(node, context);
-        }  else {
+        }  else if (FunctionSet.INFORMATION_FUNCTIONS.contains(node.getName().toString())) {
+            callExpr = new InformationFunction(node.getName().toString().toUpperCase());
+        } else {
             callExpr = new FunctionCallExpr(node.getName().toString(), arguments);
         }
         if (node.getWindow().isPresent()) {
-            return visitWindow(callExpr, node.getWindow().get(), context);
+            return visitWindow((FunctionCallExpr) callExpr, node.getWindow().get(), context);
         }
         return callExpr;
 
@@ -619,7 +750,7 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
         List<Expr> partitionExprs = visit(node.getPartitionBy(), context, Expr.class);
 
         return new AnalyticExpr(functionCallExpr, partitionExprs, orderByElements,
-                (AnalyticWindow) processOptional(node.getFrame(), context));
+                (AnalyticWindow) processOptional(node.getFrame(), context), null);
     }
 
     private ParseNode visitWindow(FunctionCallExpr functionCallExpr, Window windowSpec, ParseTreeContext context) {
@@ -676,6 +807,26 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
         }
     }
 
+    @Override
+    protected ParseNode visitTryExpression(TryExpression node, ParseTreeContext context) {
+        return visit(node.getInnerExpression(), context);
+    }
+
+    @Override
+    protected ParseNode visitJsonQuery(JsonQuery jsonQuery, ParseTreeContext context) {
+        Expr inputExpr = (Expr) visit(jsonQuery.getJsonPathInvocation().getInputExpression(), context);
+        String jsonPath = jsonQuery.getJsonPathInvocation().getJsonPath().getValue();
+        com.starrocks.analysis.StringLiteral jsonPathLiteral =
+                new com.starrocks.analysis.StringLiteral(jsonPath.substring(jsonPath.indexOf('$')));
+        return new FunctionCallExpr("json_query", ImmutableList.of(inputExpr, jsonPathLiteral));
+    }
+
+    @Override
+    protected ParseNode visitJsonArray(JsonArray jsonArray, ParseTreeContext context) {
+        List<Expr> children = visit(jsonArray.getElements(), context, Expr.class);
+        return new FunctionCallExpr("json_array", children);
+    }
+
     private static final BigInteger LONG_MAX = new BigInteger("9223372036854775807");
 
     private static final BigInteger LARGEINT_MAX_ABS =
@@ -704,6 +855,8 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
         try {
             if (SqlModeHelper.check(sqlMode, SqlModeHelper.MODE_DOUBLE_LITERAL)) {
                 return new FloatLiteral(node.getValue());
+            } else if (Double.isInfinite(node.getValue())) {
+                throw new SemanticException("Numeric overflow " + node.getValue());
             } else {
                 BigDecimal decimal = BigDecimal.valueOf(node.getValue());
                 int precision = DecimalLiteral.getRealPrecision(decimal);
@@ -741,8 +894,21 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
             } catch (AnalysisException e) {
                 throw new ParsingException(e.getMessage());
             }
+        } else if (node.getType().equalsIgnoreCase("json")) {
+            return new com.starrocks.analysis.StringLiteral(node.getValue());
+        } else if (node.getType().equalsIgnoreCase("real")) {
+            try {
+                return new FloatLiteral(node.getValue());
+            } catch (AnalysisException e) {
+                throw new RuntimeException(e);
+            }
         }
         throw new ParsingException("Parse Error : unknown type " + node.getType());
+    }
+
+    @Override
+    protected ParseNode visitBinaryLiteral(BinaryLiteral node, ParseTreeContext context) {
+        return new VarBinaryLiteral(node.getValue());
     }
 
     @Override
@@ -761,6 +927,25 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
     }
 
     @Override
+    protected ParseNode visitIntervalLiteral(IntervalLiteral node, ParseTreeContext context) {
+        return new com.starrocks.sql.ast.IntervalLiteral(new com.starrocks.analysis.StringLiteral(node.getValue()),
+                new UnitIdentifier(node.getStartField().toString()));
+    }
+
+    @Override
+    protected ParseNode visitTimestampLiteral(TimestampLiteral node, ParseTreeContext context) {
+        try {
+            String value = node.getValue();
+            if (value.length() <= 10) {
+                value += " 00:00:00";
+            }
+            return new DateLiteral(value, Type.DATETIME);
+        } catch (AnalysisException e) {
+            throw new ParsingException(PARSER_ERROR_MSG.invalidDateFormat(node.getValue()));
+        }
+    }
+
+    @Override
     protected ParseNode visitCoalesceExpression(CoalesceExpression node, ParseTreeContext context) {
         List<Expr> children = visit(node, context, Expr.class);
         FunctionName fnName = FunctionName.createFnName("coalesce");
@@ -776,15 +961,40 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
     }
 
     @Override
+    protected ParseNode visitArithmeticUnary(ArithmeticUnaryExpression node, ParseTreeContext context) {
+        Expr child = (Expr) visit(node.getValue(), context);
+        if (node.getSign() == ArithmeticUnaryExpression.Sign.MINUS) {
+            return new ArithmeticExpr(ArithmeticExpr.Operator.MULTIPLY, new IntLiteral(-1), child);
+        } else  {
+            return child;
+        }
+    }
+
+    @Override
     protected ParseNode visitArithmeticBinary(ArithmeticBinaryExpression node, ParseTreeContext context) {
         Expr left = (Expr) visit(node.getLeft(), context);
         Expr right = (Expr) visit(node.getRight(), context);
+
+        if (left instanceof com.starrocks.sql.ast.IntervalLiteral) {
+            return new TimestampArithmeticExpr(BINARY_OPERATOR_MAP.get(node.getOperator()), right,
+                    ((com.starrocks.sql.ast.IntervalLiteral) left).getValue(),
+                    ((com.starrocks.sql.ast.IntervalLiteral) left).getUnitIdentifier().getDescription(),
+                    true);
+        }
+
+        if (right instanceof com.starrocks.sql.ast.IntervalLiteral) {
+            return new TimestampArithmeticExpr(BINARY_OPERATOR_MAP.get(node.getOperator()), left,
+                    ((com.starrocks.sql.ast.IntervalLiteral) right).getValue(),
+                    ((com.starrocks.sql.ast.IntervalLiteral) right).getUnitIdentifier().getDescription(),
+                    false);
+        }
+
         return new ArithmeticExpr(BINARY_OPERATOR_MAP.get(node.getOperator()), left, right);
     }
 
     @Override
     protected ParseNode visitComparisonExpression(ComparisonExpression node, ParseTreeContext context) {
-        BinaryPredicate.Operator binaryOp = COMPARISON_OPERATOR_MAP.get(node.getOperator());
+        BinaryType binaryOp = COMPARISON_OPERATOR_MAP.get(node.getOperator());
         if (binaryOp == null) {
             throw new SemanticException("Do not support the comparison type %s", node.getOperator());
         }
@@ -874,6 +1084,16 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
     }
 
     @Override
+    protected ParseNode visitCurrentUser(CurrentUser node, ParseTreeContext context) {
+        return new InformationFunction(FunctionSet.CURRENT_USER.toUpperCase());
+    }
+
+    @Override
+    protected ParseNode visitCurrentTime(CurrentTime node, ParseTreeContext context) {
+        return new FunctionCallExpr(node.getFunction().getName(), new ArrayList<>());
+    }
+
+    @Override
     protected ParseNode visitSearchedCaseExpression(SearchedCaseExpression node, ParseTreeContext context) {
         return new CaseExpr(null, visit(node.getWhenClauses(), context, CaseWhenClause.class),
                 (Expr) processOptional(node.getDefaultValue(), context));
@@ -887,6 +1107,58 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
     }
 
     @Override
+    protected ParseNode visitNullIfExpression(NullIfExpression node, ParseTreeContext context) {
+        List<Expr> arguments = visit(ImmutableList.of(node.getFirst(), node.getSecond()), context, Expr.class);
+        return new FunctionCallExpr("nullif", arguments);
+    }
+
+    @Override
+    protected ParseNode visitIfExpression(IfExpression node, ParseTreeContext context) {
+        List<Node> children = Lists.newArrayList();
+        children.add(node.getCondition());
+        children.add(node.getTrueValue());
+        if (node.getFalseValue().isPresent()) {
+            children.add(node.getFalseValue().get());
+        } else {
+            children.add(new io.trino.sql.tree.NullLiteral());
+        }
+        List<Expr> arguments = visit(children, context, Expr.class);
+        return new FunctionCallExpr("if", arguments);
+    }
+
+    @Override
+    protected ParseNode visitLambdaExpression(LambdaExpression node, ParseTreeContext context) {
+        List<String> names = Lists.newArrayList();
+        for (LambdaArgumentDeclaration argumentDeclaration : node.getArguments()) {
+            names.add(argumentDeclaration.getName().getValue());
+        }
+
+        List<Expr> arguments = Lists.newArrayList();
+        Expr expr = null;
+        if (node.getBody() != null) {
+            expr = (Expr) visit(node.getBody(), context);
+        }
+        // put lambda body to the first argument
+        arguments.add(expr);
+        for (String name : names) {
+            arguments.add(new LambdaArgument(name));
+        }
+        return new LambdaFunctionExpr(arguments);
+    }
+
+    @Override
+    protected ParseNode visitTrim(Trim node, ParseTreeContext context) {
+        Expr trimSource = (Expr) visit(node.getTrimSource(), context);
+        Expr trimCharacter = (Expr) processOptional(node.getTrimCharacter(), context);
+        List<Expr> arguments = Lists.newArrayList();
+        arguments.add(trimSource);
+        if (trimCharacter != null) {
+            arguments.add(trimCharacter);
+        }
+        return new FunctionCallExpr(node.getSpecification().getFunctionName(), arguments);
+    }
+
+    @Override
     protected ParseNode visitWhenClause(WhenClause node, ParseTreeContext context) {
         return new CaseWhenClause((Expr) visit(node.getOperand(), context), (Expr) visit(node.getResult(), context));
     }
@@ -895,7 +1167,6 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
     protected ParseNode visitCast(Cast node, ParseTreeContext context) {
         return new CastExpr(new TypeDef(getType(node.getType())), (Expr) visit(node.getExpression(), context));
     }
-
 
     public Type getType(DataType dataType) {
         if (dataType instanceof GenericDataType) {
@@ -915,22 +1186,34 @@ public class AstBuilder extends AstVisitor<ParseNode, ParseTreeContext> {
 
     private Type getGenericDataType(GenericDataType dataType) {
         int length = -1;
+        int precision = -1;
+        int scale = -1;
         String typeName = dataType.getName().getValue().toLowerCase();
         if (!dataType.getArguments().isEmpty() && dataType.getArguments().get(0) instanceof NumericParameter) {
             length = Integer.parseInt(((NumericParameter) dataType.getArguments().get(0)).getValue());
+            precision = length;
+            if (dataType.getArguments().size() > 1 && dataType.getArguments().get(1) instanceof NumericParameter) {
+                scale = Integer.parseInt(((NumericParameter) dataType.getArguments().get(1)).getValue());
+            }
         }
         if (typeName.equals("varchar")) {
             ScalarType type = ScalarType.createVarcharType(length);
-            if (length != -1) {
-                type.setAssignedStrLenInColDefinition();
-            }
             return type;
         } else if (typeName.equals("char")) {
             ScalarType type = ScalarType.createCharType(length);
-            if (length != -1) {
-                type.setAssignedStrLenInColDefinition();
-            }
             return type;
+        } else if (typeName.equals("decimal")) {
+            if (precision != -1) {
+                if (scale != -1) {
+                    return ScalarType.createUnifiedDecimalType(precision, scale);
+                }
+                return ScalarType.createUnifiedDecimalType(precision, 0);
+            }
+            return ScalarType.createUnifiedDecimalType(38, 0);
+        } else if (typeName.contains("decimal")) {
+            throw new SemanticException("Unknown type: %s", typeName);
+        } else if (typeName.equals("real")) {
+            return ScalarType.createType(PrimitiveType.FLOAT);
         } else {
             // this contains datetime/date/numeric type
             return ScalarType.createType(typeName);

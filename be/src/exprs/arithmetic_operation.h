@@ -77,6 +77,43 @@ bool check_fpe_of_min_div_by_minus_one(LType lhs, RType rhs) {
     }
 }
 
+template <typename Op>
+std::string get_op_name() {
+    if constexpr (is_add_op<Op>) {
+        return "add";
+    } else if constexpr (is_sub_op<Op>) {
+        return "sub";
+    } else if constexpr (is_reverse_sub_op<Op>) {
+        return "reverse_sub";
+    } else if constexpr (is_reverse_mod_op<Op>) {
+        return "reverse_mod";
+    } else if constexpr (is_mul_op<Op>) {
+        return "mul";
+    } else if constexpr (is_div_op<Op>) {
+        return "div";
+    } else if constexpr (is_intdiv_op<Op>) {
+        return "intdiv";
+    } else if constexpr (is_mod_op<Op>) {
+        return "mod";
+    } else if constexpr (is_bitand_op<Op>) {
+        return "bitand";
+    } else if constexpr (is_bitor_op<Op>) {
+        return "bitor";
+    } else if constexpr (is_bitxor_op<Op>) {
+        return "bitxor";
+    } else if constexpr (is_bitnot_op<Op>) {
+        return "bitnot";
+    } else if constexpr (is_bit_shift_left_op<Op>) {
+        return "bit_shift_left";
+    } else if constexpr (is_bit_shift_right_op<Op>) {
+        return "bit_shift_right";
+    } else if constexpr (is_bit_shift_right_logical_op<Op>) {
+        return "bit_shift_right_logical";
+    } else {
+        return "unknown";
+    }
+}
+
 template <typename Op, LogicalType Type, typename = guard::Guard, typename = guard::Guard>
 struct ArithmeticBinaryOperator {
     template <typename LType, typename RType, typename ResultType>
@@ -170,7 +207,7 @@ struct ArithmeticBinaryOperator<Op, TYPE_DECIMALV2, DivModOpGuard<Op>, guard::Gu
 };
 
 template <LogicalType Type>
-struct ArithmeticBinaryOperator<ModOp, Type, guard::Guard, FloatPTGuard<Type>> {
+struct ArithmeticBinaryOperator<ModOp, Type, guard::Guard, FloatLTGuard<Type>> {
     template <typename LType, typename RType, typename ResultType>
     static inline ReturnType<Type, ResultType> apply(const LType& l, const RType& r) {
         auto result = fmod(l, (r + (r == 0)));
@@ -232,6 +269,20 @@ T decimal_div_integer(const T& dividend, const T& divisor, int dividend_scale) {
     return quotient;
 }
 
+template <typename T>
+T decimal_sub(const T& lhs, const T& rhs, int scale) {
+    // compute adjust_scale_factor
+    auto [_1, _2, adjust_scale] = compute_decimal_result_type<T, SubOp>(scale, scale);
+    T adjust_scale_factor = get_scale_factor<T>(adjust_scale);
+    // scale lhs up by adjust_scale
+    T scaled_lhs = 0;
+    DecimalV3Cast::to_decimal<T, T, T, true, false>(lhs, adjust_scale_factor, &scaled_lhs);
+    // compute the delta
+    T delta = 0;
+    DecimalV3Arithmetics<T, false>::sub(scaled_lhs, rhs, &delta);
+    return delta;
+}
+
 class Decimal128P38S9 {
 public:
     using Type = int128_t;
@@ -282,10 +333,10 @@ private:
 };
 
 template <typename Op, LogicalType Type>
-struct ArithmeticBinaryOperator<Op, Type, DecimalOpGuard<Op>, DecimalPTGuard<Type>> {
+struct ArithmeticBinaryOperator<Op, Type, DecimalOpGuard<Op>, DecimalLTGuard<Type>> {
     template <bool check_overflow, typename LType, typename RType, typename ResultType>
     static inline bool apply(const LType& l, const RType& r, ResultType* result) {
-        [[maybe_unused]] static constexpr ResultType zero = ResultType(0);
+        [[maybe_unused]] static constexpr auto zero = ResultType(0);
         using DecimalV3Operators = DecimalV3Arithmetics<ResultType, check_overflow>;
         [[maybe_unused]] bool overflow = false;
         if constexpr (is_add_op<Op>) {
@@ -371,11 +422,11 @@ struct ArithmeticBinaryOperator<Op, Type, DecimalOpGuard<Op>, DecimalPTGuard<Typ
 };
 
 template <typename Op, LogicalType Type>
-struct ArithmeticBinaryOperator<Op, Type, DecimalFastMulOpGuard<Op>, DecimalPTGuard<Type>> {
+struct ArithmeticBinaryOperator<Op, Type, DecimalFastMulOpGuard<Op>, DecimalLTGuard<Type>> {
     template <bool check_overflow, bool adjust_left, typename LType, typename RType, typename ResultType>
     static inline bool apply(const LType& l, const RType& r, ResultType* result,
                              [[maybe_unused]] const RType& scale_factor) {
-        if constexpr (pt_is_decimal128<Type>) {
+        if constexpr (lt_is_decimal128<Type>) {
             *result = i64_x_i64_produce_i128(l, r);
         } else {
             *result = i32_x_i32_produce_i64(l, r);

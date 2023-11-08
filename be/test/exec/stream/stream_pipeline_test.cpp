@@ -18,6 +18,7 @@
 
 #include <vector>
 
+#include "exec/pipeline/fragment_context.h"
 #include "exec/pipeline/pipeline_builder.h"
 #include "exec/pipeline/pipeline_driver_executor.h"
 #include "exec/pipeline/stream_pipeline_driver.h"
@@ -45,7 +46,8 @@ Status StreamPipelineTest::prepare() {
     _query_ctx->set_query_expire_seconds(600);
     _query_ctx->extend_delivery_lifetime();
     _query_ctx->extend_query_lifetime();
-    _query_ctx->init_mem_tracker(_exec_env->query_pool_mem_tracker()->limit(), _exec_env->query_pool_mem_tracker());
+    _query_ctx->init_mem_tracker(GlobalEnv::GetInstance()->query_pool_mem_tracker()->limit(),
+                                 GlobalEnv::GetInstance()->query_pool_mem_tracker());
 
     _fragment_ctx = _query_ctx->fragment_mgr()->get_or_register(fragment_id);
     _fragment_ctx->set_query_id(query_id);
@@ -54,6 +56,7 @@ Status StreamPipelineTest::prepare() {
             std::make_unique<RuntimeState>(_request.params.query_id, _request.params.fragment_instance_id,
                                            _request.query_options, _request.query_globals, _exec_env));
     _fragment_ctx->set_is_stream_pipeline(true);
+    _fragment_ctx->set_is_stream_test(true);
 
     _fragment_future = _fragment_ctx->finish_future();
     _runtime_state = _fragment_ctx->runtime_state();
@@ -65,6 +68,8 @@ Status StreamPipelineTest::prepare() {
     _runtime_state->set_fragment_ctx(_fragment_ctx);
 
     _obj_pool = _runtime_state->obj_pool();
+    _pipeline_context =
+            _obj_pool->add(new pipeline::PipelineBuilderContext(_fragment_ctx, _degree_of_parallelism, true));
 
     DCHECK(_pipeline_builder != nullptr);
     _pipelines.clear();
@@ -74,16 +79,22 @@ Status StreamPipelineTest::prepare() {
 
     const auto& pipelines = _fragment_ctx->pipelines();
     const size_t num_pipelines = pipelines.size();
+
+    // morsel queue
+    starrocks::pipeline::MorselQueueFactoryMap& morsel_queues = _fragment_ctx->morsel_queue_factories();
+    for (const auto& pipeline : pipelines) {
+        if (pipeline->source_operator_factory()->with_morsels()) {
+            auto source_id = pipeline->get_op_factories()[0]->plan_node_id();
+            DCHECK(morsel_queues.count(source_id));
+            auto& morsel_queue_factory = morsel_queues[source_id];
+
+            pipeline->source_operator_factory()->set_morsel_queue_factory(morsel_queue_factory.get());
+        }
+    }
+
     for (auto n = 0; n < num_pipelines; ++n) {
         const auto& pipeline = pipelines[n];
         pipeline->instantiate_drivers(_fragment_ctx->runtime_state());
-        for (auto& driver : pipeline->drivers()) {
-            for (auto& op : driver->operators()) {
-                if (auto* stream_source_op = dynamic_cast<GeneratorStreamSourceOperator*>(op.get())) {
-                    _tablet_ids.push_back(stream_source_op->tablet_id());
-                }
-            }
-        }
     }
 
     // prepare epoch manager
@@ -100,14 +111,12 @@ Status StreamPipelineTest::execute() {
             [state = _fragment_ctx->runtime_state()](const DriverPtr& driver) { return driver->prepare(state); });
     DCHECK(prepare_status.ok());
     bool enable_resource_group = _fragment_ctx->enable_resource_group();
-    _fragment_ctx->iterate_drivers([exec_env = _exec_env, enable_resource_group](const DriverPtr& driver) {
-        if (enable_resource_group) {
-            exec_env->wg_driver_executor()->submit(driver.get());
-        } else {
-            exec_env->driver_executor()->submit(driver.get());
-        }
-        return Status::OK();
-    });
+    CHECK(_fragment_ctx
+                  ->iterate_drivers([exec_env = _exec_env, enable_resource_group](const DriverPtr& driver) {
+                      exec_env->wg_driver_executor()->submit(driver.get());
+                      return Status::OK();
+                  })
+                  .ok());
     return Status::OK();
 }
 
@@ -116,7 +125,8 @@ OpFactories StreamPipelineTest::maybe_interpolate_local_passthrough_exchange(OpF
     auto* source_operator = down_cast<SourceOperatorFactory*>(pred_operators[0].get());
     if (source_operator->degree_of_parallelism() > 1) {
         auto pseudo_plan_node_id = -200;
-        auto mem_mgr = std::make_shared<pipeline::LocalExchangeMemoryManager>(config::vector_chunk_size);
+        auto mem_mgr = std::make_shared<pipeline::ChunkBufferMemoryManager>(
+                config::vector_chunk_size, config::local_exchange_buffer_mem_limit_per_driver);
         auto local_exchange_source = std::make_shared<pipeline::LocalExchangeSourceOperatorFactory>(
                 next_operator_id(), pseudo_plan_node_id, mem_mgr);
 
@@ -152,7 +162,7 @@ Status StreamPipelineTest::start_mv(InitiliazeFunc&& init_func) {
 void StreamPipelineTest::stop_mv() {
     VLOG_ROW << "StopMV";
     auto stream_epoch_manager = _query_ctx->stream_epoch_manager();
-    stream_epoch_manager->set_finished(_exec_env, _query_ctx);
+    ASSERT_TRUE(stream_epoch_manager->set_finished(_exec_env, _query_ctx).ok());
     ASSERT_EQ(std::future_status::ready, _fragment_future.wait_for(std::chrono::seconds(15)));
 }
 
@@ -188,17 +198,10 @@ Status StreamPipelineTest::wait_until_epoch_finished(const EpochInfo& epoch_info
     auto are_all_drivers_parked_func = [=]() {
         size_t num_parked_drivers = 0;
         auto query_id = _fragment_ctx->query_id();
-        if (_fragment_ctx->enable_resource_group()) {
-            num_parked_drivers = _exec_env->wg_driver_executor()->calculate_parked_driver(
-                    [query_id](const pipeline::PipelineDriver* driver) {
-                        return driver->query_ctx()->query_id() == query_id;
-                    });
-        } else {
-            num_parked_drivers = _exec_env->driver_executor()->calculate_parked_driver(
-                    [query_id](const pipeline::PipelineDriver* driver) {
-                        return driver->query_ctx()->query_id() == query_id;
-                    });
-        }
+        num_parked_drivers = _exec_env->wg_driver_executor()->calculate_parked_driver(
+                [query_id](const pipeline::PipelineDriver* driver) {
+                    return driver->query_ctx()->query_id() == query_id;
+                });
         return num_parked_drivers == _fragment_ctx->num_drivers();
     };
 

@@ -18,15 +18,15 @@
 
 #include "column/chunk.h"
 #include "column/column_helper.h"
-#include "column/nullable_column.h"
 #include "column/vectorized_fwd.h"
-#include "common/global_types.h"
 #include "common/object_pool.h"
 #include "common/statusor.h"
 #include "exec/pipeline/limit_operator.h"
 #include "exec/pipeline/nljoin/nljoin_build_operator.h"
 #include "exec/pipeline/nljoin/nljoin_context.h"
 #include "exec/pipeline/nljoin/nljoin_probe_operator.h"
+#include "exec/pipeline/nljoin/spillable_nljoin_build_operator.h"
+#include "exec/pipeline/nljoin/spillable_nljoin_probe_operator.h"
 #include "exec/pipeline/operator.h"
 #include "exec/pipeline/pipeline_builder.h"
 #include "exprs/expr_context.h"
@@ -59,9 +59,6 @@ static bool _support_join_type(TJoinOp::type join_type) {
 
 Status CrossJoinNode::init(const TPlanNode& tnode, RuntimeState* state) {
     RETURN_IF_ERROR(ExecNode::init(tnode, state));
-    if (tnode.__isset.need_create_tuple_columns) {
-        _need_create_tuple_columns = tnode.need_create_tuple_columns;
-    }
     if (tnode.__isset.nestloop_join_node) {
         _join_op = tnode.nestloop_join_node.join_op;
         if (!state->enable_pipeline_engine() && _join_op != TJoinOp::CROSS_JOIN && _join_op != TJoinOp::INNER_JOIN) {
@@ -69,7 +66,7 @@ Status CrossJoinNode::init(const TPlanNode& tnode, RuntimeState* state) {
         }
         if (!_support_join_type(_join_op)) {
             std::string type_string = starrocks::to_string(_join_op);
-            return Status::NotSupported("nestloop join not supoort: " + type_string);
+            return Status::NotSupported("nest-loop join not support: " + type_string);
         }
 
         if (tnode.nestloop_join_node.__isset.join_conjuncts) {
@@ -162,31 +159,6 @@ void CrossJoinNode::_copy_joined_rows_with_index_base_probe(ChunkPtr& chunk, siz
         ColumnPtr& src_col = _build_chunk->get_column_by_slot_id(slot->id());
         _copy_build_rows_with_index_base_probe(dest_col, src_col, build_index, row_count);
     }
-
-    for (int tuple_id : _output_probe_tuple_ids) {
-        if (_probe_chunk->is_tuple_exist(tuple_id)) {
-            ColumnPtr& src_col = _probe_chunk->get_tuple_column_by_id(tuple_id);
-            auto& src_data = ColumnHelper::as_raw_column<BooleanColumn>(src_col)->get_data();
-            ColumnPtr& dest_col = chunk->get_tuple_column_by_id(tuple_id);
-            auto& dest_data = ColumnHelper::as_raw_column<BooleanColumn>(dest_col)->get_data();
-            for (size_t i = 0; i < row_count; i++) {
-                dest_data.emplace_back(src_data[probe_index]);
-            }
-        }
-    }
-
-    for (int tuple_id : _output_build_tuple_ids) {
-        if (_build_chunk->is_tuple_exist(tuple_id)) {
-            ColumnPtr& src_col = _build_chunk->get_tuple_column_by_id(tuple_id);
-            auto& src_data = ColumnHelper::as_raw_column<BooleanColumn>(src_col)->get_data();
-            ColumnPtr& dest_col = chunk->get_tuple_column_by_id(tuple_id);
-            auto& dest_data = ColumnHelper::as_raw_column<BooleanColumn>(dest_col)->get_data();
-
-            for (size_t i = 0; i < row_count; i++) {
-                dest_data.emplace_back(src_data[build_index + i]);
-            }
-        }
-    }
 }
 
 void CrossJoinNode::_copy_joined_rows_with_index_base_build(ChunkPtr& chunk, size_t row_count, size_t probe_index,
@@ -203,31 +175,6 @@ void CrossJoinNode::_copy_joined_rows_with_index_base_build(ChunkPtr& chunk, siz
         ColumnPtr& dest_col = chunk->get_column_by_slot_id(slot->id());
         ColumnPtr& src_col = _build_chunk->get_column_by_slot_id(slot->id());
         _copy_build_rows_with_index_base_build(dest_col, src_col, build_index, row_count);
-    }
-
-    for (int tuple_id : _output_probe_tuple_ids) {
-        if (_probe_chunk->is_tuple_exist(tuple_id)) {
-            ColumnPtr& src_col = _probe_chunk->get_tuple_column_by_id(tuple_id);
-            auto& src_data = ColumnHelper::as_raw_column<BooleanColumn>(src_col)->get_data();
-            ColumnPtr& dest_col = chunk->get_tuple_column_by_id(tuple_id);
-            auto& dest_data = ColumnHelper::as_raw_column<BooleanColumn>(dest_col)->get_data();
-            for (size_t i = 0; i < row_count; i++) {
-                dest_data.emplace_back(src_data[probe_index + i]);
-            }
-        }
-    }
-
-    for (int tuple_id : _output_build_tuple_ids) {
-        if (_build_chunk->is_tuple_exist(tuple_id)) {
-            ColumnPtr& src_col = _build_chunk->get_tuple_column_by_id(tuple_id);
-            auto& src_data = ColumnHelper::as_raw_column<BooleanColumn>(src_col)->get_data();
-            ColumnPtr& dest_col = chunk->get_tuple_column_by_id(tuple_id);
-            auto& dest_data = ColumnHelper::as_raw_column<BooleanColumn>(dest_col)->get_data();
-
-            for (size_t i = 0; i < row_count; i++) {
-                dest_data.emplace_back(src_data[build_index]);
-            }
-        }
     }
 }
 
@@ -378,6 +325,7 @@ Status CrossJoinNode::get_next_internal(RuntimeState* state, ChunkPtr* chunk, bo
             continue;
         }
 
+        TRY_CATCH_ALLOC_SCOPE_START()
         if ((*chunk) == nullptr) {
             // we need a valid probe chunk to initialize the new chunk.
             _init_chunk(chunk);
@@ -396,7 +344,7 @@ Status CrossJoinNode::get_next_internal(RuntimeState* state, ChunkPtr* chunk, bo
         // Until _probe_chunk be done.
         if (_probe_chunk_index == _probe_chunk->num_rows()) {
             // step 2:
-            // if left chunk is bigger than right, we shuld scan left based on right.
+            // if left chunk is bigger than right, we should scan left based on right.
             if (_probe_chunk_index > _number_of_build_rows - _build_chunks_size) {
                 if (row_count > _probe_chunk_index - _probe_rows_index) {
                     row_count = _probe_chunk_index - _probe_rows_index;
@@ -472,6 +420,8 @@ Status CrossJoinNode::get_next_internal(RuntimeState* state, ChunkPtr* chunk, bo
             continue;
         }
 
+        TRY_CATCH_ALLOC_SCOPE_END()
+
         RETURN_IF_ERROR(ExecNode::eval_conjuncts(_join_conjuncts, (*chunk).get()));
         RETURN_IF_ERROR(ExecNode::eval_conjuncts(_conjunct_ctxs, (*chunk).get()));
 
@@ -504,9 +454,9 @@ Status CrossJoinNode::get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos) 
             });
 }
 
-Status CrossJoinNode::close(RuntimeState* state) {
+void CrossJoinNode::close(RuntimeState* state) {
     if (is_closed()) {
-        return Status::OK();
+        return;
     }
 
     if (_build_chunk != nullptr) {
@@ -517,7 +467,7 @@ Status CrossJoinNode::close(RuntimeState* state) {
     }
 
     Expr::close(_join_conjuncts, state);
-    return ExecNode::close(state);
+    ExecNode::close(state);
 }
 
 void CrossJoinNode::_init_row_desc() {
@@ -526,21 +476,11 @@ void CrossJoinNode::_init_row_desc() {
             _col_types.emplace_back(slot);
             _probe_column_count++;
         }
-        if (_need_create_tuple_columns) {
-            if (_row_descriptor.get_tuple_idx(tuple_desc->id()) != RowDescriptor::INVALID_IDX) {
-                _output_probe_tuple_ids.emplace_back(tuple_desc->id());
-            }
-        }
     }
     for (auto& tuple_desc : child(1)->row_desc().tuple_descriptors()) {
         for (auto& slot : tuple_desc->slots()) {
             _col_types.emplace_back(slot);
             _build_column_count++;
-        }
-        if (_need_create_tuple_columns) {
-            if (_row_descriptor.get_tuple_idx(tuple_desc->id()) != RowDescriptor::INVALID_IDX) {
-                _output_build_tuple_ids.emplace_back(tuple_desc->id());
-            }
         }
     }
 }
@@ -582,7 +522,7 @@ Status CrossJoinNode::_build(RuntimeState* state) {
         _build_chunks_size = (_number_of_build_rows / runtime_state()->chunk_size()) * runtime_state()->chunk_size();
     }
 
-    RETURN_IF_ERROR(child(1)->close(state));
+    child(1)->close(state);
     return Status::OK();
 }
 
@@ -594,7 +534,7 @@ StatusOr<std::list<ExprContext*>> CrossJoinNode::rewrite_runtime_filter(
     for (auto rf_desc : rf_descs) {
         DCHECK_LT(rf_desc->build_expr_order(), ctxs.size());
         ASSIGN_OR_RETURN(auto expr, RuntimeFilterHelper::rewrite_runtime_filter_in_cross_join_node(
-                                            pool, ctxs[rf_desc->build_expr_order()], chunk));
+                                            pool, ctxs[rf_desc->build_expr_order()], chunk))
         filters.push_back(expr);
     }
     return filters;
@@ -617,28 +557,16 @@ void CrossJoinNode::_init_chunk(ChunkPtr* chunk) {
         new_chunk->append_column(std::move(new_col), slot->id());
     }
 
-    for (int tuple_id : _output_probe_tuple_ids) {
-        if (_probe_chunk->is_tuple_exist(tuple_id)) {
-            ColumnPtr dest_col = BooleanColumn::create();
-            new_chunk->append_tuple_column(dest_col, tuple_id);
-        }
-    }
-    for (int tuple_id : _output_build_tuple_ids) {
-        if (_build_chunk->is_tuple_exist(tuple_id)) {
-            ColumnPtr dest_col = BooleanColumn::create();
-            new_chunk->append_tuple_column(dest_col, tuple_id);
-        }
-    }
-
     *chunk = std::move(new_chunk);
     (*chunk)->reserve(runtime_state()->chunk_size());
 }
 
-pipeline::OpFactories CrossJoinNode::decompose_to_pipeline(pipeline::PipelineBuilderContext* context) {
+template <class BuildFactory, class ProbeFactory>
+std::vector<std::shared_ptr<pipeline::OperatorFactory>> CrossJoinNode::_decompose_to_pipeline(
+        pipeline::PipelineBuilderContext* context) {
     using namespace pipeline;
 
     // step 0: construct pipeline end with cross join right operator.
-    OpFactories left_ops = _children[0]->decompose_to_pipeline(context);
     OpFactories right_ops = _children[1]->decompose_to_pipeline(context);
 
     // define a runtime filter holder
@@ -646,15 +574,9 @@ pipeline::OpFactories CrossJoinNode::decompose_to_pipeline(pipeline::PipelineBui
 
     // Create a shared RefCountedRuntimeFilterCollector
     auto&& rc_rf_probe_collector = std::make_shared<RcRfProbeCollector>(2, std::move(this->runtime_filter_collector()));
-    // communication with CrossJoinLeft through shared_datas.
-    auto* right_source = down_cast<SourceOperatorFactory*>(right_ops[0].get());
-    auto* left_source = down_cast<SourceOperatorFactory*>(left_ops[0].get());
 
     // step 1: construct pipeline end with cross join left operator(cross join left maybe not sink operator).
-
     NLJoinContextParams context_params;
-    context_params.num_left_probers = left_source->degree_of_parallelism();
-    context_params.num_right_sinkers = right_source->degree_of_parallelism();
     context_params.plan_node_id = _id;
     context_params.rf_hub = context->fragment_context()->runtime_filter_hub();
     context_params.rf_descs = std::move(_build_runtime_filters);
@@ -662,30 +584,58 @@ pipeline::OpFactories CrossJoinNode::decompose_to_pipeline(pipeline::PipelineBui
     context_params.filters = _join_conjuncts;
     std::copy(conjunct_ctxs().begin(), conjunct_ctxs().end(), std::back_inserter(context_params.filters));
 
+    size_t num_right_partitions = context->source_operator(right_ops)->degree_of_parallelism();
+    auto workgroup = context->fragment_context()->workgroup();
+    auto executor = std::make_shared<spill::IOTaskExecutor>(ExecEnv::GetInstance()->scan_executor(), workgroup);
+    auto spill_process_factory_ptr =
+            std::make_shared<SpillProcessChannelFactory>(num_right_partitions, std::move(executor));
+    context_params.spill_process_factory_ptr = spill_process_factory_ptr;
+
     auto cross_join_context = std::make_shared<NLJoinContext>(std::move(context_params));
 
     // cross_join_right as sink operator
-    auto right_factory =
-            std::make_shared<NLJoinBuildOperatorFactory>(context->next_operator_id(), id(), cross_join_context);
+    auto right_factory = std::make_shared<BuildFactory>(context->next_operator_id(), id(), cross_join_context);
     // Initialize OperatorFactory's fields involving runtime filters.
     this->init_runtime_filter_for_operator(right_factory.get(), context, rc_rf_probe_collector);
+
     right_ops.emplace_back(std::move(right_factory));
     context->add_pipeline(right_ops);
+    context->push_dependent_pipeline(context->last_pipeline());
+    DeferOp pop_dependent_pipeline([context]() { context->pop_dependent_pipeline(); });
 
+    OpFactories left_ops = _children[0]->decompose_to_pipeline(context);
     // communication with CrossJoinRight through shared_data.
-    auto left_factory = std::make_shared<NLJoinProbeOperatorFactory>(
-            context->next_operator_id(), id(), _row_descriptor, child(0)->row_desc(), child(1)->row_desc(),
-            _sql_join_conjuncts, std::move(_join_conjuncts), std::move(_conjunct_ctxs), std::move(cross_join_context),
-            _join_op);
+    auto left_factory =
+            std::make_shared<ProbeFactory>(context->next_operator_id(), id(), _row_descriptor, child(0)->row_desc(),
+                                           child(1)->row_desc(), _sql_join_conjuncts, std::move(_join_conjuncts),
+                                           std::move(_conjunct_ctxs), std::move(cross_join_context), _join_op);
     // Initialize OperatorFactory's fields involving runtime filters.
     this->init_runtime_filter_for_operator(left_factory.get(), context, rc_rf_probe_collector);
+    left_ops = context->maybe_interpolate_local_adpative_passthrough_exchange(runtime_state(), id(), left_ops,
+                                                                              context->degree_of_parallelism());
     left_ops.emplace_back(std::move(left_factory));
+
     if (limit() != -1) {
         left_ops.emplace_back(std::make_shared<LimitOperatorFactory>(context->next_operator_id(), id(), limit()));
     }
 
+    if constexpr (std::is_same_v<BuildFactory, SpillableNLJoinBuildOperatorFactory>) {
+        may_add_chunk_accumulate_operator(left_ops, context, id());
+    }
+
     // return as the following pipeline
     return left_ops;
+}
+
+pipeline::OpFactories CrossJoinNode::decompose_to_pipeline(pipeline::PipelineBuilderContext* context) {
+    using namespace pipeline;
+
+    if (runtime_state()->enable_spill() && runtime_state()->enable_nl_join_spill() && _join_op == TJoinOp::CROSS_JOIN) {
+        return _decompose_to_pipeline<SpillableNLJoinBuildOperatorFactory, SpillableNLJoinProbeOperatorFactory>(
+                context);
+    } else {
+        return _decompose_to_pipeline<NLJoinBuildOperatorFactory, NLJoinProbeOperatorFactory>(context);
+    }
 }
 
 } // namespace starrocks

@@ -34,6 +34,7 @@
 
 package com.starrocks.http.rest;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Strings;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
@@ -48,13 +49,13 @@ import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
-import com.starrocks.mysql.privilege.PrivPredicate;
+import com.starrocks.privilege.AccessDeniedException;
 import com.starrocks.privilege.PrivilegeType;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Authorizer;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
-import org.codehaus.jackson.map.ObjectMapper;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -77,7 +78,7 @@ public class TableSchemaAction extends RestBaseAction {
     }
 
     @Override
-    protected void executeWithoutPassword(BaseRequest request, BaseResponse response) throws DdlException {
+    protected void executeWithoutPassword(BaseRequest request, BaseResponse response) throws DdlException, AccessDeniedException {
         // just allocate 2 slot for top holder map
         Map<String, Object> resultMap = new HashMap<>(2);
         String dbName = request.getSingleParameter(DB_KEY);
@@ -88,11 +89,9 @@ public class TableSchemaAction extends RestBaseAction {
                 throw new StarRocksHttpException(HttpResponseStatus.BAD_REQUEST, "No database or table selected.");
             }
             // check privilege for select, otherwise return 401 HTTP status
-            if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-                checkTableAction(ConnectContext.get(), dbName, tableName, PrivilegeType.SELECT);
-            } else {
-                checkTblAuth(ConnectContext.get().getCurrentUserIdentity(), dbName, tableName, PrivPredicate.SELECT);
-            }
+            Authorizer.checkTableAction(ConnectContext.get().getCurrentUserIdentity(), ConnectContext.get().getCurrentRoleIds(),
+                    dbName, tableName, PrivilegeType.SELECT);
+
             Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
             if (db == null) {
                 throw new StarRocksHttpException(HttpResponseStatus.NOT_FOUND,

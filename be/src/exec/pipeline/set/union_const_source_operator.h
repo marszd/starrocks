@@ -38,7 +38,7 @@ public:
     UnionConstSourceOperator(OperatorFactory* factory, int32_t id, int32_t plan_node_id, int32_t driver_sequence,
                              const std::vector<SlotDescriptor*>& dst_slots,
                              const std::vector<ExprContext*>* const const_expr_lists, const size_t rows_total)
-            : SourceOperator(factory, id, "union_const_source", plan_node_id, driver_sequence),
+            : SourceOperator(factory, id, "union_const_source", plan_node_id, false, driver_sequence),
               _dst_slots(dst_slots),
               _const_expr_lists(DCHECK_NOTNULL(const_expr_lists)),
               _rows_total(rows_total) {}
@@ -82,6 +82,8 @@ public:
 
     Status prepare(RuntimeState* state) override;
     void close(RuntimeState* state) override;
+
+    SourceOperatorFactory::AdaptiveState adaptive_state() const override { return AdaptiveState::ACTIVE; }
 
 private:
     const std::vector<SlotDescriptor*>& _dst_slots;

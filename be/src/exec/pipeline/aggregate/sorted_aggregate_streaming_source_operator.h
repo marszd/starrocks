@@ -21,22 +21,21 @@ namespace starrocks::pipeline {
 class SortedAggregateStreamingSourceOperator : public SourceOperator {
 public:
     SortedAggregateStreamingSourceOperator(OperatorFactory* factory, int32_t id, int32_t plan_node_id,
-                                           int32_t driver_sequence,
-                                           std::shared_ptr<SortedStreamingAggregator> aggregator);
+                                           int32_t driver_sequence, SortedStreamingAggregatorPtr aggregator);
     ~SortedAggregateStreamingSourceOperator() override = default;
 
     bool has_output() const override;
     bool is_finished() const override;
-    Status set_finishing(RuntimeState* state) override;
-    Status set_finished(RuntimeState* state) override;
+    [[nodiscard]] Status set_finishing(RuntimeState* state) override;
+    [[nodiscard]] Status set_finished(RuntimeState* state) override;
 
     void close(RuntimeState* state) override;
 
-    StatusOr<ChunkPtr> pull_chunk(RuntimeState* state) override;
+    [[nodiscard]] StatusOr<ChunkPtr> pull_chunk(RuntimeState* state) override;
 
 private:
     mutable bool _is_finished = false;
-    std::shared_ptr<SortedStreamingAggregator> _aggregator;
+    SortedStreamingAggregatorPtr _aggregator;
 };
 
 class SortedAggregateStreamingSourceOperatorFactory final : public SourceOperatorFactory {

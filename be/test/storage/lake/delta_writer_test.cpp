@@ -22,40 +22,29 @@
 #include "column/datum_tuple.h"
 #include "column/fixed_length_column.h"
 #include "column/schema.h"
-#include "column/vectorized_fwd.h"
 #include "common/logging.h"
 #include "fs/fs_util.h"
 #include "runtime/mem_tracker.h"
 #include "storage/chunk_helper.h"
 #include "storage/lake/fixed_location_provider.h"
 #include "storage/lake/join_path.h"
-#include "storage/lake/tablet.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/lake/txn_log.h"
 #include "storage/rowset/segment.h"
-#include "storage/rowset/segment_iterator.h"
 #include "storage/rowset/segment_options.h"
 #include "storage/tablet_schema.h"
+#include "test_util.h"
 #include "testutil/assert.h"
 #include "testutil/id_generator.h"
-#include "util/defer_op.h"
+#include "testutil/sync_point.h"
 
 namespace starrocks::lake {
 
 using namespace starrocks;
 
-using VSchema = starrocks::Schema;
-using VChunk = starrocks::Chunk;
-
-class DeltaWriterTest : public testing::Test {
+class LakeDeltaWriterTest : public TestBase {
 public:
-    DeltaWriterTest() {
-        _parent_mem_tracker = std::make_unique<MemTracker>(-1);
-        _mem_tracker = std::make_unique<MemTracker>(-1, "", _parent_mem_tracker.get());
-        _location_provider = std::make_unique<FixedLocationProvider>(kTestGroupPath);
-        _update_manager = std::make_unique<UpdateManager>(_location_provider.get());
-        _tablet_manager = std::make_unique<TabletManager>(_location_provider.get(), _update_manager.get(), 1024 * 1024);
-
+    LakeDeltaWriterTest() : TestBase(kTestDirectory) {
         _tablet_metadata = std::make_unique<TabletMetadata>();
         _tablet_metadata->set_id(next_id());
         _tablet_metadata->set_version(1);
@@ -87,26 +76,18 @@ public:
         }
 
         _tablet_schema = TabletSchema::create(*schema);
-        _schema = std::make_shared<VSchema>(ChunkHelper::convert_schema(*_tablet_schema));
+        _schema = std::make_shared<Schema>(ChunkHelper::convert_schema(_tablet_schema));
     }
 
 protected:
     void SetUp() override {
-        (void)fs::remove_all(kTestGroupPath);
-        CHECK_OK(fs::create_directories(lake::join_path(kTestGroupPath, lake::kSegmentDirectoryName)));
-        CHECK_OK(fs::create_directories(lake::join_path(kTestGroupPath, lake::kMetadataDirectoryName)));
-        CHECK_OK(fs::create_directories(lake::join_path(kTestGroupPath, lake::kTxnLogDirectoryName)));
-        CHECK_OK(_tablet_manager->put_tablet_metadata(*_tablet_metadata));
+        clear_and_init_test_dir();
+        CHECK_OK(_tablet_mgr->put_tablet_metadata(*_tablet_metadata));
     }
 
-    void TearDown() override {
-        ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(_tablet_metadata->id()));
-        tablet.delete_txn_log(_txn_id);
-        _txn_id++;
-        (void)fs::remove_all(kTestGroupPath);
-    }
+    void TearDown() override { remove_test_dir_ignore_error(); }
 
-    VChunk generate_data(int64_t chunk_size) {
+    Chunk generate_data(int64_t chunk_size) {
         std::vector<int> v0(chunk_size);
         std::vector<int> v1(chunk_size);
         for (int i = 0; i < chunk_size; i++) {
@@ -122,36 +103,93 @@ protected:
         auto c1 = Int32Column::create();
         c0->append_numbers(v0.data(), v0.size() * sizeof(int));
         c1->append_numbers(v1.data(), v1.size() * sizeof(int));
-        return VChunk({c0, c1}, _schema);
+        return Chunk({c0, c1}, _schema);
     }
 
-    constexpr static const char* const kTestGroupPath = "test_lake_delta_writer";
-
-    std::unique_ptr<MemTracker> _parent_mem_tracker;
-    std::unique_ptr<MemTracker> _mem_tracker;
-    std::unique_ptr<FixedLocationProvider> _location_provider;
-    std::unique_ptr<UpdateManager> _update_manager;
-    std::unique_ptr<TabletManager> _tablet_manager;
+    constexpr static const char* const kTestDirectory = "test_lake_delta_writer";
 
     std::unique_ptr<TabletMetadata> _tablet_metadata;
     std::shared_ptr<TabletSchema> _tablet_schema;
-    std::shared_ptr<VSchema> _schema;
-    int64_t _txn_id = 123;
+    std::shared_ptr<Schema> _schema;
     int64_t _partition_id = 456;
 };
 
-TEST_F(DeltaWriterTest, test_open) {
+TEST_F(LakeDeltaWriterTest, test_build) {
+    {
+        auto res = DeltaWriterBuilder().build();
+        ASSERT_TRUE(!res.ok());
+        ASSERT_EQ("tablet_manager not set", res.status().message());
+    }
+    {
+        auto res = DeltaWriterBuilder().set_tablet_manager(_tablet_mgr.get()).build();
+        ASSERT_TRUE(!res.ok());
+        ASSERT_EQ("tablet_id not set", res.status().message());
+    }
+    {
+        auto res = DeltaWriterBuilder().set_tablet_manager(_tablet_mgr.get()).set_tablet_id(10).build();
+        ASSERT_TRUE(!res.ok());
+        ASSERT_EQ("txn_id not set", res.status().message());
+    }
+    {
+        auto res = DeltaWriterBuilder().set_tablet_manager(_tablet_mgr.get()).set_tablet_id(10).set_txn_id(11).build();
+        ASSERT_TRUE(!res.ok());
+        ASSERT_EQ("mem_tracker not set", res.status().message());
+    }
+    {
+        auto res = DeltaWriterBuilder()
+                           .set_tablet_manager(_tablet_mgr.get())
+                           .set_tablet_id(10)
+                           .set_txn_id(11)
+                           .set_mem_tracker(_mem_tracker.get())
+                           .set_max_buffer_size(-1)
+                           .build();
+        ASSERT_TRUE(!res.ok());
+        ASSERT_EQ("invalid max_buffer_size: -1", res.status().message());
+    }
+    {
+        auto res = DeltaWriterBuilder()
+                           .set_tablet_manager(_tablet_mgr.get())
+                           .set_tablet_id(10)
+                           .set_txn_id(11)
+                           .set_mem_tracker(_mem_tracker.get())
+                           .set_miss_auto_increment_column(true)
+                           .build();
+        ASSERT_TRUE(!res.ok());
+        ASSERT_EQ("must set table_id when miss_auto_increment_column is true", res.status().message());
+    }
+    {
+        auto res = DeltaWriterBuilder()
+                           .set_tablet_manager(_tablet_mgr.get())
+                           .set_tablet_id(10)
+                           .set_txn_id(11)
+                           .set_mem_tracker(_mem_tracker.get())
+                           .set_miss_auto_increment_column(true)
+                           .set_table_id(8)
+                           .build();
+        ASSERT_TRUE(!res.ok());
+        ASSERT_EQ("index_id not set", res.status().message());
+    }
+}
+
+TEST_F(LakeDeltaWriterTest, test_open) {
     // Invalid tablet id
     {
+        auto txn_id = next_id();
         auto tablet_id = -1;
-        auto delta_writer = DeltaWriter::create(_tablet_manager.get(), tablet_id, _txn_id, _partition_id, nullptr,
-                                                _mem_tracker.get());
+        ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_index_id(_tablet_schema->id())
+                                                   .build());
         ASSERT_OK(delta_writer->open());
         delta_writer->close();
     }
 }
 
-TEST_F(DeltaWriterTest, test_write) {
+TEST_F(LakeDeltaWriterTest, test_write) {
     // Prepare data for writing
     static const int kChunkSize = 128;
     auto chunk0 = generate_data(kChunkSize);
@@ -161,9 +199,16 @@ TEST_F(DeltaWriterTest, test_write) {
     }
 
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer =
-            DeltaWriter::create(_tablet_manager.get(), tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
     ASSERT_OK(delta_writer->open());
 
     // Write and flush
@@ -177,10 +222,10 @@ TEST_F(DeltaWriterTest, test_write) {
     delta_writer->close();
 
     // Check TxnLog
-    ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(tablet_id));
-    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(_txn_id));
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(txn_id));
     ASSERT_EQ(tablet_id, txnlog->tablet_id());
-    ASSERT_EQ(_txn_id, txnlog->txn_id());
+    ASSERT_EQ(txn_id, txnlog->txn_id());
     ASSERT_TRUE(txnlog->has_op_write());
     ASSERT_FALSE(txnlog->has_op_compaction());
     ASSERT_FALSE(txnlog->has_op_schema_change());
@@ -191,12 +236,12 @@ TEST_F(DeltaWriterTest, test_write) {
     ASSERT_GT(txnlog->op_write().rowset().data_size(), 0);
 
     // Check segment file
-    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestGroupPath));
-    auto path0 = _location_provider->segment_location(tablet_id, txnlog->op_write().rowset().segments(0));
-    auto path1 = _location_provider->segment_location(tablet_id, txnlog->op_write().rowset().segments(1));
+    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestDirectory));
+    auto path0 = _tablet_mgr->segment_location(tablet_id, txnlog->op_write().rowset().segments(0));
+    auto path1 = _tablet_mgr->segment_location(tablet_id, txnlog->op_write().rowset().segments(1));
 
-    ASSIGN_OR_ABORT(auto seg0, Segment::open(fs, path0, 0, _tablet_schema.get()));
-    ASSIGN_OR_ABORT(auto seg1, Segment::open(fs, path1, 1, _tablet_schema.get()));
+    ASSIGN_OR_ABORT(auto seg0, Segment::open(fs, path0, 0, _tablet_schema));
+    ASSIGN_OR_ABORT(auto seg1, Segment::open(fs, path1, 1, _tablet_schema));
 
     OlapReaderStatistics statistics;
     SegmentReadOptions opts;
@@ -223,7 +268,52 @@ TEST_F(DeltaWriterTest, test_write) {
     check_segment(seg1);
 }
 
-TEST_F(DeltaWriterTest, test_close) {
+TEST_F(LakeDeltaWriterTest, test_write_without_schema_file) {
+    // Prepare data for writing
+    static const int kChunkSize = 12;
+    auto chunk0 = generate_data(kChunkSize);
+    auto indexes = std::vector<uint32_t>(kChunkSize);
+    for (int i = 0; i < kChunkSize; i++) {
+        indexes[i] = i;
+    }
+    bool invoked = false;
+
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    SyncPoint::GetInstance()->SetCallBack("get_tablet_schema_by_index_id.1",
+                                          [](void* arg) { ((std::shared_ptr<const TabletSchema>*)arg)->reset(); });
+    SyncPoint::GetInstance()->SetCallBack("get_tablet_schema_by_index_id.2", [&](void* arg) {
+        *((StatusOr<std::shared_ptr<const TabletSchema>>*)arg) = Status::NotFound("mocked not found error");
+        invoked = true;
+    });
+
+    // Create and open DeltaWriter
+    auto txn_id = next_id();
+    auto tablet_id = _tablet_metadata->id();
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
+
+    ASSERT_OK(delta_writer->open());
+
+    // Write
+    ASSERT_OK(delta_writer->write(chunk0, indexes.data(), indexes.size()));
+    // finish
+    ASSERT_OK(delta_writer->finish());
+    // close
+    delta_writer->close();
+
+    ASSERT_TRUE(invoked) << "get_tablet_schema_by_index_id not invoked";
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    SyncPoint::GetInstance()->DisableProcessing();
+}
+
+TEST_F(LakeDeltaWriterTest, test_close) {
     // Prepare data for writing
     static const int kChunkSize = 128;
     auto chunk0 = generate_data(kChunkSize);
@@ -233,9 +323,16 @@ TEST_F(DeltaWriterTest, test_close) {
     }
 
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer =
-            DeltaWriter::create(_tablet_manager.get(), tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
     ASSERT_OK(delta_writer->open());
 
     // write()
@@ -244,18 +341,104 @@ TEST_F(DeltaWriterTest, test_close) {
     delta_writer->close();
 
     // TxnLog should not exist
-    ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(tablet_id));
-    ASSERT_TRUE(tablet.get_txn_log(_txn_id).status().is_not_found());
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSERT_TRUE(tablet.get_txn_log(txn_id).status().is_not_found());
 
     // Segment file should not exist
-    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestGroupPath));
-    ASSERT_OK(fs->iterate_dir(join_path(kTestGroupPath, kMetadataDirectoryName), [&](std::string_view name) {
+    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestDirectory));
+    ASSERT_OK(fs->iterate_dir(join_path(kTestDirectory, kMetadataDirectoryName), [&](std::string_view name) {
         EXPECT_TRUE(is_tablet_metadata(name)) << name;
         return true;
     }));
 }
 
-TEST_F(DeltaWriterTest, test_memory_limit_unreached) {
+TEST_F(LakeDeltaWriterTest, test_finish_without_write_txn_log) {
+    // Prepare data for writing
+    static const int kChunkSize = 1;
+    auto chunk0 = generate_data(kChunkSize);
+    auto indexes = std::vector<uint32_t>(kChunkSize);
+    for (int i = 0; i < kChunkSize; i++) {
+        indexes[i] = i;
+    }
+
+    // Create and open DeltaWriter
+    auto txn_id = next_id();
+    auto tablet_id = _tablet_metadata->id();
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
+    ASSERT_OK(delta_writer->open());
+
+    // write()
+    ASSERT_OK(delta_writer->write(chunk0, indexes.data(), indexes.size()));
+    ASSERT_OK(delta_writer->finish(DeltaWriter::kDontWriteTxnLog));
+    delta_writer->close();
+
+    // TxnLog should not exist
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSERT_TRUE(tablet.get_txn_log(txn_id).status().is_not_found());
+
+    // Segment file should exist
+    int segment_files = 0;
+    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestDirectory));
+    ASSERT_OK(fs->iterate_dir(join_path(kTestDirectory, kSegmentDirectoryName), [&](std::string_view name) {
+        segment_files += is_segment(name);
+        return true;
+    }));
+    ASSERT_EQ(1, segment_files) << segment_files;
+}
+
+TEST_F(LakeDeltaWriterTest, test_empty_write) {
+    auto txn_id = next_id();
+    auto tablet_id = _tablet_metadata->id();
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
+    ASSERT_OK(delta_writer->open());
+    ASSERT_OK(delta_writer->finish());
+    delta_writer->close();
+
+    // Check TxnLog
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(txn_id));
+    ASSERT_EQ(tablet_id, txnlog->tablet_id());
+    ASSERT_EQ(txn_id, txnlog->txn_id());
+    ASSERT_TRUE(txnlog->has_op_write());
+    ASSERT_FALSE(txnlog->has_op_compaction());
+    ASSERT_FALSE(txnlog->has_op_schema_change());
+    ASSERT_TRUE(txnlog->op_write().has_rowset());
+    ASSERT_EQ(0, txnlog->op_write().rowset().segments_size());
+    ASSERT_FALSE(txnlog->op_write().rowset().overlapped());
+    ASSERT_EQ(0, txnlog->op_write().rowset().num_rows());
+    ASSERT_EQ(0, txnlog->op_write().rowset().data_size());
+}
+
+TEST_F(LakeDeltaWriterTest, test_negative_txn_id) {
+    auto tablet_id = _tablet_metadata->id();
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(-1)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
+    ASSERT_OK(delta_writer->open());
+    ASSERT_ERROR(delta_writer->finish());
+    delta_writer->close();
+}
+
+TEST_F(LakeDeltaWriterTest, test_memory_limit_unreached) {
     // Prepare data for writing
     static const int kChunkSize = 128;
     auto chunk0 = generate_data(kChunkSize);
@@ -265,9 +448,16 @@ TEST_F(DeltaWriterTest, test_memory_limit_unreached) {
     }
 
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer =
-            DeltaWriter::create(_tablet_manager.get(), tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
     ASSERT_OK(delta_writer->open());
 
     // Write three times
@@ -280,10 +470,10 @@ TEST_F(DeltaWriterTest, test_memory_limit_unreached) {
     delta_writer->close();
 
     // Check TxnLog: there should only one segment file
-    ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(tablet_id));
-    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(_txn_id));
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(txn_id));
     ASSERT_EQ(tablet_id, txnlog->tablet_id());
-    ASSERT_EQ(_txn_id, txnlog->txn_id());
+    ASSERT_EQ(txn_id, txnlog->txn_id());
     ASSERT_TRUE(txnlog->has_op_write());
     ASSERT_FALSE(txnlog->has_op_compaction());
     ASSERT_FALSE(txnlog->has_op_schema_change());
@@ -294,7 +484,7 @@ TEST_F(DeltaWriterTest, test_memory_limit_unreached) {
     ASSERT_GT(txnlog->op_write().rowset().data_size(), 0);
 }
 
-TEST_F(DeltaWriterTest, test_reached_memory_limit) {
+TEST_F(LakeDeltaWriterTest, test_reached_memory_limit) {
     // Prepare data for writing
     static const int kChunkSize = 128;
     auto chunk0 = generate_data(kChunkSize);
@@ -308,9 +498,16 @@ TEST_F(DeltaWriterTest, test_reached_memory_limit) {
     DeferOp defer([&]() { _mem_tracker->set_limit(-1); });
 
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer =
-            DeltaWriter::create(_tablet_manager.get(), tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
     ASSERT_OK(delta_writer->open());
 
     // Write tree times
@@ -324,10 +521,10 @@ TEST_F(DeltaWriterTest, test_reached_memory_limit) {
     delta_writer->close();
 
     // Check TxnLog: there should be three segment files
-    ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(tablet_id));
-    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(_txn_id));
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(txn_id));
     ASSERT_EQ(tablet_id, txnlog->tablet_id());
-    ASSERT_EQ(_txn_id, txnlog->txn_id());
+    ASSERT_EQ(txn_id, txnlog->txn_id());
     ASSERT_TRUE(txnlog->has_op_write());
     ASSERT_FALSE(txnlog->has_op_compaction());
     ASSERT_FALSE(txnlog->has_op_schema_change());
@@ -338,7 +535,7 @@ TEST_F(DeltaWriterTest, test_reached_memory_limit) {
     ASSERT_GT(txnlog->op_write().rowset().data_size(), 0);
 }
 
-TEST_F(DeltaWriterTest, test_reached_parent_memory_limit) {
+TEST_F(LakeDeltaWriterTest, test_reached_parent_memory_limit) {
     // Prepare data for writing
     static const int kChunkSize = 128;
     auto chunk0 = generate_data(kChunkSize);
@@ -348,17 +545,24 @@ TEST_F(DeltaWriterTest, test_reached_parent_memory_limit) {
     }
 
     // Change the memory limit to a very small value
-    _parent_mem_tracker->set_limit(1);
-    DeferOp defer([&]() { _parent_mem_tracker->set_limit(-1); });
+    _parent_tracker->set_limit(1);
+    DeferOp defer([&]() { _parent_tracker->set_limit(-1); });
 
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer =
-            DeltaWriter::create(_tablet_manager.get(), tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
     ASSERT_OK(delta_writer->open());
 
     // Write tree times
-    _parent_mem_tracker->consume(10);
+    _parent_tracker->consume(10);
     ASSERT_OK(delta_writer->write(chunk0, indexes.data(), indexes.size()));
     ASSERT_OK(delta_writer->write(chunk0, indexes.data(), indexes.size()));
     ASSERT_OK(delta_writer->write(chunk0, indexes.data(), indexes.size()));
@@ -368,10 +572,10 @@ TEST_F(DeltaWriterTest, test_reached_parent_memory_limit) {
     delta_writer->close();
 
     // Check TxnLog: there should be three segment files
-    ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(tablet_id));
-    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(_txn_id));
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(txn_id));
     ASSERT_EQ(tablet_id, txnlog->tablet_id());
-    ASSERT_EQ(_txn_id, txnlog->txn_id());
+    ASSERT_EQ(txn_id, txnlog->txn_id());
     ASSERT_TRUE(txnlog->has_op_write());
     ASSERT_FALSE(txnlog->has_op_compaction());
     ASSERT_FALSE(txnlog->has_op_schema_change());
@@ -382,7 +586,7 @@ TEST_F(DeltaWriterTest, test_reached_parent_memory_limit) {
     ASSERT_GT(txnlog->op_write().rowset().data_size(), 0);
 }
 
-TEST_F(DeltaWriterTest, test_memtable_full) {
+TEST_F(LakeDeltaWriterTest, test_memtable_full) {
     // Prepare data for writing
     static const int kChunkSize = 128;
     auto chunk0 = generate_data(kChunkSize);
@@ -397,12 +601,19 @@ TEST_F(DeltaWriterTest, test_memtable_full) {
     DeferOp defer([&]() { config::write_buffer_size = backup; });
 
     // Create and open DeltaWriter
+    auto txn_id = next_id();
     auto tablet_id = _tablet_metadata->id();
-    auto delta_writer =
-            DeltaWriter::create(_tablet_manager.get(), tablet_id, _txn_id, _partition_id, nullptr, _mem_tracker.get());
+    ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                               .set_tablet_manager(_tablet_mgr.get())
+                                               .set_tablet_id(tablet_id)
+                                               .set_txn_id(txn_id)
+                                               .set_partition_id(_partition_id)
+                                               .set_mem_tracker(_mem_tracker.get())
+                                               .set_index_id(_tablet_schema->id())
+                                               .build());
     ASSERT_OK(delta_writer->open());
 
-    // Write tree times
+    // Write three times
     ASSERT_OK(delta_writer->write(chunk0, indexes.data(), indexes.size()));
     ASSERT_OK(delta_writer->write(chunk0, indexes.data(), indexes.size()));
     ASSERT_OK(delta_writer->write(chunk0, indexes.data(), indexes.size()));
@@ -412,10 +623,10 @@ TEST_F(DeltaWriterTest, test_memtable_full) {
     delta_writer->close();
 
     // Check TxnLog: there should be three segment files
-    ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(tablet_id));
-    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(_txn_id));
+    ASSIGN_OR_ABORT(auto tablet, _tablet_mgr->get_tablet(tablet_id));
+    ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(txn_id));
     ASSERT_EQ(tablet_id, txnlog->tablet_id());
-    ASSERT_EQ(_txn_id, txnlog->txn_id());
+    ASSERT_EQ(txn_id, txnlog->txn_id());
     ASSERT_TRUE(txnlog->has_op_write());
     ASSERT_FALSE(txnlog->has_op_compaction());
     ASSERT_FALSE(txnlog->has_op_schema_change());

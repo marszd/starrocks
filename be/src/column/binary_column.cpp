@@ -171,11 +171,17 @@ void append_fixed_length(const Buffer<Slice>& strs, Bytes* bytes, typename Binar
 
     size_t offset = bytes->size();
     bytes->resize(size + copy_length);
-    for (const auto& s : strs) {
-        strings::memcpy_inlined(&(*bytes)[offset], s.data, copy_length);
-        offset += s.size;
-        offsets->emplace_back(offset);
+
+    size_t rows = strs.size();
+    size_t length = offsets->size();
+    raw::stl_vector_resize_uninitialized(offsets, offsets->size() + rows);
+
+    for (size_t i = 0; i < rows; ++i) {
+        memcpy(&(*bytes)[offset], strs[i].get_data(), copy_length);
+        offset += strs[i].get_size();
+        (*offsets)[length++] = offset;
     }
+
     bytes->resize(offset);
 }
 
@@ -284,6 +290,10 @@ void BinaryColumnBase<T>::append_value_multiple_times(const void* value, size_t 
 
 template <typename T>
 void BinaryColumnBase<T>::_build_slices() const {
+    if constexpr (std::is_same_v<T, uint32_t>) {
+        CHECK_LT(_bytes.size(), (size_t)UINT32_MAX) << "BinaryColumn size overflow";
+    }
+
     DCHECK(_offsets.size() > 0);
     _slices_cache = false;
     _slices.clear();
@@ -315,7 +325,7 @@ void BinaryColumnBase<T>::fill_default(const Filter& filter) {
 }
 
 template <typename T>
-Status BinaryColumnBase<T>::update_rows(const Column& src, const uint32_t* indexes) {
+void BinaryColumnBase<T>::update_rows(const Column& src, const uint32_t* indexes) {
     const auto& src_column = down_cast<const BinaryColumnBase<T>&>(src);
     size_t replace_num = src.size();
     bool need_resize = false;
@@ -353,8 +363,6 @@ Status BinaryColumnBase<T>::update_rows(const Column& src, const uint32_t* index
         }
         swap_column(*new_binary_column);
     }
-
-    return Status::OK();
 }
 
 template <typename T>
@@ -639,6 +647,15 @@ std::string BinaryColumnBase<T>::debug_item(size_t idx) const {
     return s;
 }
 
+template <typename T>
+std::string BinaryColumnBase<T>::raw_item_value(size_t idx) const {
+    std::string s;
+    auto slice = get_slice(idx);
+    s.reserve(slice.size);
+    s.append(slice.data, slice.size);
+    return s;
+}
+
 size_t find_first_overflow_point(const BinaryColumnBase<uint32_t>::Offsets& offsets, size_t start, size_t end) {
     for (size_t i = start; i < end; i++) {
         if (offsets[i] > offsets[i + 1]) {
@@ -673,6 +690,10 @@ StatusOr<ColumnPtr> BinaryColumnBase<T>::upgrade_if_overflow() {
                 base += Column::MAX_CAPACITY_LIMIT;
                 start = mid;
             }
+
+            // NOTE(yanz): in BinaryColumnBase, we have an invariant that `_offsets.back == _bytes.size()`;  
+            // and since _bytes has been moved to new_column, we have to clear _offset to keep the invariant.
+            _offsets.clear();
             return new_column;
         } else {
             return nullptr;

@@ -37,7 +37,6 @@ package com.starrocks.http.rest;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.starrocks.alter.SystemHandler;
-import com.starrocks.analysis.UserIdentity;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.Pair;
@@ -45,10 +44,11 @@ import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
 import com.starrocks.http.IllegalArgException;
-import com.starrocks.mysql.privilege.PrivPredicate;
+import com.starrocks.privilege.AccessDeniedException;
 import com.starrocks.privilege.PrivilegeType;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.system.SystemInfoService;
 import io.netty.handler.codec.http.HttpMethod;
 
@@ -74,13 +74,9 @@ public class CheckDecommissionAction extends RestBaseAction {
 
     @Override
     public void executeWithoutPassword(BaseRequest request, BaseResponse response)
-            throws DdlException {
+            throws DdlException, AccessDeniedException {
         UserIdentity currentUser = ConnectContext.get().getCurrentUserIdentity();
-        if (GlobalStateMgr.getCurrentState().isUsingNewPrivilege()) {
-            checkActionOnSystem(currentUser, PrivilegeType.OPERATE);
-        } else {
-            checkGlobalAuth(currentUser, PrivPredicate.OPERATOR);
-        }
+        Authorizer.checkSystemAction(currentUser, null, PrivilegeType.OPERATE);
 
         String hostPorts = request.getSingleParameter(HOST_PORTS);
         if (Strings.isNullOrEmpty(hostPorts)) {
@@ -96,7 +92,7 @@ public class CheckDecommissionAction extends RestBaseAction {
         for (String hostPort : hostPortArr) {
             Pair<String, Integer> pair;
             try {
-                pair = SystemInfoService.validateHostAndPort(hostPort);
+                pair = SystemInfoService.validateHostAndPort(hostPort, false);
             } catch (AnalysisException e) {
                 throw new DdlException(e.getMessage());
             }

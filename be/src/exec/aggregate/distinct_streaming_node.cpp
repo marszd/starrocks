@@ -84,7 +84,6 @@ Status DistinctStreamingNode::get_next(RuntimeState* state, ChunkPtr* chunk, boo
 
                 COUNTER_SET(_aggregator->hash_table_size(), (int64_t)_aggregator->hash_set_variant().size());
 
-                _mem_tracker->set(_aggregator->hash_set_variant().reserved_memory_usage(_aggregator->mem_pool()));
                 _aggregator->try_convert_to_two_level_set();
 
                 TRY_CATCH_ALLOC_SCOPE_END()
@@ -107,7 +106,6 @@ Status DistinctStreamingNode::get_next(RuntimeState* state, ChunkPtr* chunk, boo
                     _aggregator->build_hash_set(input_chunk_size);
 
                     COUNTER_SET(_aggregator->hash_table_size(), (int64_t)_aggregator->hash_set_variant().size());
-                    _mem_tracker->set(_aggregator->hash_set_variant().reserved_memory_usage(_aggregator->mem_pool()));
 
                     _aggregator->try_convert_to_two_level_set();
                     TRY_CATCH_ALLOC_SCOPE_END()
@@ -179,7 +177,7 @@ pipeline::OpFactories DistinctStreamingNode::decompose_to_pipeline(pipeline::Pip
 
     OpFactories ops_with_sink = _children[0]->decompose_to_pipeline(context);
 
-    auto should_cache = context->should_interpolate_cache_operator(ops_with_sink[0], id());
+    auto should_cache = context->should_interpolate_cache_operator(id(), ops_with_sink[0]);
     auto* upstream_source_op = context->source_operator(ops_with_sink);
     auto operators_generator = [this, should_cache, upstream_source_op, context](bool post_cache) {
         // shared by sink operator factory and source operator factory
@@ -208,7 +206,8 @@ pipeline::OpFactories DistinctStreamingNode::decompose_to_pipeline(pipeline::Pip
     ops_with_source.push_back(std::move(agg_source_op));
 
     if (should_cache) {
-        ops_with_source = context->interpolate_cache_operator(ops_with_sink, ops_with_source, operators_generator);
+        ops_with_source =
+                context->interpolate_cache_operator(id(), ops_with_sink, ops_with_source, operators_generator);
     }
     context->add_pipeline(ops_with_sink);
     if (limit() != -1) {

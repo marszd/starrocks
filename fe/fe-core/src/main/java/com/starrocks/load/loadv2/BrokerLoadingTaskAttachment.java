@@ -42,18 +42,24 @@ import java.util.Map;
 
 public class BrokerLoadingTaskAttachment extends TaskAttachment {
 
-    private Map<String, String> counters;
-    private String trackingUrl;
-    private List<TabletCommitInfo> commitInfoList;
-    private List<TabletFailInfo> failInfoList;
+    private final Map<String, String> counters;
+    private final String trackingUrl;
+    private final List<TabletCommitInfo> commitInfoList;
+    private final List<TabletFailInfo> failInfoList;
+    private final List<String> rejectedRecordPaths;
+    private final long writeDurationMs;
 
     public BrokerLoadingTaskAttachment(long taskId, Map<String, String> counters, String trackingUrl,
-                                       List<TabletCommitInfo> commitInfoList, List<TabletFailInfo> failInfoList) {
+                                       List<TabletCommitInfo> commitInfoList, List<TabletFailInfo> failInfoList,
+                                       List<String> rejectedRecordPaths,
+                                       long writeDurationMs) {
         super(taskId);
         this.trackingUrl = trackingUrl;
         this.counters = counters;
         this.commitInfoList = commitInfoList;
         this.failInfoList = failInfoList;
+        this.rejectedRecordPaths = rejectedRecordPaths;
+        this.writeDurationMs = writeDurationMs;
     }
 
     public String getCounter(String key) {
@@ -74,5 +80,13 @@ public class BrokerLoadingTaskAttachment extends TaskAttachment {
 
     public List<TabletFailInfo> getFailInfoList() {
         return failInfoList;
+    }
+
+    public List<String> getRejectedRecordPaths() {
+        return rejectedRecordPaths;
+    }
+
+    public long getWriteDurationMs() {
+        return writeDurationMs;
     }
 }

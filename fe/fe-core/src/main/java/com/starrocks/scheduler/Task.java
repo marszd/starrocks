@@ -16,7 +16,7 @@
 package com.starrocks.scheduler;
 
 import com.google.gson.annotations.SerializedName;
-import com.starrocks.authentication.AuthenticationManager;
+import com.starrocks.authentication.AuthenticationMgr;
 import com.starrocks.cluster.ClusterNamespace;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
@@ -56,6 +56,9 @@ public class Task implements Writable {
     @SerializedName("definition")
     private String definition;
 
+    @SerializedName("postRun")
+    private String postRun;
+
     @SerializedName("properties")
     private Map<String, String> properties;
 
@@ -67,7 +70,9 @@ public class Task implements Writable {
 
     // set default to ROOT is for compatibility
     @SerializedName("createUser")
-    private String createUser = AuthenticationManager.ROOT_USER;
+    private String createUser = AuthenticationMgr.ROOT_USER;
+
+    public Task() {}
 
     public Task(String name) {
         this.name = name;
@@ -175,6 +180,14 @@ public class Task implements Writable {
         this.createUser = createUser;
     }
 
+    public String getPostRun() {
+        return postRun;
+    }
+
+    public void setPostRun(String postRun) {
+        this.postRun = postRun;
+    }
+
     public static Task read(DataInput in) throws IOException {
         String json = Text.readString(in);
         return GsonUtils.GSON.fromJson(json, Task.class);
@@ -186,4 +199,22 @@ public class Task implements Writable {
         Text.writeString(out, json);
     }
 
+    @Override
+    public String toString() {
+        return "Task{" +
+                "id=" + id +
+                ", name='" + name + '\'' +
+                ", type=" + type +
+                ", state=" + state +
+                ", schedule=" + schedule +
+                ", createTime=" + createTime +
+                ", dbName='" + dbName + '\'' +
+                ", definition='" + definition + '\'' +
+                ", postRun='" + postRun + '\'' +
+                ", properties=" + properties +
+                ", expireTime=" + expireTime +
+                ", source=" + source +
+                ", createUser='" + createUser + '\'' +
+                '}';
+    }
 }

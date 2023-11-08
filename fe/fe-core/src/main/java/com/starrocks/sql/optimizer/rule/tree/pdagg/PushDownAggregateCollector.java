@@ -46,8 +46,8 @@ import com.starrocks.sql.optimizer.statistics.StatisticsCalculator;
 import com.starrocks.sql.optimizer.statistics.StatisticsEstimateCoefficient;
 import com.starrocks.sql.optimizer.task.TaskContext;
 import org.apache.commons.collections4.CollectionUtils;
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.HashSet;
 import java.util.List;
@@ -541,7 +541,7 @@ class PushDownAggregateCollector extends OptExpressionVisitor<Void, AggregatePus
                 return true;
             }
             return statistics.getOutputRowCount() >=
-                    StatisticsEstimateCoefficient.DEFAULT_PUSH_DOWN_AGGREGATE_ROWS_LIMIT;
+                    StatisticsEstimateCoefficient.SMALL_SCALE_ROWS_LIMIT;
         }
 
         return false;

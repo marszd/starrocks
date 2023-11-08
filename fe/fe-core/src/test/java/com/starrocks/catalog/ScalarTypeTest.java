@@ -26,16 +26,14 @@ import java.util.List;
 
 public class ScalarTypeTest {
 
-    @Test(expected = AnalysisException.class)
+    @Test
     public void createUnifiedDecimalTypeWithoutPrecisionAndScale() throws AnalysisException {
         ScalarType.createUnifiedDecimalType();
-        Assert.fail("should throw an exception");
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test
     public void testCreateUnifiedDecimalTypeWithoutScale() throws AnalysisException {
         ScalarType.createUnifiedDecimalType(18);
-        Assert.fail("should throw an exception");
     }
 
     @Test
@@ -186,43 +184,41 @@ public class ScalarTypeTest {
         // integer to integer
         for (int i = 0; i < integerTypes.size(); i++) {
             for (int j = 0; j < integerTypes.size(); j++) {
-                Assert.assertEquals(
-                        ScalarType.isFullyCompatible(integerTypes.get(i), integerTypes.get(j)), i <= j);
+                Assert.assertEquals(i <= j, integerTypes.get(i).isFullyCompatible(integerTypes.get(j)));
             }
         }
         // integer to string
         for (int i = 0; i < integerTypes.size(); i++) {
             for (int j = 0; j < stringTypes.size(); j++) {
-                Assert.assertTrue(ScalarType.isFullyCompatible(integerTypes.get(i), stringTypes.get(j)));
+                Assert.assertTrue(integerTypes.get(i).isFullyCompatible(stringTypes.get(j)));
             }
         }
         // decimal to decimal
         for (int i = 0; i < decimalTypes.size(); i++) {
             for (int j = 0; j < decimalTypes.size(); j++) {
-                Assert.assertEquals(
-                        ScalarType.isFullyCompatible(decimalTypes.get(i), decimalTypes.get(j)), i <= j);
+                Assert.assertEquals(i <= j, decimalTypes.get(i).isFullyCompatible(decimalTypes.get(j)));
             }
         }
         // decimal to float
         for (int i = 0; i < decimalTypes.size(); i++) {
-            Assert.assertTrue(ScalarType.isFullyCompatible(decimalTypes.get(i), ScalarType.FLOAT));
-            Assert.assertTrue(ScalarType.isFullyCompatible(decimalTypes.get(i), ScalarType.DOUBLE));
+            Assert.assertTrue(decimalTypes.get(i).isFullyCompatible(ScalarType.FLOAT));
+            Assert.assertTrue(decimalTypes.get(i).isFullyCompatible(ScalarType.DOUBLE));
         }
         // decimal to string
         for (int i = 0; i < decimalTypes.size(); i++) {
             for (int j = 0; j < stringTypes.size(); j++) {
-                Assert.assertTrue(ScalarType.isFullyCompatible(decimalTypes.get(i), stringTypes.get(j)));
+                Assert.assertTrue(decimalTypes.get(i).isFullyCompatible(stringTypes.get(j)));
             }
         }
         // string to string
         for (int i = 0; i < stringTypes.size(); i++) {
             for (int j = 0; j < stringTypes.size(); j++) {
-                Assert.assertTrue(ScalarType.isFullyCompatible(stringTypes.get(i), stringTypes.get(j)));
+                Assert.assertTrue(stringTypes.get(i).isFullyCompatible(stringTypes.get(j)));
             }
         }
 
         // complex types
-        Assert.assertFalse(ScalarType.isFullyCompatible(ScalarType.JSON, ScalarType.INT));
-        Assert.assertFalse(ScalarType.isFullyCompatible(ScalarType.JSON, ScalarType.VARCHAR));
+        Assert.assertFalse(ScalarType.JSON.isFullyCompatible(ScalarType.INT));
+        Assert.assertFalse(ScalarType.JSON.isFullyCompatible(ScalarType.VARCHAR));
     }
 }

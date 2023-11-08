@@ -17,24 +17,34 @@ package com.starrocks.sql.ast;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.Predicate;
 import com.starrocks.analysis.RedirectStatus;
+import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.MetaNotFoundException;
-import com.starrocks.privilege.PrivilegeManager;
+import com.starrocks.privilege.AccessDeniedException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ShowResultSetMetaData;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.statistic.BasicStatsMeta;
+import com.starrocks.statistic.ExternalBasicStatsMeta;
 import com.starrocks.statistic.StatisticUtils;
 
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 public class ShowBasicStatsMetaStmt extends ShowStmt {
+
     public ShowBasicStatsMetaStmt(Predicate predicate) {
-        setPredicate(predicate);
+        this(predicate, NodePosition.ZERO);
+    }
+
+    public ShowBasicStatsMetaStmt(Predicate predicate, NodePosition pos) {
+        super(pos);
+        this.predicate = predicate;
     }
 
     private static final ShowResultSetMetaData META_DATA =
@@ -67,8 +77,10 @@ public class ShowBasicStatsMetaStmt extends ShowStmt {
         row.set(1, table.getName());
 
         // In new privilege framework(RBAC), user needs any action on the table to show analysis status for it.
-        if (context.getGlobalStateMgr().isUsingNewPrivilege() &&
-                !PrivilegeManager.checkAnyActionOnTable(context, db.getOriginName(), table.getName())) {
+        try {
+            Authorizer.checkAnyActionOnTableLikeObject(context.getCurrentUserIdentity(),
+                    context.getCurrentRoleIds(), db.getFullName(), table);
+        } catch (AccessDeniedException e) {
             return null;
         }
 
@@ -81,6 +93,46 @@ public class ShowBasicStatsMetaStmt extends ShowStmt {
         row.set(4, basicStatsMeta.getUpdateTime().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
         row.set(5, basicStatsMeta.getProperties() == null ? "{}" : basicStatsMeta.getProperties().toString());
         row.set(6, (int) (basicStatsMeta.getHealthy() * 100) + "%");
+
+        return row;
+    }
+
+    public static List<String> showExternalBasicStatsMeta(ConnectContext context,
+                                                          ExternalBasicStatsMeta basicStatsMeta) throws MetaNotFoundException {
+        List<String> row = Lists.newArrayList("", "", "ALL", "", "", "", "");
+        String catalogName = basicStatsMeta.getCatalogName();
+        String dbName = basicStatsMeta.getDbName();
+        String tableName = basicStatsMeta.getTableName();
+
+        List<String> columns = basicStatsMeta.getColumns();
+
+        Database db = GlobalStateMgr.getCurrentState().getMetadataMgr().getDb(catalogName, dbName);
+        if (db == null) {
+            throw new MetaNotFoundException("No found database: " + catalogName + "." + dbName);
+        }
+        row.set(0, catalogName + "." + dbName);
+        Table table = GlobalStateMgr.getCurrentState().getMetadataMgr().getTable(catalogName, dbName, tableName);
+        if (table == null) {
+            throw new MetaNotFoundException("No found table: " + catalogName + "." + dbName + "." + tableName);
+        }
+        row.set(1, tableName);
+
+        // In new privilege framework(RBAC), user needs any action on the table to show analysis status for it.
+        try {
+            Authorizer.checkAnyActionOnTable(context.getCurrentUserIdentity(),
+                    context.getCurrentRoleIds(), new TableName(catalogName, db.getOriginName(), table.getName()));
+        } catch (AccessDeniedException e) {
+            return null;
+        }
+
+        long totalCollectColumnsSize = StatisticUtils.getCollectibleColumns(table).size();
+        if (null != columns && !columns.isEmpty() && (columns.size() != totalCollectColumnsSize)) {
+            row.set(2, String.join(",", columns));
+        }
+
+        row.set(3, basicStatsMeta.getType().name());
+        row.set(4, basicStatsMeta.getUpdateTime().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+        row.set(5, basicStatsMeta.getProperties() == null ? "{}" : basicStatsMeta.getProperties().toString());
 
         return row;
     }

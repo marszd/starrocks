@@ -17,13 +17,13 @@ package com.starrocks.sql.ast;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import com.starrocks.analysis.ColumnDef;
 import com.starrocks.analysis.IndexDef;
 import com.starrocks.analysis.KeysDesc;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Index;
 import com.starrocks.sql.common.EngineType;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.io.DataInput;
 import java.io.IOException;
@@ -115,6 +115,26 @@ public class CreateTableStmt extends DdlStmt {
                            Map<String, String> properties,
                            Map<String, String> extProperties,
                            String comment, List<AlterClause> rollupAlterClauseList, List<String> sortKeys) {
+        this(ifNotExists, isExternal, tableName, columnDefinitions, indexDefs, engineName, charsetName, keysDesc,
+                partitionDesc, distributionDesc, properties, extProperties, comment, rollupAlterClauseList,
+                sortKeys, NodePosition.ZERO);
+    }
+
+    public CreateTableStmt(boolean ifNotExists,
+                           boolean isExternal,
+                           TableName tableName,
+                           List<ColumnDef> columnDefinitions,
+                           List<IndexDef> indexDefs,
+                           String engineName,
+                           String charsetName,
+                           KeysDesc keysDesc,
+                           PartitionDesc partitionDesc,
+                           DistributionDesc distributionDesc,
+                           Map<String, String> properties,
+                           Map<String, String> extProperties,
+                           String comment, List<AlterClause> rollupAlterClauseList, List<String> sortKeys,
+                           NodePosition pos) {
+        super(pos);
         this.tableName = tableName;
         if (columnDefinitions == null) {
             this.columnDefs = Lists.newArrayList();
@@ -156,6 +176,10 @@ public class CreateTableStmt extends DdlStmt {
 
     public TableName getDbTbl() {
         return tableName;
+    }
+
+    public String getCatalogName() {
+        return tableName.getCatalog();
     }
 
     public String getTableName() {
@@ -200,14 +224,6 @@ public class CreateTableStmt extends DdlStmt {
 
     public boolean isOlapEngine() {
         return engineName.equalsIgnoreCase(EngineType.OLAP.name());
-    }
-
-    public boolean isLakeEngine() {
-        return engineName.equalsIgnoreCase(EngineType.STARROCKS.name());
-    }
-
-    public boolean isOlapOrLakeEngine() {
-        return isOlapEngine() || isLakeEngine();
     }
 
     public String getCharsetName() {
@@ -262,8 +278,20 @@ public class CreateTableStmt extends DdlStmt {
         this.properties = properties;
     }
 
+    public void updateProperties(Map<String, String> properties) {
+        if (this.properties == null) {
+            this.properties = properties;
+        } else {
+            this.properties.putAll(properties);
+        }
+    }
+
     public void setDistributionDesc(DistributionDesc distributionDesc) {
         this.distributionDesc = distributionDesc;
+    }
+
+    public void setPartitionDesc(PartitionDesc partitionDesc) {
+        this.partitionDesc = partitionDesc;
     }
 
     public static CreateTableStmt read(DataInput in) throws IOException {
@@ -272,7 +300,7 @@ public class CreateTableStmt extends DdlStmt {
 
     @Override
     public boolean needAuditEncryption() {
-        return !isOlapOrLakeEngine();
+        return !Strings.isNullOrEmpty(engineName) && !isOlapEngine();
     }
 
     @Override

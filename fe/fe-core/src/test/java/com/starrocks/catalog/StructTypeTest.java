@@ -30,7 +30,7 @@ public class StructTypeTest {
     @Test
     public void testUnnamedStruct() {
         StructType type = new StructType(Lists.newArrayList(Type.INT, Type.DATETIME));
-        Assert.assertEquals("STRUCT<int(11), datetime>", type.toSql());
+        Assert.assertEquals("struct<col1 int(11), col2 datetime>", type.toSql());
     }
 
     @Test
@@ -71,7 +71,7 @@ public class StructTypeTest {
         // "struct<struct_test:int,c1:struct<c1:int,cc1:string>>"
         StructType c1 = new StructType(Lists.newArrayList(
                 new StructField("c1", ScalarType.createType(PrimitiveType.INT)),
-                new StructField("cc1", ScalarType.createDefaultExternalTableString())
+                new StructField("cc1", ScalarType.createDefaultCatalogString())
         ));
         StructType root = new StructType(Lists.newArrayList(
                 new StructField("struct_test", ScalarType.createType(PrimitiveType.INT)),
@@ -99,7 +99,7 @@ public class StructTypeTest {
                 new StructField("st", ScalarType.createType(PrimitiveType.INT)),
                 new StructField("cc", c1)
         ));
-        Assert.assertTrue(root.matchesType(diffName));
+        Assert.assertFalse(root.matchesType(diffName));
 
         // Different field type
         StructType diffType = new StructType(Lists.newArrayList(
@@ -111,7 +111,7 @@ public class StructTypeTest {
         // matched
         StructType mc1 = new StructType(Lists.newArrayList(
                 new StructField("c1", ScalarType.createType(PrimitiveType.INT)),
-                new StructField("cc1", ScalarType.createDefaultExternalTableString())
+                new StructField("cc1", ScalarType.createDefaultCatalogString())
         ));
         StructType matched = new StructType(Lists.newArrayList(
                 new StructField("struct_test", ScalarType.createType(PrimitiveType.INT)),
@@ -121,7 +121,7 @@ public class StructTypeTest {
 
         // Won't match with different subfield order
         StructType mc2 = new StructType(Lists.newArrayList(
-                new StructField("cc1", ScalarType.createDefaultExternalTableString()),
+                new StructField("cc1", ScalarType.createDefaultCatalogString()),
                 new StructField("c1", ScalarType.createType(PrimitiveType.INT))
         ));
         StructType matchedDiffOrder = new StructType(Lists.newArrayList(

@@ -18,11 +18,13 @@ package com.starrocks.sql.optimizer;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Type;
+import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
 import com.starrocks.qe.ConnectContext;
@@ -74,8 +76,7 @@ public class UtilsTest {
             + "DISTRIBUTED BY HASH(`table_id`, `column_name`, `db_id`) BUCKETS 2\n"
             + "PROPERTIES (\n"
             + "\"replication_num\" = \"1\",\n"
-            + "\"in_memory\" = \"false\",\n"
-            + "\"storage_format\" = \"V2\"\n"
+            + "\"in_memory\" = \"false\"\n"
             + ");";
 
     private static ConnectContext connectContext;
@@ -89,7 +90,7 @@ public class UtilsTest {
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-        FeConstants.default_scheduler_interval_millisecond = 1;
+        Config.alter_scheduler_interval_millisecond = 1;
         UtFrameUtils.createMinStarRocksCluster();
 
         // create connect context
@@ -111,8 +112,7 @@ public class UtilsTest {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `t1` (\n" +
@@ -124,8 +124,7 @@ public class UtilsTest {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         CreateDbStmt dbStmt = new CreateDbStmt(false, StatsConstants.STATISTICS_DB_NAME);
@@ -165,7 +164,7 @@ public class UtilsTest {
                 new CompoundPredicateOperator(CompoundPredicateOperator.CompoundType.AND,
                         ConstantOperator.createBoolean(false),
                         new CompoundPredicateOperator(CompoundPredicateOperator.CompoundType.AND,
-                                new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ,
+                                new BinaryPredicateOperator(BinaryType.EQ,
                                         new ColumnRefOperator(3, Type.INT, "hello", true),
                                         ConstantOperator.createInt(1)),
                                 new CompoundPredicateOperator(CompoundPredicateOperator.CompoundType.AND,
@@ -352,5 +351,29 @@ public class UtilsTest {
                                         new LogicalValuesOperator(Lists.newArrayList(), Lists.newArrayList())))));
 
         assertEquals(4, Utils.countJoinNodeSize(root, JoinOperator.semiAntiJoinSet()));
+    }
+
+    @Test
+    public void testComputeMaxLEPower2() {
+        Assert.assertEquals(0, Utils.computeMaxLEPower2(0));
+
+        for (int i = 1; i < 10000; i++) {
+            int out = Utils.computeMaxLEPower2(i);
+            // The number i belongs to the range [out, out*2).
+            Assert.assertTrue(out <= i);
+            Assert.assertTrue(out * 2 > i);
+        }
+    }
+
+    @Test
+    public void testComputeMinGEPower2() {
+        Assert.assertEquals(1, Utils.computeMinGEPower2(0));
+
+        for (int i = 1; i < 10000; i++) {
+            int out = Utils.computeMinGEPower2(i);
+            // The number i belongs to the range (out/2, out].
+            Assert.assertTrue(out >= i);
+            Assert.assertTrue(out / 2 < i);
+        }
     }
 }

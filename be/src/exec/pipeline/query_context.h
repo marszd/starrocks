@@ -22,6 +22,7 @@
 #include "exec/pipeline/fragment_context.h"
 #include "exec/pipeline/pipeline_fwd.h"
 #include "exec/pipeline/stream_epoch_manager.h"
+#include "exec/spill/query_spill_manager.h"
 #include "gen_cpp/InternalService_types.h" // for TQueryOptions
 #include "gen_cpp/Types_types.h"           // for TUniqueId
 #include "gen_cpp/internal_service.pb.h"
@@ -30,6 +31,7 @@
 #include "runtime/runtime_state.h"
 #include "util/debug/query_trace.h"
 #include "util/hash_util.hpp"
+#include "util/spinlock.h"
 #include "util/time.h"
 
 namespace starrocks {
@@ -51,6 +53,7 @@ public:
     void set_exec_env(ExecEnv* exec_env) { _exec_env = exec_env; }
     void set_query_id(const TUniqueId& query_id) { _query_id = query_id; }
     TUniqueId query_id() const { return _query_id; }
+    int64_t lifetime() { return _lifetime_sw.elapsed_time(); }
     void set_total_fragments(size_t total_fragments) { _total_fragments = total_fragments; }
 
     void increment_num_fragments() {
@@ -85,8 +88,23 @@ public:
         _query_deadline =
                 duration_cast<milliseconds>(steady_clock::now().time_since_epoch() + _query_expire_seconds).count();
     }
-    void set_report_profile() { _is_report_profile = true; }
-    bool is_report_profile() { return _is_report_profile; }
+    void set_enable_profile() { _enable_profile = true; }
+    bool enable_profile() {
+        if (_enable_profile) {
+            return true;
+        }
+        if (_big_query_profile_threshold_ns <= 0) {
+            return false;
+        }
+        return MonotonicNanos() - _query_begin_time > _big_query_profile_threshold_ns;
+    }
+    void set_big_query_profile_threshold(int64_t big_query_profile_threshold_s) {
+        _big_query_profile_threshold_ns = 1'000'000'000L * big_query_profile_threshold_s;
+    }
+    void set_runtime_profile_report_interval(int64_t runtime_profile_report_interval_s) {
+        _runtime_profile_report_interval_ns = 1'000'000'000L * runtime_profile_report_interval_s;
+    }
+    int64_t get_runtime_profile_report_interval_ns() { return _runtime_profile_report_interval_ns; }
     void set_profile_level(const TPipelineProfileLevel::type& profile_level) { _profile_level = profile_level; }
     const TPipelineProfileLevel::type& profile_level() { return _profile_level; }
 
@@ -111,10 +129,18 @@ public:
     int64_t compute_query_mem_limit(int64_t parent_mem_limit, int64_t per_instance_mem_limit, size_t pipeline_dop,
                                     int64_t option_query_mem_limit);
     size_t total_fragments() { return _total_fragments; }
-    void init_mem_tracker(int64_t bytes_limit, MemTracker* parent);
+    /// Initialize the mem_tracker of this query.
+    /// Positive `big_query_mem_limit` and non-null `wg` indicate
+    /// that there is a big query memory limit of this resource group.
+    void init_mem_tracker(int64_t query_mem_limit, MemTracker* parent, int64_t big_query_mem_limit = -1,
+                          workgroup::WorkGroup* wg = nullptr);
     std::shared_ptr<MemTracker> mem_tracker() { return _mem_tracker; }
 
-    Status init_query_once(workgroup::WorkGroup* wg);
+    Status init_query_once(workgroup::WorkGroup* wg, bool enable_group_level_query_queue);
+    /// Release the workgroup token only once to avoid double-free.
+    /// This method should only be invoked while the QueryContext is still valid,
+    /// to avoid double-free between the destruction and this method.
+    void release_workgroup_token_once();
 
     // Some statistic about the query, including cpu, scan_rows, scan_bytes
     int64_t mem_cost_bytes() const { return _mem_tracker->peak_consumption(); }
@@ -131,9 +157,14 @@ public:
         _total_scan_bytes += scan_bytes;
         _delta_scan_bytes += scan_bytes;
     }
+
+    void update_scan_stats(int64_t table_id, int64_t scan_rows_num, int64_t scan_bytes);
+
     int64_t cpu_cost() const { return _total_cpu_cost_ns; }
     int64_t cur_scan_rows_num() const { return _total_scan_rows_num; }
     int64_t get_scan_bytes() const { return _total_scan_bytes; }
+    std::atomic_int64_t* mutable_total_spill_bytes() { return &_total_spill_bytes; }
+    int64_t get_spill_bytes() { return _total_spill_bytes; }
 
     // Query start time, used to check how long the query has been running
     // To ensure that the minimum run time of the query will not be killed by the big query checking mechanism
@@ -153,13 +184,18 @@ public:
     // Merged statistic from all executor nodes
     std::shared_ptr<QueryStatistics> final_query_statistic();
     std::shared_ptr<QueryStatisticsRecvr> maintained_query_recv();
-    bool is_result_sink() const { return _is_result_sink; }
-    void set_result_sink(bool value) { _is_result_sink = value; }
+    bool is_final_sink() const { return _is_final_sink; }
+    void set_final_sink() { _is_final_sink = true; }
 
     QueryContextPtr get_shared_ptr() { return shared_from_this(); }
 
     // STREAM MV
     StreamEpochManager* stream_epoch_manager() const { return _stream_epoch_manager.get(); }
+
+    spill::QuerySpillManager* spill_manager() { return _spill_manager.get(); }
+
+    void mark_prepared() { _is_prepared = true; }
+    bool is_prepared() { return _is_prepared; }
 
 public:
     static constexpr int DEFAULT_EXPIRE_SECONDS = 300;
@@ -167,6 +203,7 @@ public:
 private:
     ExecEnv* _exec_env = nullptr;
     TUniqueId _query_id;
+    MonotonicStopWatch _lifetime_sw;
     std::unique_ptr<FragmentContextManager> _fragment_mgr;
     size_t _total_fragments;
     std::atomic<size_t> _num_fragments;
@@ -178,30 +215,51 @@ private:
     bool _is_runtime_filter_coordinator = false;
     std::once_flag _init_mem_tracker_once;
     std::shared_ptr<RuntimeProfile> _profile;
-    bool _is_report_profile = false;
+    bool _enable_profile = false;
+    int64_t _big_query_profile_threshold_ns = 0;
+    int64_t _runtime_profile_report_interval_ns = std::numeric_limits<int64_t>::max();
     TPipelineProfileLevel::type _profile_level;
     std::shared_ptr<MemTracker> _mem_tracker;
     ObjectPool _object_pool;
     DescriptorTbl* _desc_tbl = nullptr;
     std::once_flag _query_trace_init_flag;
     std::shared_ptr<starrocks::debug::QueryTrace> _query_trace;
+    std::atomic_bool _is_prepared = false;
 
     std::once_flag _init_query_once;
     int64_t _query_begin_time = 0;
     std::atomic<int64_t> _total_cpu_cost_ns = 0;
     std::atomic<int64_t> _total_scan_rows_num = 0;
     std::atomic<int64_t> _total_scan_bytes = 0;
+    std::atomic<int64_t> _total_spill_bytes = 0;
     std::atomic<int64_t> _delta_cpu_cost_ns = 0;
     std::atomic<int64_t> _delta_scan_rows_num = 0;
     std::atomic<int64_t> _delta_scan_bytes = 0;
-    bool _is_result_sink = false;
+
+    struct ScanStats {
+        std::atomic<int64_t> total_scan_rows_num = 0;
+        std::atomic<int64_t> total_scan_bytes = 0;
+        std::atomic<int64_t> delta_scan_rows_num = 0;
+        std::atomic<int64_t> delta_scan_bytes = 0;
+    };
+    // @TODO(silverbullet233):
+    // our phmap's version is too old and it doesn't provide a thread-safe iteration interface,
+    // we use spinlock + flat_hash_map here, after upgrading, we can change it to parallel_flat_hash_map
+    SpinLock _scan_stats_lock;
+    // table level scan stats
+    phmap::flat_hash_map<int64_t, std::shared_ptr<ScanStats>> _scan_stats;
+
+    bool _is_final_sink = false;
     std::shared_ptr<QueryStatisticsRecvr> _sub_plan_query_statistics_recvr; // For receive
 
     int64_t _scan_limit = 0;
     workgroup::RunningQueryTokenPtr _wg_running_query_token_ptr;
+    std::atomic<workgroup::RunningQueryToken*> _wg_running_query_token_atomic_ptr = nullptr;
 
     // STREAM MV
     std::shared_ptr<StreamEpochManager> _stream_epoch_manager;
+
+    std::unique_ptr<spill::QuerySpillManager> _spill_manager;
 };
 
 class QueryContextManager {
@@ -210,7 +268,7 @@ public:
     ~QueryContextManager();
     Status init();
     QueryContext* get_or_register(const TUniqueId& query_id);
-    QueryContextPtr get(const TUniqueId& query_id);
+    QueryContextPtr get(const TUniqueId& query_id, bool need_prepared = false);
     size_t size();
     bool remove(const TUniqueId& query_id);
     // used for graceful exit

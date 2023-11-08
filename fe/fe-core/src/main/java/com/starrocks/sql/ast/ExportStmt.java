@@ -35,6 +35,7 @@ import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -76,9 +77,21 @@ public class ExportStmt extends StatementBase {
     // may catalog.db.table
     private TableRef tableRef;
     private long exportStartTime;
+    private boolean sync;
 
     public ExportStmt(TableRef tableRef, List<String> columnNames, String path,
                       Map<String, String> properties, BrokerDesc brokerDesc) {
+        this(tableRef, columnNames, path, properties, brokerDesc, NodePosition.ZERO);
+    }
+
+    public ExportStmt(TableRef tableRef, List<String> columnNames, String path,
+                      Map<String, String> properties, BrokerDesc brokerDesc, NodePosition pos) {
+        this(tableRef, columnNames, path, properties, brokerDesc, pos, false);
+    }
+
+    public ExportStmt(TableRef tableRef, List<String> columnNames, String path,
+                      Map<String, String> properties, BrokerDesc brokerDesc, NodePosition pos, boolean sync) {
+        super(pos);
         this.tableRef = tableRef;
         this.columnNames = columnNames;
         this.path = path.trim();
@@ -89,6 +102,15 @@ public class ExportStmt extends StatementBase {
         this.columnSeparator = DEFAULT_COLUMN_SEPARATOR;
         this.rowDelimiter = DEFAULT_LINE_DELIMITER;
         this.includeQueryId = true;
+        this.sync = sync;
+    }
+
+    public boolean getSync() {
+        return sync;
+    }
+
+    public void setSync(boolean sync) {
+        this.sync = sync;
     }
 
     public long getExportStartTime() {
@@ -172,7 +194,7 @@ public class ExportStmt extends StatementBase {
             switch (tblType) {
                 case MYSQL:
                 case OLAP:
-                case LAKE:
+                case CLOUD_NATIVE:
                     break;
                 case BROKER:
                 case SCHEMA:

@@ -17,6 +17,7 @@ package com.starrocks.sql.optimizer.rule.transformation;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.optimizer.OptExpression;
@@ -77,7 +78,7 @@ public class ExistentialApply2OuterJoinRule extends TransformationRule {
     private List<OptExpression> transformCorrelation(OptExpression input, LogicalApplyOperator apply,
                                                      ExistsPredicateOperator epo, OptimizerContext context) {
         boolean hasEqPredicate = Utils.extractConjuncts(apply.getCorrelationConjuncts()).stream()
-                .anyMatch(d -> OperatorType.BINARY.equals(d.getOpType()) && BinaryPredicateOperator.BinaryType.EQ
+                .anyMatch(d -> OperatorType.BINARY.equals(d.getOpType()) && BinaryType.EQ
                         .equals(((BinaryPredicateOperator) d).getBinaryType()));
 
         if (hasEqPredicate) {
@@ -197,10 +198,10 @@ public class ExistentialApply2OuterJoinRule extends TransformationRule {
                 .mapToObj(context.getColumnRefFactory()::getColumnRef).forEach(d -> projectMap.put(d, d));
 
         if (isNotExists) {
-            projectMap.put(apply.getOutput(), new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, count,
+            projectMap.put(apply.getOutput(), new BinaryPredicateOperator(BinaryType.EQ, count,
                     ConstantOperator.createBigint(0)));
         } else {
-            projectMap.put(apply.getOutput(), new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.GT, count,
+            projectMap.put(apply.getOutput(), new BinaryPredicateOperator(BinaryType.GT, count,
                     ConstantOperator.createBigint(0)));
         }
         OptExpression projectExpression = OptExpression.create(new LogicalProjectOperator(projectMap), joinExpression);
@@ -256,9 +257,7 @@ public class ExistentialApply2OuterJoinRule extends TransformationRule {
         // extract join-key
         CorrelatedPredicateRewriter rewriter = new CorrelatedPredicateRewriter(
                 correlationColumnRefs, context);
-        ScalarOperator newPredicate = SubqueryUtils.rewritePredicateAndExtractColumnRefs(
-                Utils.compoundAnd(correlationPredicates), rewriter);
-
+        ScalarOperator newPredicate = rewriter.rewrite(Utils.compoundAnd(correlationPredicates));
         Map<ColumnRefOperator, ScalarOperator> innerRefMap = rewriter.getColumnRefToExprMap();
 
         // rootOptExpression
@@ -290,9 +289,7 @@ public class ExistentialApply2OuterJoinRule extends TransformationRule {
 
         // filter(UnCorrelation) agg -> project -> un-correlation filter
         if (null != apply.getPredicate()) {
-            OptExpression filterOptExpression =
-                    OptExpression.create(new LogicalFilterOperator(apply.getPredicate()), input.getInputs().get(1));
-
+            OptExpression filterOptExpression = OptExpression.create(new LogicalFilterOperator(apply.getPredicate()));
             rootOptExpression.getInputs().add(filterOptExpression);
             rootOptExpression = filterOptExpression;
         }

@@ -32,19 +32,22 @@ NLJoinProbeOperator::NLJoinProbeOperator(OperatorFactory* factory, int32_t id, i
                                          const std::vector<ExprContext*>& conjunct_ctxs,
                                          const std::vector<SlotDescriptor*>& col_types, size_t probe_column_count,
                                          const std::shared_ptr<NLJoinContext>& cross_join_context)
-        : OperatorWithDependency(factory, id, "nestloop_join_probe", plan_node_id, driver_sequence),
+        : OperatorWithDependency(factory, id, "nestloop_join_probe", plan_node_id, false, driver_sequence),
           _join_op(join_op),
           _col_types(col_types),
           _probe_column_count(probe_column_count),
           _sql_join_conjuncts(sql_join_conjuncts),
           _join_conjuncts(join_conjuncts),
           _conjunct_ctxs(conjunct_ctxs),
-          _cross_join_context(cross_join_context) {
-    _cross_join_context->ref();
-}
+          _cross_join_context(cross_join_context) {}
 
 Status NLJoinProbeOperator::prepare(RuntimeState* state) {
+    RETURN_IF_ERROR(Operator::prepare(state));
+
     _runtime_state = state;
+
+    _cross_join_context->incr_prober();
+
     _output_accumulator.set_desired_size(state->chunk_size());
 
     _unique_metrics->add_info_string("JoinType", to_string(_join_op));
@@ -54,11 +57,11 @@ Status NLJoinProbeOperator::prepare(RuntimeState* state) {
     if (_is_left_join() || _is_left_anti_join()) {
         _permute_left_rows_counter = ADD_COUNTER(_unique_metrics, "PermuteLeftJoinRows", TUnit::UNIT);
     }
-    return Operator::prepare(state);
+    return Status::OK();
 }
 
 void NLJoinProbeOperator::close(RuntimeState* state) {
-    _cross_join_context->unref(state);
+    _cross_join_context->decr_prober(state);
     Operator::close(state);
 }
 
@@ -155,8 +158,7 @@ Status NLJoinProbeOperator::set_finishing(RuntimeState* state) {
 }
 
 Status NLJoinProbeOperator::set_finished(RuntimeState* state) {
-    _cross_join_context->set_finished();
-    return Status::OK();
+    return _cross_join_context->finish_one_left_prober(state);
 }
 
 bool NLJoinProbeOperator::_is_left_join() const {
@@ -175,11 +177,23 @@ bool NLJoinProbeOperator::_is_left_anti_join() const {
     return _join_op == TJoinOp::LEFT_ANTI_JOIN;
 }
 
+bool NLJoinProbeOperator::_is_build_side_empty() const {
+    return _cross_join_context->is_build_chunk_empty();
+}
+
 int NLJoinProbeOperator::_num_build_chunks() const {
     return _cross_join_context->num_build_chunks();
 }
 
-Chunk* NLJoinProbeOperator::_move_build_chunk_index(int index) {
+void NLJoinProbeOperator::_reset_build_chunk_index() {
+    _move_build_chunk_index(0);
+}
+
+void NLJoinProbeOperator::_next_build_chunk_index() {
+    _move_build_chunk_index(_curr_build_chunk_index + 1);
+}
+
+void NLJoinProbeOperator::_move_build_chunk_index(int index) {
     DCHECK_GE(index, 0);
     DCHECK_LE(index, _num_build_chunks());
     if (_curr_build_chunk) {
@@ -192,7 +206,6 @@ Chunk* NLJoinProbeOperator::_move_build_chunk_index(int index) {
         _curr_build_chunk = nullptr;
     }
     _curr_build_chunk_index = index;
-    return _curr_build_chunk;
 }
 
 ChunkPtr NLJoinProbeOperator::_init_output_chunk(RuntimeState* state) const {
@@ -238,16 +251,16 @@ void NLJoinProbeOperator::iterate_enumerate_chunk(const ChunkPtr& chunk,
     }
 }
 
-Status NLJoinProbeOperator::_probe(RuntimeState* state, ChunkPtr chunk) {
+Status NLJoinProbeOperator::_probe(RuntimeState* state, const ChunkPtr& chunk) {
     FilterPtr filter;
 
     // directly return all probe chunk when it's left anti join and right input is empty
-    if (_is_left_anti_join() && _num_build_chunks() == 0) {
+    if (_is_left_anti_join() && _is_build_side_empty()) {
         _permute_left_join(state, chunk, 0, _probe_chunk->num_rows());
         return Status::OK();
     }
 
-    bool apply_filter = (!_is_left_semi_join() && !_is_left_anti_join()) || _num_build_chunks() == 0;
+    bool apply_filter = (!_is_left_semi_join() && !_is_left_anti_join()) || _is_build_side_empty();
     if (!_join_conjuncts.empty() && chunk && !chunk->is_empty()) {
         size_t rows = chunk->num_rows();
         RETURN_IF_ERROR(eval_conjuncts_and_in_filters(_join_conjuncts, chunk.get(), &filter, apply_filter));
@@ -262,7 +275,7 @@ Status NLJoinProbeOperator::_probe(RuntimeState* state, ChunkPtr chunk) {
         // If join conjuncts are empty, most join type do not need to filter data
         // Except left join and the right table is empty, in which it could not permute any chunk
         // So here we need to permute_left_join for this case
-        if (_num_build_chunks() == 0) {
+        if (_is_build_side_empty()) {
             // Empty right table
             DCHECK_EQ(_probe_row_current, _probe_chunk->num_rows());
             _permute_left_join(state, chunk, 0, _probe_chunk->num_rows());
@@ -371,7 +384,7 @@ ChunkPtr NLJoinProbeOperator::_permute_chunk(RuntimeState* state) {
         bool is_last_build_chunk = _curr_build_chunk_index == _num_build_chunks() - 1 && _num_build_chunks() > 1;
         if (!_probe_row_finished && is_last_build_chunk) {
             _permute_probe_row(state, chunk);
-            _move_build_chunk_index(0);
+            _reset_build_chunk_index();
             _probe_row_finished = true;
             probe_row_start();
             return chunk;
@@ -381,7 +394,7 @@ ChunkPtr NLJoinProbeOperator::_permute_chunk(RuntimeState* state) {
         // Otherwise accumulate more build chunks into a larger chunk
         while (!_probe_row_finished && _curr_build_chunk_index < _num_build_chunks()) {
             _permute_probe_row(state, chunk);
-            _move_build_chunk_index(_curr_build_chunk_index + 1);
+            _next_build_chunk_index();
             probe_row_start();
             if (chunk->num_rows() >= state->chunk_size()) {
                 return chunk;
@@ -391,7 +404,7 @@ ChunkPtr NLJoinProbeOperator::_permute_chunk(RuntimeState* state) {
         // Move to next probe row
         _probe_row_matched = false;
         _probe_row_finished = false;
-        _move_build_chunk_index(0);
+        _reset_build_chunk_index();
     }
     return chunk;
 }
@@ -541,7 +554,7 @@ Status NLJoinProbeOperator::push_chunk(RuntimeState* state, const ChunkPtr& chun
     _probe_row_current = 0;
     _probe_row_matched = false;
     _probe_row_finished = false;
-    _move_build_chunk_index(0);
+    _reset_build_chunk_index();
 
     return Status::OK();
 }
@@ -569,6 +582,9 @@ OperatorPtr NLJoinProbeOperatorFactory::create(int32_t degree_of_parallelism, in
 
 Status NLJoinProbeOperatorFactory::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(OperatorWithDependencyFactory::prepare(state));
+
+    // Unref is called in _cross_join_context->decr_prober, when call probe operators have called decr_prober.
+    _cross_join_context->ref();
 
     _init_row_desc();
     RETURN_IF_ERROR(Expr::prepare(_join_conjuncts, state));

@@ -18,12 +18,12 @@ package com.starrocks.privilege;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.ResourceGroup;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.common.MetaNotFoundException;
 
 import java.util.List;
 import java.util.Objects;
 
 public class ResourceGroupPEntryObject implements PEntryObject {
-    public static final long ALL_RESOURCE_GROUP_ID = -1; // -1 represent all
 
     @SerializedName(value = "i")
     private long id;
@@ -39,7 +39,7 @@ public class ResourceGroupPEntryObject implements PEntryObject {
         }
         String name = tokens.get(0);
         if (name.equals("*")) {
-            return new ResourceGroupPEntryObject(ALL_RESOURCE_GROUP_ID);
+            return new ResourceGroupPEntryObject(PrivilegeBuiltinConstants.ALL_RESOURCE_GROUP_ID);
         } else {
             ResourceGroup resourceGroup = mgr.getResourceGroupMgr().getResourceGroup(name);
             if (resourceGroup == null) {
@@ -66,7 +66,7 @@ public class ResourceGroupPEntryObject implements PEntryObject {
             return false;
         }
         ResourceGroupPEntryObject other = (ResourceGroupPEntryObject) obj;
-        if (other.id == ALL_RESOURCE_GROUP_ID) {
+        if (other.id == PrivilegeBuiltinConstants.ALL_RESOURCE_GROUP_ID) {
             return true;
         }
         return other.id == id;
@@ -74,7 +74,7 @@ public class ResourceGroupPEntryObject implements PEntryObject {
 
     @Override
     public boolean isFuzzyMatching() {
-        return ALL_RESOURCE_GROUP_ID == id;
+        return PrivilegeBuiltinConstants.ALL_RESOURCE_GROUP_ID == id;
     }
 
     @Override
@@ -111,5 +111,18 @@ public class ResourceGroupPEntryObject implements PEntryObject {
     @Override
     public int hashCode() {
         return Objects.hash(id);
+    }
+
+    @Override
+    public String toString() {
+        if (getId() == PrivilegeBuiltinConstants.ALL_RESOURCE_GROUP_ID) {
+            return "ALL RESOURCE GROUPS";
+        } else {
+            ResourceGroup resourceGroup = GlobalStateMgr.getCurrentState().getResourceGroupMgr().getResourceGroup(getId());
+            if (resourceGroup == null) {
+                throw new MetaNotFoundException("Can't find resource group : " + id);
+            }
+            return resourceGroup.getName();
+        }
     }
 }

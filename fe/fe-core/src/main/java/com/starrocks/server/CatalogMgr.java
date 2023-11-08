@@ -27,6 +27,7 @@ import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.Resource;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.proc.BaseProcResult;
 import com.starrocks.common.proc.DbsProcDir;
@@ -34,13 +35,26 @@ import com.starrocks.common.proc.ExternalDbsProcDir;
 import com.starrocks.common.proc.ProcDirInterface;
 import com.starrocks.common.proc.ProcNodeInterface;
 import com.starrocks.common.proc.ProcResult;
+import com.starrocks.connector.CatalogConnector;
 import com.starrocks.connector.ConnectorContext;
 import com.starrocks.connector.ConnectorMgr;
-import com.starrocks.connector.hive.HiveMetastoreApiConverter;
+import com.starrocks.connector.ConnectorTableId;
+import com.starrocks.connector.ConnectorType;
+import com.starrocks.persist.AlterCatalogLog;
 import com.starrocks.persist.DropCatalogLog;
 import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.persist.metablock.SRMetaBlockEOFException;
+import com.starrocks.persist.metablock.SRMetaBlockException;
+import com.starrocks.persist.metablock.SRMetaBlockID;
+import com.starrocks.persist.metablock.SRMetaBlockReader;
+import com.starrocks.persist.metablock.SRMetaBlockWriter;
+import com.starrocks.privilege.NativeAccessController;
+import com.starrocks.privilege.ranger.hive.RangerHiveAccessController;
+import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.ast.AlterCatalogStmt;
 import com.starrocks.sql.ast.CreateCatalogStmt;
 import com.starrocks.sql.ast.DropCatalogStmt;
+import com.starrocks.sql.ast.ModifyTablePropertiesClause;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -52,12 +66,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
 import static com.starrocks.catalog.ResourceMgr.NEED_MAPPING_CATALOG_RESOURCES;
-import static com.starrocks.connector.ConnectorMgr.SUPPORT_CONNECTOR_TYPE;
 import static com.starrocks.connector.hive.HiveConnector.HIVE_METASTORE_URIS;
 import static com.starrocks.server.CatalogMgr.ResourceMappingCatalog.getResourceMappingCatalogName;
 import static com.starrocks.server.CatalogMgr.ResourceMappingCatalog.isResourceMappingCatalog;
@@ -99,11 +113,22 @@ public class CatalogMgr {
         writeLock();
         try {
             Preconditions.checkState(!catalogs.containsKey(catalogName), "Catalog '%s' already exists", catalogName);
-            connectorMgr.createConnector(new ConnectorContext(catalogName, type, properties));
+            CatalogConnector connector = connectorMgr.createConnector(new ConnectorContext(catalogName, type, properties));
+            if (null == connector) {
+                LOG.error("connector create failed. catalog [{}] encounter unknown catalog type [{}]", catalogName, type);
+                throw new DdlException("connector create failed");
+            }
             long id = isResourceMappingCatalog(catalogName) ?
-                    HiveMetastoreApiConverter.CONNECTOR_ID_GENERATOR.getNextId().asInt() :
+                    ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asInt() :
                     GlobalStateMgr.getCurrentState().getNextId();
             Catalog catalog = new ExternalCatalog(id, catalogName, comment, properties);
+            String serviceName = properties.get("ranger.plugin.hive.service.name");
+            if (serviceName == null || serviceName.isEmpty()) {
+                Authorizer.getInstance().setAccessControl(catalogName, new NativeAccessController());
+            } else {
+                Authorizer.getInstance().setAccessControl(catalogName, new RangerHiveAccessController(serviceName));
+            }
+
             catalogs.put(catalogName, catalog);
 
             if (!isResourceMappingCatalog(catalogName)) {
@@ -126,10 +151,39 @@ public class CatalogMgr {
         writeLock();
         try {
             connectorMgr.removeConnector(catalogName);
+            Authorizer.getInstance().removeAccessControl(catalogName);
             catalogs.remove(catalogName);
             if (!isResourceMappingCatalog(catalogName)) {
                 DropCatalogLog dropCatalogLog = new DropCatalogLog(catalogName);
                 GlobalStateMgr.getCurrentState().getEditLog().logDropCatalog(dropCatalogLog);
+            }
+        } finally {
+            writeUnLock();
+        }
+    }
+
+    public void alterCatalog(AlterCatalogStmt stmt) {
+        String catalogName = stmt.getCatalogName();
+        writeLock();
+        try {
+            Catalog catalog = catalogs.get(catalogName);
+            if (catalog == null) {
+                return;
+            }
+
+            if (stmt.getAlterClause() instanceof ModifyTablePropertiesClause) {
+                Map<String, String> properties = ((ModifyTablePropertiesClause) stmt.getAlterClause()).getProperties();
+                String serviceName = properties.get("ranger.plugin.hive.service.name");
+                if (serviceName.isEmpty()) {
+                    Authorizer.getInstance().setAccessControl(catalogName, new NativeAccessController());
+                } else {
+                    Authorizer.getInstance().setAccessControl(catalogName, new RangerHiveAccessController(serviceName));
+                }
+
+                catalog.getConfig().put("ranger.plugin.hive.service.name", serviceName);
+
+                AlterCatalogLog alterCatalogLog = new AlterCatalogLog(catalogName, properties);
+                GlobalStateMgr.getCurrentState().getEditLog().logAlterCatalog(alterCatalogLog);
             }
         } finally {
             writeUnLock();
@@ -144,7 +198,17 @@ public class CatalogMgr {
 
         readLock();
         try {
-            return catalogs.containsKey(catalogName);
+            if (catalogs.containsKey(catalogName)) {
+                return true;
+            }
+
+            // TODO: Used for replay query dump which only supports `hive` catalog for now.
+            if (FeConstants.isReplayFromQueryDump &&
+                    catalogs.containsKey(getResourceMappingCatalogName(catalogName, "hive"))) {
+                return true;
+            }
+
+            return false;
         } finally {
             readUnlock();
         }
@@ -152,6 +216,14 @@ public class CatalogMgr {
 
     public static boolean isInternalCatalog(String name) {
         return name.equalsIgnoreCase(InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME);
+    }
+
+    public static boolean isInternalCatalog(long catalogId) {
+        return catalogId == InternalCatalog.DEFAULT_INTERNAL_CATALOG_ID;
+    }
+
+    public static boolean isExternalCatalog(String name) {
+        return !Strings.isNullOrEmpty(name) && !isInternalCatalog(name) && !isResourceMappingCatalog(name);
     }
 
     public void replayCreateCatalog(Catalog catalog) throws DdlException {
@@ -163,7 +235,7 @@ public class CatalogMgr {
         }
 
         // skip unsupport connector type
-        if (!SUPPORT_CONNECTOR_TYPE.contains(type)) {
+        if (!ConnectorType.isSupport(type)) {
             LOG.error("Replay catalog [{}] encounter unknown catalog type [{}], ignore it", catalogName, type);
             return;
         }
@@ -175,7 +247,20 @@ public class CatalogMgr {
             readUnlock();
         }
 
-        connectorMgr.createConnector(new ConnectorContext(catalogName, type, config));
+        CatalogConnector catalogConnector = connectorMgr.createConnector(new ConnectorContext(catalogName, type, config));
+        if (catalogConnector == null) {
+            LOG.error("connector create failed. catalog [{}] encounter unknown catalog type [{}]", catalogName, type);
+            throw new DdlException("connector create failed");
+        }
+
+        Map<String, String> properties = catalog.getConfig();
+        String serviceName = properties.get("ranger.plugin.hive.service.name");
+        if (serviceName == null || serviceName.isEmpty()) {
+            Authorizer.getInstance().setAccessControl(catalogName, new NativeAccessController());
+        } else {
+            Authorizer.getInstance().setAccessControl(catalogName, new RangerHiveAccessController(serviceName));
+        }
+
         writeLock();
         try {
             catalogs.put(catalogName, catalog);
@@ -205,6 +290,25 @@ public class CatalogMgr {
         }
     }
 
+    public void replayAlterCatalog(AlterCatalogLog log) {
+        writeLock();
+        try {
+            String catalogName = log.getCatalogName();
+            Map<String, String> properties = log.getProperties();
+            String serviceName = properties.get("ranger.plugin.hive.service.name");
+            if (serviceName.isEmpty()) {
+                Authorizer.getInstance().setAccessControl(catalogName, new NativeAccessController());
+            } else {
+                Authorizer.getInstance().setAccessControl(catalogName, new RangerHiveAccessController(serviceName));
+            }
+
+            Catalog catalog = catalogs.get(catalogName);
+            catalog.getConfig().put("ranger.plugin.hive.service.name", serviceName);
+        } finally {
+            writeUnLock();
+        }
+    }
+
     public long loadCatalogs(DataInputStream dis, long checksum) throws IOException, DdlException {
         int catalogCount = 0;
         try {
@@ -229,6 +333,8 @@ public class CatalogMgr {
     }
 
     public void loadResourceMappingCatalog() {
+        LOG.info("start to replay resource mapping catalog");
+
         List<Resource> resources = GlobalStateMgr.getCurrentState().getResourceMgr().getNeedMappingCatalogResources();
         for (Resource resource : resources) {
             Map<String, String> properties = Maps.newHashMap(resource.getProperties());
@@ -246,6 +352,7 @@ public class CatalogMgr {
                 LOG.error("Failed to load resource mapping inside catalog {}", catalogName, e);
             }
         }
+        LOG.info("finished replaying resource mapping catalogs from resources");
     }
 
     public long saveCatalogs(DataOutputStream dos, long checksum) throws IOException {
@@ -269,12 +376,24 @@ public class CatalogMgr {
         return procNode.fetchResult().getRows();
     }
 
+    public String getCatalogType(String catalogName) {
+        if (isInternalCatalog(catalogName)) {
+            return "internal";
+        } else {
+            return catalogs.get(catalogName).getType();
+        }
+    }
+
     public Catalog getCatalogByName(String name) {
         return catalogs.get(name);
     }
 
+    public Optional<Catalog> getCatalogById(long id) {
+        return catalogs.values().stream().filter(catalog -> catalog.getId() == id).findFirst();
+    }
+
     public Map<String, Catalog> getCatalogs() {
-        return catalogs;
+        return new HashMap<>(catalogs);
     }
 
     public boolean checkCatalogExistsById(long id) {
@@ -299,6 +418,15 @@ public class CatalogMgr {
 
     private void writeUnLock() {
         this.catalogLock.writeLock().unlock();
+    }
+
+    public long getCatalogCount() {
+        readLock();
+        try {
+            return catalogs.size();
+        } finally {
+            readUnlock();
+        }
     }
 
     public class CatalogProcNode implements ProcDirInterface {
@@ -353,6 +481,35 @@ public class CatalogMgr {
         public static String toResourceName(String catalogName, String type) {
             return isResourceMappingCatalog(catalogName) ?
                     catalogName.substring(RESOURCE_MAPPING_CATALOG_PREFIX.length() + type.length() + 1) : catalogName;
+        }
+    }
+
+    public void save(DataOutputStream dos) throws IOException, SRMetaBlockException {
+        Map<String, Catalog> serializedCatalogs = catalogs.entrySet().stream()
+                .filter(entry -> !isResourceMappingCatalog(entry.getKey()))
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+        int numJson = 1 + serializedCatalogs.size();
+        SRMetaBlockWriter writer = new SRMetaBlockWriter(dos, SRMetaBlockID.CATALOG_MGR, numJson);
+
+        writer.writeJson(serializedCatalogs.size());
+        for (Catalog catalog : serializedCatalogs.values()) {
+            writer.writeJson(catalog);
+        }
+
+        writer.close();
+    }
+
+    public void load(SRMetaBlockReader reader) throws IOException, SRMetaBlockException, SRMetaBlockEOFException {
+        try {
+            int serializedCatalogsSize = reader.readInt();
+            for (int i = 0; i < serializedCatalogsSize; ++i) {
+                Catalog catalog = reader.readJson(Catalog.class);
+                replayCreateCatalog(catalog);
+            }
+            loadResourceMappingCatalog();
+        } catch (DdlException e) {
+            throw new IOException(e);
         }
     }
 }

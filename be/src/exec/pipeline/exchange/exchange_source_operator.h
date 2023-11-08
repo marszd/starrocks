@@ -25,7 +25,7 @@ namespace pipeline {
 class ExchangeSourceOperator : public SourceOperator {
 public:
     ExchangeSourceOperator(OperatorFactory* factory, int32_t id, int32_t plan_node_id, int32_t driver_sequence)
-            : SourceOperator(factory, id, "exchange_source", plan_node_id, driver_sequence) {}
+            : SourceOperator(factory, id, "exchange_source", plan_node_id, false, driver_sequence) {}
 
     ~ExchangeSourceOperator() override = default;
 
@@ -65,9 +65,10 @@ public:
     bool could_local_shuffle() const override;
     TPartitionType::type partition_type() const override;
 
-    std::shared_ptr<DataStreamRecvr> create_stream_recvr(RuntimeState* state,
-                                                         const std::shared_ptr<RuntimeProfile>& profile);
+    std::shared_ptr<DataStreamRecvr> create_stream_recvr(RuntimeState* state);
     void close_stream_recvr();
+
+    SourceOperatorFactory::AdaptiveState adaptive_state() const override { return AdaptiveState::ACTIVE; }
 
 private:
     const TExchangeNode& _texchange_node;

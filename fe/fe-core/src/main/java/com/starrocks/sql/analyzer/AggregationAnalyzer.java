@@ -14,7 +14,6 @@
 
 package com.starrocks.sql.analyzer;
 
-import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.AnalyticExpr;
@@ -27,6 +26,7 @@ import com.starrocks.analysis.CastExpr;
 import com.starrocks.analysis.CloneExpr;
 import com.starrocks.analysis.CollectionElementExpr;
 import com.starrocks.analysis.CompoundPredicate;
+import com.starrocks.analysis.DictQueryExpr;
 import com.starrocks.analysis.ExistsPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
@@ -51,11 +51,12 @@ import com.starrocks.sql.ast.LambdaFunctionExpr;
 import com.starrocks.sql.ast.QueryStatement;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static com.starrocks.sql.common.ErrorMsgProxy.PARSER_ERROR_MSG;
 
 /**
  * AggregationAnalyzer is used to analyze aggregation
@@ -99,8 +100,7 @@ public class AggregationAnalyzer {
 
     private void analyze(Expr expression) {
         if (!new VerifyExpressionVisitor().visit(expression)) {
-            throw new SemanticException("'%s' must be an aggregate expression or appear in GROUP BY clause",
-                    expression.toSql());
+            throw new SemanticException(PARSER_ERROR_MSG.shouldBeAggFunc(expression.toSql()), expression.getPos());
         }
     }
 
@@ -118,7 +118,8 @@ public class AggregationAnalyzer {
 
         @Override
         public Boolean visitExpression(Expr node, Void context) {
-            throw new SemanticException("%s is not support in GROUP BY clause", node.toSql());
+            throw new SemanticException(PARSER_ERROR_MSG.unsupportedExprWithInfo(node.toSql(), "GROUP BY"),
+                    node.getPos());
         }
 
         private boolean isGroupingKey(Expr node) {
@@ -216,7 +217,9 @@ public class AggregationAnalyzer {
         public Boolean visitExistsPredicate(ExistsPredicate node, Void context) {
             List<Subquery> subqueries = Lists.newArrayList();
             node.collect(Subquery.class, subqueries);
-            Preconditions.checkState(subqueries.size() == 1, "Exist must have exact one subquery");
+            if (subqueries.size() != 1) {
+                throw new SemanticException(PARSER_ERROR_MSG.canOnlyOneExistSub(), node.getPos());
+            }
             return visit(subqueries.get(0));
         }
 
@@ -229,14 +232,14 @@ public class AggregationAnalyzer {
                             arg.getFn() instanceof AggregateFunction, aggFunc);
                     return !aggFunc.isEmpty();
                 })) {
-                    throw new SemanticException("Cannot nest aggregations inside aggregation '%s'", expr.toSql());
+                    throw new SemanticException(PARSER_ERROR_MSG.unsupportedNestAgg("aggregation function"), expr.getPos());
                 }
 
                 if (expr.getChildren().stream().anyMatch(childExpr -> {
                     childExpr.collectAll((Predicate<Expr>) arg -> arg instanceof AnalyticExpr, aggFunc);
                     return !aggFunc.isEmpty();
                 })) {
-                    throw new SemanticException("Cannot nest window function inside aggregation '%s'", expr.toSql());
+                    throw new SemanticException(PARSER_ERROR_MSG.unsupportedNestAgg("window function"), expr.getPos());
                 }
 
                 return true;
@@ -247,12 +250,13 @@ public class AggregationAnalyzer {
         @Override
         public Boolean visitGroupingFunctionCall(GroupingFunctionCallExpr node, Void context) {
             if (orderByScope != null) {
-                throw new SemanticException("Grouping operations are not allowed in order by");
+                throw new SemanticException(PARSER_ERROR_MSG.unsupportedExprWithInfo(node.toSql(), "ORDER BY"),
+                        node.getPos());
             }
 
             if (node.getChildren().stream().anyMatch(argument ->
                     !analyzeState.getColumnReferences().containsKey(argument) || !isGroupingKey(argument))) {
-                throw new SemanticException("The arguments to GROUPING must be expressions referenced by GROUP BY");
+                throw new SemanticException(PARSER_ERROR_MSG.argsCanOnlyFromGroupBy(), node.getPos());
             }
 
             return true;
@@ -294,11 +298,28 @@ public class AggregationAnalyzer {
         @Override
         public Boolean visitSubquery(Subquery node, Void context) {
             QueryStatement queryStatement = node.getQueryStatement();
-            List<FieldId> fieldIds = queryStatement.getQueryRelation().getColumnReferences().values().stream()
-                    .filter(fieldId -> fieldId.getRelationId().equals(sourceScope.getRelationId()))
-                    .collect(Collectors.toList());
+            for (Map.Entry<Expr, FieldId> entry : queryStatement.getQueryRelation().getColumnReferences().entrySet()) {
+                Expr expr = entry.getKey();
+                FieldId id = entry.getValue();
 
-            return groupingFields.containsAll(fieldIds);
+                if (!id.getRelationId().equals(sourceScope.getRelationId())) {
+                    continue;
+                }
+
+                if (!groupingFields.contains(id)) {
+                    if (!SqlModeHelper.check(session.getSessionVariable().getSqlMode(),
+                            SqlModeHelper.MODE_ONLY_FULL_GROUP_BY)) {
+                        if (!analyzeState.getColumnNotInGroupBy().contains(expr)) {
+                            throw new SemanticException(
+                                    PARSER_ERROR_MSG.unsupportedNoGroupBySubquery(expr.toSql(), node.toSql()),
+                                    expr.getPos());
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
 
         @Override
@@ -314,6 +335,11 @@ public class AggregationAnalyzer {
         @Override
         public Boolean visitCloneExpr(CloneExpr node, Void context) {
             return visit(node.getChild(0));
+        }
+
+        @Override
+        public Boolean visitDictQueryExpr(DictQueryExpr node, Void context) {
+            return node.getChildren().stream().allMatch(this::visit);
         }
     }
 }

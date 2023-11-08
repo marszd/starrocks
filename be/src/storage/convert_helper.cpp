@@ -1520,7 +1520,7 @@ private:
 
 DEF_PRED_GUARD(DirectlyCopybleGuard, is_directly_copyable, typename, SrcType, typename, DstType)
 #define IS_DIRECTLY_COPYABLE_CTOR(SrcType, DstType) DEF_PRED_CASE_CTOR(is_directly_copyable, SrcType, DstType)
-#define IS_DIRECTLY_COPYABLE(PT, ...) DEF_BINARY_RELATION_ENTRY_SEP_NONE(IS_DIRECTLY_COPYABLE_CTOR, PT, ##__VA_ARGS__)
+#define IS_DIRECTLY_COPYABLE(LT, ...) DEF_BINARY_RELATION_ENTRY_SEP_NONE(IS_DIRECTLY_COPYABLE_CTOR, LT, ##__VA_ARGS__)
 
 IS_DIRECTLY_COPYABLE(DecimalV2Value, int128_t)
 IS_DIRECTLY_COPYABLE(int128_t, DecimalV2Value)
@@ -1732,48 +1732,6 @@ void RowConverter::convert(std::vector<Datum>* dst, const std::vector<Datum>& sr
     for (size_t i = 0; i < num_datums; ++i) {
         _converters[i]->convert(&(*dst)[i], src[i]);
     }
-}
-
-Status ChunkConverter::init(const Schema& in_schema, const Schema& out_schema) {
-    DCHECK_EQ(in_schema.num_fields(), out_schema.num_fields());
-    DCHECK_EQ(in_schema.num_key_fields(), out_schema.num_key_fields());
-    auto num_columns = in_schema.num_fields();
-    _converters.resize(num_columns, nullptr);
-    for (int i = 0; i < num_columns; ++i) {
-        auto& f1 = in_schema.field(i);
-        auto& f2 = out_schema.field(i);
-        DCHECK_EQ(f1->id(), f2->id());
-        _converters[i] = get_field_converter(f1->type()->type(), f2->type()->type());
-        if (_converters[i] == nullptr) {
-            return Status::NotSupported("Cannot get field converter");
-        }
-    }
-    _out_schema = std::make_shared<Schema>(out_schema);
-    return Status::OK();
-}
-
-std::unique_ptr<Chunk> ChunkConverter::copy_convert(const Chunk& from) const {
-    auto dest = std::make_unique<Chunk>(Columns{}, std::make_shared<Schema>());
-    auto num_columns = _converters.size();
-    DCHECK_EQ(num_columns, from.num_columns());
-    for (int i = 0; i < num_columns; ++i) {
-        auto f = _out_schema->field(i);
-        auto c = _converters[i]->copy_convert(*from.get_column_by_id(f->id()));
-        dest->append_column(std::move(c), f);
-    }
-    return dest;
-}
-
-std::unique_ptr<Chunk> ChunkConverter::move_convert(Chunk* from) const {
-    auto dest = std::make_unique<Chunk>(Columns{}, std::make_shared<Schema>());
-    auto num_columns = _converters.size();
-    DCHECK_EQ(num_columns, from->num_columns());
-    for (int i = 0; i < num_columns; ++i) {
-        auto f = _out_schema->field(i);
-        auto c = _converters[i]->move_convert(from->get_column_by_id(f->id()).get());
-        dest->append_column(std::move(c), f);
-    }
-    return dest;
 }
 
 } // namespace starrocks

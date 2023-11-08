@@ -43,6 +43,7 @@ public:
 
     bool insert_local_exchange_operator() const override { return true; }
     bool accept_empty_scan_ranges() const override { return false; }
+    const TupleDescriptor* tuple_descriptor(RuntimeState* state) const override;
 
 protected:
     ConnectorScanNode* _scan_node;
@@ -54,6 +55,7 @@ public:
     ~MySQLDataSource() override = default;
 
     MySQLDataSource(const MySQLDataSourceProvider* provider, const TScanRange& scan_range);
+    std::string name() const override;
     Status open(RuntimeState* state) override;
     void close(RuntimeState* state) override;
     Status get_next(RuntimeState* state, ChunkPtr* chunk) override;
@@ -95,7 +97,7 @@ private:
 
     Status append_text_to_column(const char* data, const int& len, const SlotDescriptor* slot_desc, Column* column);
 
-    template <LogicalType PT, typename CppType = RunTimeCppType<PT>>
+    template <LogicalType LT, typename CppType = RunTimeCppType<LT>>
     void append_value_to_column(Column* column, CppType& value);
 };
 

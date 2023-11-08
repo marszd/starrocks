@@ -18,6 +18,10 @@ import com.google.common.collect.Lists;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.RowOutputInfo;
+import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalScanOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalJoinOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalScanOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 
 import java.util.List;
@@ -29,7 +33,9 @@ public abstract class Operator {
 
     protected final OperatorType opType;
     protected long limit = DEFAULT_LIMIT;
-    protected ScalarOperator predicate;
+    protected ScalarOperator predicate = null;
+
+    private static long saltGenerator = 0;
     /**
      * Before entering the Cascades search framework,
      * we need to merge LogicalProject and child children into one node
@@ -39,6 +45,13 @@ public abstract class Operator {
     protected Projection projection;
 
     protected RowOutputInfo rowOutputInfo;
+
+    // Add salt make the original equivalent operators nonequivalent to avoid Group
+    // mutual reference in Memo.
+    // Only LogicalScanOperator/PhysicalScanOperator yielded by CboTablePruneRule has salt.
+    // if no salt, two different Groups will be merged into one, that leads to mutual reference
+    // or self reference of groups
+    protected long salt = 0;
 
     public Operator(OperatorType opType) {
         this.opType = opType;
@@ -98,15 +111,37 @@ public abstract class Operator {
         this.projection = projection;
     }
 
+    public void addSalt() {
+        if ((this instanceof LogicalJoinOperator) || (this instanceof LogicalScanOperator)) {
+            this.salt = ++saltGenerator;
+        }
+    }
+
+    public void setSalt(long salt) {
+        if ((this instanceof LogicalJoinOperator) ||
+                (this instanceof LogicalScanOperator) ||
+                (this instanceof PhysicalScanOperator) ||
+                (this instanceof PhysicalJoinOperator)) {
+            this.salt = salt;
+        }
+    }
+    public boolean hasSalt() {
+        return salt > 0;
+    }
+
+    public long getSalt() {
+        return salt;
+    }
+
     public RowOutputInfo getRowOutputInfo(List<OptExpression> inputs) {
-        if (rowOutputInfo != null) {
-            return rowOutputInfo;
+        if (rowOutputInfo == null) {
+            rowOutputInfo = deriveRowOutputInfo(inputs);
         }
 
+        // transformation may update the projection, so update the rowOutputInfo at the same time
         if (projection != null) {
-            rowOutputInfo = new RowOutputInfo(projection.getColumnRefMap());
-        } else {
-            rowOutputInfo = deriveRowOutputInfo(inputs);
+            rowOutputInfo = new RowOutputInfo(projection.getColumnRefMap(), projection.getCommonSubOperatorMap(),
+                    rowOutputInfo.getOriginalColOutputInfo(), rowOutputInfo.getEndogenousCols());
         }
         return rowOutputInfo;
     }
@@ -117,7 +152,7 @@ public abstract class Operator {
 
     protected RowOutputInfo projectInputRow(RowOutputInfo inputRow) {
         List<ColumnOutputInfo> entryList = Lists.newArrayList();
-        for (ColumnOutputInfo columnOutputInfo : inputRow.getColumnEntries()) {
+        for (ColumnOutputInfo columnOutputInfo : inputRow.getColumnOutputInfo()) {
             entryList.add(new ColumnOutputInfo(columnOutputInfo.getColumnRef(), columnOutputInfo.getColumnRef()));
         }
         return new RowOutputInfo(entryList);
@@ -147,63 +182,67 @@ public abstract class Operator {
         Operator operator = (Operator) o;
         return limit == operator.limit && opType == operator.opType &&
                 Objects.equals(predicate, operator.predicate) &&
-                Objects.equals(projection, operator.projection);
+                Objects.equals(projection, operator.projection) &&
+                Objects.equals(salt, operator.salt);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(opType.ordinal(), limit, predicate, projection);
+        return Objects.hash(opType.ordinal(), limit, predicate, projection, salt);
     }
 
     public abstract static class Builder<O extends Operator, B extends Builder> {
-        protected OperatorType opType;
-        protected long limit = DEFAULT_LIMIT;
-        protected ScalarOperator predicate;
-        protected Projection projection;
+        protected O builder = newInstance();
+
+        protected abstract O newInstance();
 
         public B withOperator(O operator) {
-            this.opType = operator.opType;
-            this.limit = operator.limit;
-            this.predicate = operator.predicate;
-            this.projection = operator.projection;
+            builder.limit = operator.limit;
+            builder.predicate = operator.predicate;
+            builder.projection = operator.projection;
+            builder.salt = operator.salt;
             return (B) this;
         }
 
-        public abstract O build();
+        public O build() {
+            O newOne = builder;
+            builder = null;
+            return newOne;
+        }
 
         public OperatorType getOpType() {
-            return opType;
-        }
-
-        public B setOpType(OperatorType opType) {
-            this.opType = opType;
-            return (B) this;
+            return builder.opType;
         }
 
         public long getLimit() {
-            return limit;
+            return builder.limit;
         }
 
         public B setLimit(long limit) {
-            this.limit = limit;
+            builder.limit = limit;
             return (B) this;
         }
 
         public ScalarOperator getPredicate() {
-            return predicate;
+            return builder.predicate;
         }
 
         public B setPredicate(ScalarOperator predicate) {
-            this.predicate = predicate;
+            builder.predicate = predicate;
             return (B) this;
         }
 
         public Projection getProjection() {
-            return projection;
+            return builder.projection;
         }
 
         public B setProjection(Projection projection) {
-            this.projection = projection;
+            builder.projection = projection;
+            return (B) this;
+        }
+
+        public B addSalt() {
+            builder.salt = ++saltGenerator;
             return (B) this;
         }
     }

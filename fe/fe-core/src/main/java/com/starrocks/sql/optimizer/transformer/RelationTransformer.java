@@ -30,6 +30,7 @@ import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.Subquery;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.DistributionInfo;
+import com.starrocks.catalog.DistributionInfo.DistributionInfoType;
 import com.starrocks.catalog.EsTable;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.IcebergTable;
@@ -38,9 +39,10 @@ import com.starrocks.catalog.Table;
 import com.starrocks.catalog.TableFunction;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.Pair;
-import com.starrocks.external.elasticsearch.EsTablePartitions;
+import com.starrocks.connector.elasticsearch.EsTablePartitions;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.Field;
 import com.starrocks.sql.analyzer.FieldId;
 import com.starrocks.sql.analyzer.RelationFields;
@@ -50,8 +52,10 @@ import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.CTERelation;
 import com.starrocks.sql.ast.ExceptRelation;
+import com.starrocks.sql.ast.FileTableFunctionRelation;
 import com.starrocks.sql.ast.IntersectRelation;
 import com.starrocks.sql.ast.JoinRelation;
+import com.starrocks.sql.ast.NormalizedTableFunctionRelation;
 import com.starrocks.sql.ast.QueryRelation;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.Relation;
@@ -96,10 +100,12 @@ import com.starrocks.sql.optimizer.operator.logical.LogicalLimitOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalMetaScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalMysqlScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalOlapScanOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalPaimonScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalSchemaScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalTableFunctionOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalTableFunctionTableScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalTopNOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalUnionOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalValuesOperator;
@@ -123,6 +129,8 @@ import java.util.Objects;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static com.starrocks.server.CatalogMgr.ResourceMappingCatalog.isResourceMappingCatalog;
+import static com.starrocks.sql.common.ErrorMsgProxy.PARSER_ERROR_MSG;
 import static com.starrocks.sql.common.UnsupportedException.unsupportedException;
 
 public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMapping> {
@@ -154,9 +162,8 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
         OptExprBuilder root = plan.getRootBuilder();
         // Set limit if user set sql_select_limit.
         long selectLimit = ConnectContext.get().getSessionVariable().getSqlSelectLimit();
-        if (!root.getRoot().getOp().hasLimit() &&
-                selectLimit != SessionVariable.DEFAULT_SELECT_LIMIT) {
-            LogicalLimitOperator limitOperator = LogicalLimitOperator.local(selectLimit);
+        if (!root.getRoot().getOp().hasLimit() && selectLimit != SessionVariable.DEFAULT_SELECT_LIMIT) {
+            LogicalLimitOperator limitOperator = LogicalLimitOperator.init(selectLimit);
             root = root.withNewRoot(limitOperator);
             return new LogicalPlan(root, plan.getOutputColumn(), plan.getCorrelation());
         }
@@ -415,6 +422,43 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
         return new LogicalPlan(valuesOpt, valuesOutputColumns, null);
     }
 
+    private DistributionSpec getTableDistributionSpec(TableRelation node,
+                                                      Map<Column, ColumnRefOperator> columnMetaToColRefMap) {
+        DistributionSpec distributionSpec = null;
+        DistributionInfo distributionInfo = ((OlapTable) node.getTable()).getDefaultDistributionInfo();
+
+        if (distributionInfo.getType() == DistributionInfoType.HASH) {
+            List<Integer> hashDistributeColumns = new ArrayList<>();
+            HashDistributionInfo hashDistributionInfo = (HashDistributionInfo) distributionInfo;
+            List<Column> distributedColumns = hashDistributionInfo.getDistributionColumns();
+
+            // NOTE: sync mv output columns may not contain the distribution columns,
+            // set it as random distribution.
+            if (node.isSyncMVQuery() &&
+                    distributedColumns.stream().anyMatch(x -> !columnMetaToColRefMap.containsKey(x))) {
+                return DistributionSpec.createAnyDistributionSpec();
+            }
+
+            for (Column distributedColumn : distributedColumns) {
+                Preconditions.checkState(columnMetaToColRefMap.containsKey(distributedColumn));
+                hashDistributeColumns.add(columnMetaToColRefMap.get(distributedColumn).getId());
+            }
+            HashDistributionDesc hashDistributionDesc =
+                    new HashDistributionDesc(hashDistributeColumns, HashDistributionDesc.SourceType.LOCAL);
+            distributionSpec = DistributionSpec.createHashDistributionSpec(hashDistributionDesc);
+        } else if (distributionInfo.getType() == DistributionInfoType.RANDOM) {
+            distributionSpec = DistributionSpec.createAnyDistributionSpec();
+        } else {
+            throw new IllegalStateException("Unknown distribution type: " + distributionInfo.getType());
+        }
+        return distributionSpec;
+    }
+
+    @Override
+    public LogicalPlan visitFileTableFunction(FileTableFunctionRelation node, ExpressionMapping context) {
+        return visitTable(node, context);
+    }
+
     @Override
     public LogicalPlan visitTable(TableRelation node, ExpressionMapping context) {
         ImmutableMap.Builder<ColumnRefOperator, Column> colRefToColumnMetaMapBuilder = ImmutableMap.builder();
@@ -436,33 +480,32 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
         boolean isMVPlanner = session.getSessionVariable().isMVPlanner();
         Map<Column, ColumnRefOperator> columnMetaToColRefMap = columnMetaToColRefMapBuilder.build();
         List<ColumnRefOperator> outputVariables = outputVariablesBuilder.build();
-        LogicalScanOperator scanOperator;
-        if (node.getTable().isNativeTable()) {
-            DistributionInfo distributionInfo = ((OlapTable) node.getTable()).getDefaultDistributionInfo();
-            Preconditions.checkState(distributionInfo instanceof HashDistributionInfo);
-            HashDistributionInfo hashDistributionInfo = (HashDistributionInfo) distributionInfo;
-            List<Column> distributedColumns = hashDistributionInfo.getDistributionColumns();
-            List<Integer> hashDistributeColumns = new ArrayList<>();
-            for (Column distributedColumn : distributedColumns) {
-                hashDistributeColumns.add(columnMetaToColRefMap.get(distributedColumn).getId());
-            }
 
-            HashDistributionDesc hashDistributionDesc =
-                    new HashDistributionDesc(hashDistributeColumns, HashDistributionDesc.SourceType.LOCAL);
+        ScalarOperator partitionPredicate = null;
+        if (node.getPartitionPredicate() != null) {
+            partitionPredicate = SqlToScalarOperatorTranslator.translate(node.getPartitionPredicate(),
+                    new ExpressionMapping(node.getScope(), outputVariables), columnRefFactory);
+        }
+
+        LogicalScanOperator scanOperator;
+        if (node.getTable().isNativeTableOrMaterializedView()) {
+            DistributionSpec distributionSpec = getTableDistributionSpec(node, columnMetaToColRefMap);
             if (node.isMetaQuery()) {
                 scanOperator = new LogicalMetaScanOperator(node.getTable(), colRefToColumnMetaMapBuilder.build());
             } else if (!isMVPlanner) {
-                scanOperator = new LogicalOlapScanOperator(node.getTable(),
-                        colRefToColumnMetaMapBuilder.build(),
-                        columnMetaToColRefMap,
-                        DistributionSpec.createHashDistributionSpec(hashDistributionDesc),
-                        Operator.DEFAULT_LIMIT,
-                        null,
-                        ((OlapTable) node.getTable()).getBaseIndexId(),
-                        null,
-                        node.getPartitionNames(),
-                        Lists.newArrayList(),
-                        node.getTabletIds());
+                scanOperator = LogicalOlapScanOperator.builder()
+                        .setTable(node.getTable())
+                        .setColRefToColumnMetaMap(colRefToColumnMetaMapBuilder.build())
+                        .setColumnMetaToColRefMap(columnMetaToColRefMap)
+                        .setDistributionSpec(distributionSpec)
+                        .setSelectedIndexId(((OlapTable) node.getTable()).getBaseIndexId())
+                        .setPartitionNames(node.getPartitionNames())
+                        .setSelectedTabletId(Lists.newArrayList())
+                        .setHintsTabletIds(node.getTabletIds())
+                        .setHintsReplicaIds(node.getReplicaIds())
+                        .setHasTableHints(node.hasTableHints())
+                        .setUsePkIndex(node.isUsePkIndex())
+                        .build();
             } else {
                 scanOperator = new LogicalBinlogScanOperator(
                         node.getTable(),
@@ -472,21 +515,27 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
             }
         } else if (Table.TableType.HIVE.equals(node.getTable().getType())) {
             scanOperator = new LogicalHiveScanOperator(node.getTable(), colRefToColumnMetaMapBuilder.build(),
-                    columnMetaToColRefMap, Operator.DEFAULT_LIMIT, null);
+                    columnMetaToColRefMap, Operator.DEFAULT_LIMIT, partitionPredicate);
         } else if (Table.TableType.FILE.equals(node.getTable().getType())) {
             scanOperator = new LogicalFileScanOperator(node.getTable(), colRefToColumnMetaMapBuilder.build(),
                     columnMetaToColRefMap, Operator.DEFAULT_LIMIT, null);
         } else if (Table.TableType.ICEBERG.equals(node.getTable().getType())) {
-            if (!((IcebergTable) node.getTable()).isCatalogTbl()) {
-                ((IcebergTable) node.getTable()).refreshTable();
+            String catalogName = ((IcebergTable) node.getTable()).getCatalogName();
+            if (isResourceMappingCatalog(catalogName)) {
+                String dbName = node.getName().getDb();
+                GlobalStateMgr.getCurrentState().getMetadataMgr().refreshTable(
+                        catalogName, dbName, node.getTable(), Lists.newArrayList(), true);
             }
             scanOperator = new LogicalIcebergScanOperator(node.getTable(), colRefToColumnMetaMapBuilder.build(),
-                    columnMetaToColRefMap, Operator.DEFAULT_LIMIT, null);
+                    columnMetaToColRefMap, Operator.DEFAULT_LIMIT, partitionPredicate);
         } else if (Table.TableType.HUDI.equals(node.getTable().getType())) {
             scanOperator = new LogicalHudiScanOperator(node.getTable(), colRefToColumnMetaMapBuilder.build(),
-                    columnMetaToColRefMap, Operator.DEFAULT_LIMIT, null);
+                    columnMetaToColRefMap, Operator.DEFAULT_LIMIT, partitionPredicate);
         } else if (Table.TableType.DELTALAKE.equals(node.getTable().getType())) {
             scanOperator = new LogicalDeltaLakeScanOperator(node.getTable(), colRefToColumnMetaMapBuilder.build(),
+                    columnMetaToColRefMap, Operator.DEFAULT_LIMIT, null);
+        } else if (Table.TableType.PAIMON.equals(node.getTable().getType())) {
+            scanOperator = new LogicalPaimonScanOperator(node.getTable(), colRefToColumnMetaMapBuilder.build(),
                     columnMetaToColRefMap, Operator.DEFAULT_LIMIT, null);
         } else if (Table.TableType.SCHEMA.equals(node.getTable().getType())) {
             scanOperator =
@@ -522,6 +571,9 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
                     new LogicalJDBCScanOperator(node.getTable(), colRefToColumnMetaMapBuilder.build(),
                             columnMetaToColRefMap, Operator.DEFAULT_LIMIT,
                             null, null);
+        } else if (Table.TableType.TABLE_FUNCTION.equals(node.getTable().getType())) {
+            scanOperator = new LogicalTableFunctionTableScanOperator(node.getTable(), colRefToColumnMetaMapBuilder.build(),
+                    columnMetaToColRefMap, Operator.DEFAULT_LIMIT, null);
         } else {
             throw new StarRocksPlannerException("Not support table type: " + node.getTable().getType(),
                     ErrorType.UNSUPPORTED);
@@ -590,10 +642,12 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
             LogicalPlan leftPlan = visit(node.getLeft());
             LogicalPlan rightPlan = visit(node.getRight(), leftPlan.getRootBuilder().getExpressionMapping());
 
+            List<ColumnRefOperator> leftFieldMappings = leftPlan.getRootBuilder().getFieldMappings();
+            List<ColumnRefOperator> rightFieldMappings = rightPlan.getRootBuilder().getFieldMappings();
+
             ExpressionMapping expressionMapping = new ExpressionMapping(new Scope(RelationId.of(node),
                     node.getLeft().getRelationFields().joinWith(node.getRight().getRelationFields())),
-                    Streams.concat(leftPlan.getRootBuilder().getFieldMappings().stream(),
-                                    rightPlan.getRootBuilder().getFieldMappings().stream())
+                    Streams.concat(leftFieldMappings.stream(), rightFieldMappings.stream())
                             .collect(Collectors.toList()));
 
             Operator root = LogicalApplyOperator.builder().setCorrelationColumnRefs(correlation)
@@ -713,11 +767,19 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
             }
         }
 
-        Operator root = new LogicalTableFunctionOperator(
-                new ColumnRefSet(outputColumns), node.getTableFunction(), projectMap);
+        Operator root = new LogicalTableFunctionOperator(outputColumns, node.getTableFunction(), projectMap);
         return new LogicalPlan(new OptExprBuilder(root, Collections.emptyList(),
                 new ExpressionMapping(new Scope(RelationId.of(node), node.getRelationFields()), outputColumns)),
                 null, null);
+    }
+
+    @Override
+    public LogicalPlan visitNormalizedTableFunction(NormalizedTableFunctionRelation node, ExpressionMapping context) {
+        LogicalPlan plan = visitJoin(node, context);
+        // Column prune, only the table function columns should be returned.
+        OptExprBuilder rootBuilder = plan.getRootBuilder();
+        rootBuilder.setExpressionMapping(rootBuilder.getInputs().get(1).getExpressionMapping());
+        return plan;
     }
 
     /**
@@ -810,12 +872,26 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
 
     private boolean isJoinLeftRelatedSubquery(JoinRelation node, Expr joinOnConjunct) {
         List<Subquery> subqueries = Lists.newArrayList();
-        joinOnConjunct.collect(Subquery.class, subqueries);
-        Preconditions.checkState(subqueries.size() <= 1,
-                "Not support ON Clause conjunct contains more than one subquery");
+
+        List<Expr> elements = Expr.flattenPredicate(joinOnConjunct);
+        List<Expr> predicateWithSubquery = Lists.newArrayList();
+        for (Expr element : elements) {
+            int oldSize = subqueries.size();
+            element.collect(Subquery.class, subqueries);
+            if (subqueries.size() > oldSize) {
+                predicateWithSubquery.add(element);
+            }
+        }
+
+        if (subqueries.size() > 1) {
+            throw new SemanticException(PARSER_ERROR_MSG.unsupportedSubquery(joinOnConjunct.toSql(),
+                    "contains more than one subquery"), joinOnConjunct.getPos());
+        }
+
         if (subqueries.isEmpty()) {
             return true;
         }
+
         Subquery subquery = subqueries.get(0);
         QueryStatement subqueryStmt = subquery.getQueryStatement();
         SelectRelation selectRelation = (SelectRelation) subqueryStmt.getQueryRelation();
@@ -830,7 +906,7 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
          *       /              \
          *   Outer:R        Inner: E(r)
          * Since join node has two relation, we should to determine which one(left or right or both)
-         * is the outer relation of ApplyOperator
+         * is the outer relation of ApplyOperator for correlated subquery or expr in (un-correlated subquery),
          * usingLeftRelation = true, then the left relation of join will be the outer relation of apply
          * usingLeftRelation = false, then the right relation of join will be the outer relation of apply
          * TODO, both of the left and right relations should be taken into account, and it is not supported yet
@@ -838,42 +914,43 @@ public class RelationTransformer extends AstVisitor<LogicalPlan, ExpressionMappi
         final boolean usingLeftRelation;
 
         List<SlotRef> slotRefs = Lists.newArrayList();
-        joinOnConjunct.collect(SlotRef.class, slotRefs);
+        Expr predicate  = predicateWithSubquery.get(0);
+        predicate.collect(SlotRef.class, slotRefs);
         RelationFields leftRelationFields = node.getLeft().getRelationFields();
         RelationFields rightRelationFields = node.getRight().getRelationFields();
-        boolean isJoinLeftNonCorrelated =
+        boolean refLeftNodeCols =
                 slotRefs.stream().anyMatch(slotRef -> !leftRelationFields.resolveFields(slotRef).isEmpty());
-        boolean isJoinRightNonCorrelated =
+        boolean refRightNodeCols =
                 slotRefs.stream().anyMatch(slotRef -> !rightRelationFields.resolveFields(slotRef).isEmpty());
 
-        if (correlatedFieldIds.isEmpty()) {
-            Preconditions.checkState(!(isJoinLeftNonCorrelated && isJoinRightNonCorrelated),
-                    "Not support ON Clause un-correlated subquery referencing columns of more than one table");
-            usingLeftRelation = isJoinLeftNonCorrelated;
-        } else {
-            boolean isJoinLeftCorrelated = false;
-            boolean isJoinRightCorrelated = false;
-            for (FieldId correlatedFieldId : correlatedFieldIds) {
-                Field field = node.getRelationFields().getAllFields().get(correlatedFieldId.getFieldIndex());
-                if (node.getLeft().getRelationFields().getAllFields().contains(field)) {
-                    isJoinLeftCorrelated = true;
-                }
-                if (node.getRight().getRelationFields().getAllFields().contains(field)) {
-                    isJoinRightCorrelated = true;
-                }
+        boolean correlatedLeftNode = false;
+        boolean correlatedRightNode = false;
+        for (FieldId correlatedFieldId : correlatedFieldIds) {
+            Field field = node.getRelationFields().getAllFields().get(correlatedFieldId.getFieldIndex());
+            if (Objects.equals(node.getLeft().getResolveTableName(), field.getRelationAlias())) {
+                correlatedLeftNode = true;
+            } else if (Objects.equals(node.getRight().getResolveTableName(), field.getRelationAlias())) {
+                correlatedRightNode = true;
+            } else {
+                Preconditions.checkState(false, "Cannot find field %s in outer scope", field);
             }
-            Preconditions.checkState(isJoinLeftCorrelated || isJoinRightCorrelated);
-            Preconditions.checkState(!(isJoinLeftCorrelated && isJoinRightCorrelated),
-                    "Not support ON Clause correlated subquery referencing columns of more than one table");
-            if (joinOnConjunct instanceof InPredicate) {
-                // We DO NOT support this kind of in-predicate like below
-                // select * from t0 join t1 on t0.v1 in (select t2.v7 from t2 where t1.v5 = t2.v8)
-                Preconditions.checkState(!(isJoinLeftCorrelated && isJoinRightNonCorrelated ||
-                                isJoinRightCorrelated && isJoinLeftNonCorrelated),
-                        "Not support ON Clause correlated in-subquery referencing columns of more than one table");
-            }
-            usingLeftRelation = isJoinLeftCorrelated;
         }
+
+        if (predicate instanceof InPredicate &&
+                (refLeftNodeCols || correlatedLeftNode) && (refRightNodeCols || correlatedRightNode)) {
+            throw new SemanticException(PARSER_ERROR_MSG.unsupportedSubquery(predicate.toSql(),
+                    "referencing columns from more than one table"), predicate.getPos());
+        }
+
+        if (correlatedFieldIds.isEmpty()) {
+            usingLeftRelation = refLeftNodeCols;
+        } else if (correlatedLeftNode && correlatedRightNode) {
+            throw new SemanticException(PARSER_ERROR_MSG.unsupportedSubquery(predicate.toSql(),
+                    "referencing columns from more than one table"), predicate.getPos());
+        } else {
+            usingLeftRelation = correlatedLeftNode;
+        }
+
         return usingLeftRelation;
     }
 }

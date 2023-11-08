@@ -16,6 +16,7 @@
 
 #include "common/statusor.h"
 #include "gen_cpp/lake_types.pb.h"
+#include "storage/lake/tablet.h"
 #include "storage/lake/types_fwd.h"
 #include "storage/olap_common.h"
 
@@ -26,13 +27,15 @@ static const int kInvalidRowsetIndex = -1;
 
 class Rowset {
 public:
-    explicit Rowset(Tablet* tablet, RowsetMetadataPtr rowset_metadata, int index);
+    explicit Rowset(Tablet tablet, RowsetMetadataPtr rowset_metadata, int index);
 
-    explicit Rowset(Tablet* tablet, RowsetMetadataPtr rowset_metadata);
+    explicit Rowset(Tablet tablet, RowsetMetadataPtr rowset_metadata);
 
     ~Rowset();
 
-    [[nodiscard]] StatusOr<ChunkIteratorPtr> read(const Schema& schema, const RowsetReadOptions& options);
+    [[nodiscard]] StatusOr<std::vector<ChunkIteratorPtr>> read(const Schema& schema, const RowsetReadOptions& options);
+
+    [[nodiscard]] StatusOr<size_t> get_read_iterator_num();
 
     // only used for updatable tablets' rowset, for update state load, it wouldn't load delvec
     // simply get iterators to iterate all rows without complex options like predicates
@@ -67,11 +70,17 @@ public:
 
     [[nodiscard]] const RowsetMetadata& metadata() const { return *_rowset_metadata; }
 
-private:
+    [[nodiscard]] StatusOr<std::vector<SegmentPtr>> segments(bool fill_cache);
+
+    [[nodiscard]] StatusOr<std::vector<SegmentPtr>> segments(bool fill_data_cache, bool fill_metadata_cache);
+
     [[nodiscard]] Status load_segments(std::vector<SegmentPtr>* segments, bool fill_cache);
 
-    // _tablet is owned by TabletReader
-    Tablet* _tablet;
+    [[nodiscard]] Status load_segments(std::vector<SegmentPtr>* segments, bool fill_data_cache,
+                                       bool fill_metadata_cache);
+
+private:
+    Tablet _tablet;
     RowsetMetadataPtr _rowset_metadata;
     int _index{kInvalidRowsetIndex};
 };

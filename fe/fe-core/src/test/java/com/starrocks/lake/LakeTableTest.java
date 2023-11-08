@@ -115,7 +115,7 @@ public class LakeTableTest {
         builder.setFsInfo(fsInfo);
         builder.setFullPath("s3://test-bucket/1/");
         FilePathInfo pathInfo = builder.build();
-        table.setStorageInfo(pathInfo, false, 0, false);
+        table.setStorageInfo(pathInfo, new DataCacheInfo(false, false));
 
         // Test serialize and deserialize
         FastByteArrayOutputStream byteArrayOutputStream = new FastByteArrayOutputStream();
@@ -131,10 +131,10 @@ public class LakeTableTest {
         byteArrayOutputStream.close();
 
         // Check lake table and lake tablet
-        Assert.assertTrue(newTable.isLakeTable());
+        Assert.assertTrue(newTable.isCloudNativeTable());
         LakeTable newLakeTable = (LakeTable) newTable;
 
-        Assert.assertEquals("s3://test-bucket/1/", newLakeTable.getStorageGroup());
+        Assert.assertEquals("s3://test-bucket/1/", newLakeTable.getDefaultFilePathInfo().getFullPath());
 
         Partition p1 = newLakeTable.getPartition(partitionId);
         MaterializedIndex newIndex = p1.getBaseIndex();
@@ -147,7 +147,17 @@ public class LakeTableTest {
             ++expectedTabletId;
         }
 
+        Assert.assertEquals(-1, newLakeTable.lastSchemaUpdateTime.longValue());
+        Assert.assertEquals(-1, newLakeTable.lastVersionUpdateStartTime.longValue());
+        Assert.assertEquals(0, newLakeTable.lastVersionUpdateEndTime.longValue());
+
         Assert.assertNull(table.delete(true));
         Assert.assertNotNull(table.delete(false));
+    }
+
+    @Test
+    public void testDeserialize() {
+        LakeTable lakeTable = new LakeTable();
+        Assert.assertNotNull(lakeTable.getIndexIdToMeta());
     }
 }

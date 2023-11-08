@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.connector;
 
 import com.google.common.collect.ImmutableList;
@@ -20,19 +19,25 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.starrocks.analysis.BoolLiteral;
+import com.starrocks.analysis.DateLiteral;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.DeltaLakeTable;
+import com.starrocks.catalog.HiveTable;
+import com.starrocks.catalog.JDBCTable;
 import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.Pair;
+import com.starrocks.common.ExceptionChecker;
 import com.starrocks.common.UserException;
 import com.starrocks.connector.exception.StarRocksConnectorException;
 import com.starrocks.connector.hive.HiveMetaClient;
 import com.starrocks.connector.hive.HivePartitionName;
+import com.starrocks.connector.iceberg.IcebergApiConverter;
+import com.starrocks.server.MetadataMgr;
 import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
@@ -40,12 +45,14 @@ import mockit.Mocked;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import static com.starrocks.connector.PartitionUtil.createPartitionKey;
 import static com.starrocks.connector.PartitionUtil.fromPartitionKey;
+import static com.starrocks.connector.PartitionUtil.getPartitionName;
 import static com.starrocks.connector.PartitionUtil.getSuffixName;
 import static com.starrocks.connector.PartitionUtil.toPartitionValues;
 
@@ -65,7 +72,54 @@ public class PartitionUtilTest {
     @Test
     public void testCreateHudiPartitionKey() throws AnalysisException {
         PartitionKey partitionKey = createPartitionKey(
-                Lists.newArrayList("1", "a", "3.0", HiveMetaClient.HUDI_PARTITION_NULL_VALUE), partColumns, Table.TableType.HUDI);
+                Lists.newArrayList("1", "a", "3.0", HiveMetaClient.HUDI_PARTITION_NULL_VALUE), partColumns,
+                Table.TableType.HUDI);
+        Assert.assertEquals("(\"1\", \"a\", \"3.0\", \"NULL\")", partitionKey.toSql());
+        List<String> res = PartitionUtil.fromPartitionKey(partitionKey);
+        Assert.assertEquals("1", res.get(0));
+        Assert.assertEquals("a", res.get(1));
+        Assert.assertEquals("3.0", res.get(2));
+        Assert.assertEquals(HiveMetaClient.HUDI_PARTITION_NULL_VALUE, res.get(3));
+
+        partitionKey = createPartitionKey(
+                Lists.newArrayList("1", "a", "3.0", HiveMetaClient.PARTITION_NULL_VALUE), partColumns,
+                Table.TableType.HUDI);
+        Assert.assertEquals("(\"1\", \"a\", \"3.0\", \"NULL\")", partitionKey.toSql());
+        res = PartitionUtil.fromPartitionKey(partitionKey);
+        Assert.assertEquals("1", res.get(0));
+        Assert.assertEquals("a", res.get(1));
+        Assert.assertEquals("3.0", res.get(2));
+        Assert.assertEquals(HiveMetaClient.PARTITION_NULL_VALUE, res.get(3));
+    }
+
+    @Test
+    public void testCreateIcebergPartitionKey() throws AnalysisException {
+        PartitionKey partitionKey = createPartitionKey(
+                Lists.newArrayList("1", "a", "3.0", IcebergApiConverter.PARTITION_NULL_VALUE), partColumns,
+                Table.TableType.ICEBERG);
+        Assert.assertEquals("(\"1\", \"a\", \"3.0\", \"NULL\")", partitionKey.toSql());
+    }
+
+    @Test
+    public void testPaimonPartitionKey() throws AnalysisException {
+        PartitionKey partitionKey = createPartitionKey(
+                Lists.newArrayList("1", "a", "3.0", "__DEFAULT_PARTITION__"), partColumns,
+                Table.TableType.PAIMON);
+        Assert.assertEquals("(\"1\", \"a\", \"3.0\", \"NULL\")", partitionKey.toSql());
+    }
+
+    @Test
+    public void testCreateDeltaLakePartitionKey() throws AnalysisException {
+        PartitionKey partitionKey = createPartitionKey(
+                Lists.newArrayList("1", "a", "3.0", DeltaLakeTable.PARTITION_NULL_VALUE), partColumns,
+                Table.TableType.DELTALAKE);
+        Assert.assertEquals("(\"1\", \"a\", \"3.0\", \"NULL\")", partitionKey.toSql());
+    }
+
+    @Test
+    public void testCreateJDBCPartitionKey() throws AnalysisException {
+        PartitionKey partitionKey = createPartitionKey(
+                Lists.newArrayList("1", "a", "3.0", JDBCTable.PARTITION_NULL_VALUE), partColumns, Table.TableType.JDBC);
         Assert.assertEquals("(\"1\", \"a\", \"3.0\", \"NULL\")", partitionKey.toSql());
     }
 
@@ -90,7 +144,7 @@ public class PartitionUtilTest {
 
     @Test
     public void testToPartitionValues() {
-        String  partitionNames = "a=1/b=2/c=3";
+        String partitionNames = "a=1/b=2/c=3";
         Assert.assertEquals(Lists.newArrayList("1", "2", "3"), toPartitionValues(partitionNames));
     }
 
@@ -100,6 +154,54 @@ public class PartitionUtilTest {
         LiteralExpr boolTrue1 = new BoolLiteral(true);
         partitionKey.pushColumn(boolTrue1, PrimitiveType.BOOLEAN);
         Assert.assertEquals(Lists.newArrayList("true"), fromPartitionKey(partitionKey));
+    }
+
+    @Test
+    public void testHiveTimestampPartitionNames() throws AnalysisException {
+        List<String> partitionValues = Lists.newArrayList("2007-01-01 10:35:00.0", "2007-01-01 10:35:00.123");
+        List<Column> columns = new ArrayList<>();
+        columns.add(new Column("a", Type.fromPrimitiveType(PrimitiveType.DATETIME)));
+        columns.add(new Column("b", Type.fromPrimitiveType(PrimitiveType.DATETIME)));
+
+        PartitionKey partitionKey = PartitionUtil.createPartitionKey(partitionValues, columns, Table.TableType.HIVE);
+        List<String> res = PartitionUtil.fromPartitionKey(partitionKey);
+        Assert.assertEquals("2007-01-01 10:35:00.0", res.get(0));
+        Assert.assertEquals("2007-01-01 10:35:00.123", res.get(1));
+
+        partitionValues = Lists.newArrayList("2007-01-01 10:35:00", "2007-01-01 10:35:00.00",
+                "2007-01-01 10:35:00.000");
+        columns = new ArrayList<>();
+        columns.add(new Column("a", Type.fromPrimitiveType(PrimitiveType.DATETIME)));
+        columns.add(new Column("b", Type.fromPrimitiveType(PrimitiveType.DATETIME)));
+        columns.add(new Column("c", Type.fromPrimitiveType(PrimitiveType.DATETIME)));
+        partitionKey = PartitionUtil.createPartitionKey(partitionValues, columns, Table.TableType.HIVE);
+        res = PartitionUtil.fromPartitionKey(partitionKey);
+        Assert.assertEquals("2007-01-01 10:35:00", res.get(0));
+        Assert.assertEquals("2007-01-01 10:35:00.00", res.get(1));
+        Assert.assertEquals("2007-01-01 10:35:00.000", res.get(2));
+    }
+
+    @Test
+    public void testHiveIntPartitionNames() throws Exception {
+        List<String> partitionValues = Lists.newArrayList("2007-01-01", "01");
+        List<Column> columns = new ArrayList<>();
+        columns.add(new Column("a", Type.fromPrimitiveType(PrimitiveType.DATE)));
+        columns.add(new Column("b", Type.fromPrimitiveType(PrimitiveType.INT)));
+
+        PartitionKey partitionKey = PartitionUtil.createPartitionKey(partitionValues, columns, Table.TableType.HIVE);
+        List<String> res = PartitionUtil.fromPartitionKey(partitionKey);
+        Assert.assertEquals("2007-01-01", res.get(0));
+        Assert.assertEquals("01", res.get(1));
+
+        partitionValues = Lists.newArrayList("125", "0125");
+        columns = new ArrayList<>();
+        columns.add(new Column("a", Type.fromPrimitiveType(PrimitiveType.INT)));
+        columns.add(new Column("b", Type.fromPrimitiveType(PrimitiveType.INT)));
+
+        partitionKey = PartitionUtil.createPartitionKey(partitionValues, columns, Table.TableType.HIVE);
+        res = PartitionUtil.fromPartitionKey(partitionKey);
+        Assert.assertEquals("125", res.get(0));
+        Assert.assertEquals("0125", res.get(1));
     }
 
     @Test
@@ -140,15 +242,21 @@ public class PartitionUtilTest {
     }
 
     @Test
-    public void testGetPartitionRange(@Mocked Table table) throws UserException {
+    public void testGetPartitionRange(@Mocked HiveTable table) throws UserException {
         Column partitionColumn = new Column("date", Type.DATE);
         List<String> partitionNames = ImmutableList.of("date=2022-08-02", "date=2022-08-19", "date=2022-08-21",
                 "date=2022-09-01", "date=2022-10-01", "date=2022-12-02");
 
         new MockUp<PartitionUtil>() {
             @Mock
-            public Pair<List<String>, List<Column>> getPartitionNamesAndColumns(Table table) {
-                return Pair.create(partitionNames, ImmutableList.of(partitionColumn));
+            public List<Column> getPartitionColumns(Table table) {
+                return ImmutableList.of(partitionColumn);
+            }
+        };
+        new MockUp<MetadataMgr>() {
+            @Mock
+            public List<String> listPartitionNames(String catalogName, String dbName, String tableName) {
+                return partitionNames;
             }
         };
         new Expectations() {
@@ -163,9 +271,27 @@ public class PartitionUtilTest {
             }
         };
 
-        Map<String, Range<PartitionKey>> partitionMap = PartitionUtil.getPartitionRange(table, partitionColumn);
+        Map<String, Range<PartitionKey>> partitionMap = PartitionUtil.getPartitionKeyRange(table, partitionColumn, null);
         Assert.assertEquals(partitionMap.size(), partitionNames.size());
         Assert.assertTrue(partitionMap.containsKey("p20221202"));
-        Assert.assertTrue(partitionMap.get("p20221202").upperEndpoint().isMaxValue());
+        PartitionKey upperBound = new PartitionKey();
+        upperBound.pushColumn(new DateLiteral(2022, 12, 03), PrimitiveType.DATE);
+        Assert.assertTrue(partitionMap.get("p20221202").upperEndpoint().equals(upperBound));
+    }
+
+    @Test
+    public void testGetPartition() {
+        String base = "hdfs://hadoop01:9000/mytable";
+        String tableLocation = "hdfs://hadoop01:9000/mytable/";
+        Assert.assertTrue(getPartitionName(base, tableLocation).isEmpty());
+
+        String errorPath = "hdfs://aaa/bbb";
+        ExceptionChecker.expectThrowsWithMsg(
+                IllegalStateException.class,
+                "Can't infer partition name. base path",
+                () -> PartitionUtil.getPartitionName(base, errorPath));
+
+        String partitionPath = "hdfs://hadoop01:9000/mytable/year=2023/month=12/day=30";
+        Assert.assertEquals("year=2023/month=12/day=30", PartitionUtil.getPartitionName(base, partitionPath));
     }
 }

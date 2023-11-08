@@ -12,36 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.connector.hive;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.HiveTable;
+import com.starrocks.catalog.HiveView;
 import com.starrocks.catalog.HudiTable;
 import com.starrocks.catalog.Type;
-import com.starrocks.common.IdGenerator;
+import com.starrocks.common.Version;
+import com.starrocks.connector.CatalogConnector;
 import com.starrocks.connector.ColumnTypeConverter;
 import com.starrocks.connector.ConnectorTableId;
 import com.starrocks.connector.HdfsEnvironment;
 import com.starrocks.connector.exception.StarRocksConnectorException;
-import com.starrocks.connector.hudi.HudiConnector;
+import com.starrocks.connector.trino.TrinoViewColumnTypeConverter;
+import com.starrocks.connector.trino.TrinoViewDefinition;
 import com.starrocks.credential.CloudConfiguration;
+import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
-import org.apache.avro.LogicalType;
-import org.apache.avro.LogicalTypes;
+import com.starrocks.sql.common.StarRocksPlannerException;
 import org.apache.avro.Schema;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.metastore.api.ColumnStatisticsObj;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.api.SerDeInfo;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.metastore.api.Table;
-import org.apache.hadoop.hive.serde2.typeinfo.TypeInfo;
 import org.apache.hudi.avro.HoodieAvroUtils;
 import org.apache.hudi.common.table.HoodieTableConfig;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
@@ -51,12 +55,20 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
+import static com.google.common.base.Strings.emptyToNull;
+import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.starrocks.catalog.HiveTable.HIVE_TABLE_COLUMN_NAMES;
+import static com.starrocks.catalog.HiveTable.HIVE_TABLE_COLUMN_TYPES;
+import static com.starrocks.catalog.HiveTable.HIVE_TABLE_INPUT_FORMAT;
+import static com.starrocks.catalog.HiveTable.HIVE_TABLE_SERDE_LIB;
 import static com.starrocks.catalog.HudiTable.HUDI_BASE_PATH;
 import static com.starrocks.catalog.HudiTable.HUDI_TABLE_COLUMN_NAMES;
 import static com.starrocks.catalog.HudiTable.HUDI_TABLE_COLUMN_TYPES;
@@ -64,17 +76,19 @@ import static com.starrocks.catalog.HudiTable.HUDI_TABLE_INPUT_FOAMT;
 import static com.starrocks.catalog.HudiTable.HUDI_TABLE_SERDE_LIB;
 import static com.starrocks.catalog.HudiTable.HUDI_TABLE_TYPE;
 import static com.starrocks.connector.ColumnTypeConverter.fromHudiType;
+import static com.starrocks.connector.ColumnTypeConverter.fromHudiTypeToHiveTypeString;
+import static com.starrocks.connector.hive.HiveMetadata.STARROCKS_QUERY_ID;
+import static com.starrocks.connector.hive.RemoteFileInputFormat.fromHdfsInputFormatClass;
 import static com.starrocks.server.CatalogMgr.ResourceMappingCatalog.toResourceName;
 import static java.util.Objects.requireNonNull;
+import static org.apache.hadoop.hive.common.StatsSetupConst.NUM_FILES;
 import static org.apache.hadoop.hive.common.StatsSetupConst.ROW_COUNT;
 import static org.apache.hadoop.hive.common.StatsSetupConst.TOTAL_SIZE;
-import static org.apache.hadoop.hive.serde2.typeinfo.TypeInfoUtils.getTypeInfoFromTypeString;
 
 public class HiveMetastoreApiConverter {
     private static final Logger LOG = LogManager.getLogger(HiveMetastoreApiConverter.class);
-
-    public static final IdGenerator<ConnectorTableId> CONNECTOR_ID_GENERATOR = ConnectorTableId.createGenerator();
     private static final String SPARK_SQL_SOURCE_PROVIDER = "spark.sql.sources.provider";
+    private static final Set<String> STATS_PROPERTIES = ImmutableSet.of(ROW_COUNT, TOTAL_SIZE, NUM_FILES);
 
     private static boolean isDeltaLakeTable(Map<String, String> tableParams) {
         return tableParams.containsKey(SPARK_SQL_SOURCE_PROVIDER) &&
@@ -82,7 +96,7 @@ public class HiveMetastoreApiConverter {
     }
 
     public static boolean isHudiTable(String inputFormat) {
-        return HudiTable.fromInputFormat(inputFormat) != HudiTable.HudiTableType.UNKNOWN;
+        return inputFormat != null && HudiTable.fromInputFormat(inputFormat) != HudiTable.HudiTableType.UNKNOWN;
     }
 
     public static String toTableLocation(StorageDescriptor sd, Map<String, String> tableParams) {
@@ -97,14 +111,25 @@ public class HiveMetastoreApiConverter {
         if (database == null || database.getName() == null) {
             throw new StarRocksConnectorException("Hive database [%s] doesn't exist");
         }
-        return new Database(CONNECTOR_ID_GENERATOR.getNextId().asInt(), database.getName());
+        return new Database(ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asInt(), database.getName(),
+                database.getLocationUri());
+    }
+
+    public static org.apache.hadoop.hive.metastore.api.Database toMetastoreApiDatabase(Database database) {
+        org.apache.hadoop.hive.metastore.api.Database result = new org.apache.hadoop.hive.metastore.api.Database();
+        result.setName(database.getFullName());
+        if (!Strings.isNullOrEmpty(database.getLocation())) {
+            result.setLocationUri(database.getLocation());
+        }
+
+        return result;
     }
 
     public static HiveTable toHiveTable(Table table, String catalogName) {
         validateHiveTableType(table.getTableType());
 
         HiveTable.Builder tableBuilder = HiveTable.builder()
-                .setId(CONNECTOR_ID_GENERATOR.getNextId().asInt())
+                .setId(ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asInt())
                 .setTableName(table.getTableName())
                 .setCatalogName(catalogName)
                 .setResourceName(toResourceName(catalogName, "hive"))
@@ -118,19 +143,120 @@ public class HiveMetastoreApiConverter {
                         .collect(Collectors.toList()))
                 .setFullSchema(toFullSchemasForHiveTable(table))
                 .setTableLocation(toTableLocation(table.getSd(), table.getParameters()))
+                .setProperties(toHiveProperties(table,
+                        HiveStorageFormat.get(fromHdfsInputFormatClass(table.getSd().getInputFormat()).name())))
+                .setStorageFormat(
+                        HiveStorageFormat.get(fromHdfsInputFormatClass(table.getSd().getInputFormat()).name()))
                 .setCreateTime(table.getCreateTime());
         return tableBuilder.build();
     }
 
+    public static Table toMetastoreApiTable(HiveTable table) {
+        Table apiTable = new Table();
+        apiTable.setDbName(table.getDbName());
+        apiTable.setTableName(table.getTableName());
+        apiTable.setTableType("MANAGED_TABLE");
+        apiTable.setOwner(System.getenv("HADOOP_USER_NAME"));
+        apiTable.setParameters(toApiTableProperties(table));
+        apiTable.setPartitionKeys(table.getPartitionColumns().stream()
+                .map(HiveMetastoreApiConverter::toMetastoreApiFieldSchema)
+                .collect(Collectors.toList()));
+        apiTable.setSd(makeStorageDescriptorFromHiveTable(table));
+        return apiTable;
+    }
+
+    private static StorageDescriptor makeStorageDescriptorFromHiveTable(HiveTable table) {
+        SerDeInfo serdeInfo = new SerDeInfo();
+        serdeInfo.setName(table.getTableName());
+        HiveStorageFormat storageFormat = table.getStorageFormat();
+        serdeInfo.setSerializationLib(storageFormat.getSerde());
+
+        StorageDescriptor sd = new StorageDescriptor();
+        sd.setLocation(table.getTableLocation());
+        sd.setCols(table.getDataColumnNames().stream()
+                .map(table::getColumn)
+                .map(HiveMetastoreApiConverter::toMetastoreApiFieldSchema)
+                .collect(toImmutableList()));
+        sd.setSerdeInfo(serdeInfo);
+        sd.setInputFormat(storageFormat.getInputFormat());
+        sd.setOutputFormat(storageFormat.getOutputFormat());
+        sd.setParameters(ImmutableMap.of());
+
+        return sd;
+    }
+
+    private static StorageDescriptor makeStorageDescriptorFromHivePartition(HivePartition partition) {
+        SerDeInfo serdeInfo = new SerDeInfo();
+        HiveStorageFormat hiveSd = partition.getStorage();
+        serdeInfo.setName(partition.getTableName());
+        serdeInfo.setSerializationLib(hiveSd.getSerde());
+
+        StorageDescriptor sd = new StorageDescriptor();
+        sd.setLocation(emptyToNull(partition.getLocation()));
+        sd.setCols(partition.getColumns().stream()
+                .map(HiveMetastoreApiConverter::toMetastoreApiFieldSchema)
+                .collect(toImmutableList()));
+        sd.setSerdeInfo(serdeInfo);
+        sd.setInputFormat(hiveSd.getInputFormat());
+        sd.setOutputFormat(hiveSd.getOutputFormat());
+        sd.setParameters(ImmutableMap.of());
+
+        return sd;
+    }
+
+    public static FieldSchema toMetastoreApiFieldSchema(Column column) {
+        return new FieldSchema(column.getName(), ColumnTypeConverter.toHiveType(column.getType()), column.getComment());
+    }
+
+    public static Map<String, String> toApiTableProperties(HiveTable table) {
+        ImmutableMap.Builder<String, String> tableProperties = ImmutableMap.builder();
+
+        tableProperties.put(ROW_COUNT, "0");
+        tableProperties.put(TOTAL_SIZE, "0");
+        tableProperties.put("comment", table.getComment());
+        tableProperties.put("starrocks_version", Version.STARROCKS_VERSION + "-" + Version.STARROCKS_COMMIT_HASH);
+        if (ConnectContext.get() != null && ConnectContext.get().getQueryId() != null) {
+            tableProperties.put(STARROCKS_QUERY_ID, ConnectContext.get().getQueryId().toString());
+        }
+
+        return tableProperties.build();
+    }
+
+    public static HiveView toHiveView(Table table, String catalogName) {
+        HiveView hiveView;
+        if (table.getViewOriginalText() != null && table.getViewOriginalText().startsWith(HiveView.PRESTO_VIEW_PREFIX)
+                && table.getViewOriginalText().endsWith(HiveView.PRESTO_VIEW_SUFFIX)) {
+            // for trino view
+            String hiveViewText = table.getViewOriginalText();
+            hiveViewText = hiveViewText.substring(HiveView.PRESTO_VIEW_PREFIX.length());
+            hiveViewText = hiveViewText.substring(0, hiveViewText.length() - HiveView.PRESTO_VIEW_SUFFIX.length());
+            byte[] bytes = Base64.getDecoder().decode(hiveViewText);
+            TrinoViewDefinition trinoViewDefinition = GsonUtils.GSON.fromJson(new String(bytes),
+                    TrinoViewDefinition.class);
+            hiveViewText = trinoViewDefinition.getOriginalSql();
+            hiveView = new HiveView(ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asInt(), catalogName,
+                    table.getTableName(), toFullSchemasForTrinoView(table, trinoViewDefinition), hiveViewText);
+        } else {
+            hiveView = new HiveView(ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asInt(), catalogName,
+                    table.getTableName(), toFullSchemasForHiveTable(table), table.getViewExpandedText());
+        }
+
+        try {
+            hiveView.getQueryStatementWithSRParser();
+        } catch (StarRocksPlannerException e) {
+            throw new StarRocksConnectorException("failed to parse hive view text", e);
+        }
+        return hiveView;
+    }
+
     public static HudiTable toHudiTable(Table table, String catalogName) {
         String hudiBasePath = table.getSd().getLocation();
-        // Trick
+        // using hadoop properties from catalog definition
         Configuration configuration = new Configuration();
         if (catalogName != null) {
-            HudiConnector connector = (HudiConnector) GlobalStateMgr.getCurrentState().getConnectorMgr().
-                    getConnector(catalogName);
-            CloudConfiguration cloudConfiguration = connector.getCloudConfiguration();
-            HdfsEnvironment hdfsEnvironment = new HdfsEnvironment(null, cloudConfiguration);
+            CatalogConnector connector = GlobalStateMgr.getCurrentState().getConnectorMgr().getConnector(catalogName);
+            CloudConfiguration cloudConfiguration = connector.getMetadata().getCloudConfiguration();
+            HdfsEnvironment hdfsEnvironment = new HdfsEnvironment(cloudConfiguration);
             configuration = hdfsEnvironment.getConfiguration();
         }
 
@@ -148,7 +274,7 @@ public class HiveMetastoreApiConverter {
         List<String> partitionColumnNames = toPartitionColumnNamesForHudiTable(table, hudiTableConfig);
 
         HudiTable.Builder tableBuilder = HudiTable.builder()
-                .setId(CONNECTOR_ID_GENERATOR.getNextId().asInt())
+                .setId(ConnectorTableId.CONNECTOR_ID_GENERATOR.getNextId().asInt())
                 .setTableName(table.getTableName())
                 .setCatalogName(catalogName)
                 .setResourceName(toResourceName(catalogName, "hudi"))
@@ -175,6 +301,64 @@ public class HiveMetastoreApiConverter {
         return partitionBuilder.build();
     }
 
+    public static org.apache.hadoop.hive.metastore.api.Partition toMetastoreApiPartition(
+            HivePartitionWithStats partitionWithStatistics) {
+        org.apache.hadoop.hive.metastore.api.Partition partition =
+                toMetastoreApiPartition(partitionWithStatistics.getHivePartition());
+        partition.setParameters(updateStatisticsParameters(
+                partition.getParameters(), partitionWithStatistics.getHivePartitionStats().getCommonStats()));
+        return partition;
+    }
+
+    public static org.apache.hadoop.hive.metastore.api.Partition toMetastoreApiPartition(HivePartition hivePartition) {
+        org.apache.hadoop.hive.metastore.api.Partition result = new org.apache.hadoop.hive.metastore.api.Partition();
+        result.setDbName(hivePartition.getDatabaseName());
+        result.setTableName(hivePartition.getTableName());
+        result.setValues(hivePartition.getValues());
+        result.setSd(makeStorageDescriptorFromHivePartition(hivePartition));
+        result.setParameters(hivePartition.getParameters());
+        return result;
+    }
+
+    public static Map<String, String> toHiveProperties(Table metastoreTable, HiveStorageFormat storageFormat) {
+        Map<String, String> hiveProperties = Maps.newHashMap();
+
+        String serdeLib = storageFormat.getSerde();
+        if (!Strings.isNullOrEmpty(serdeLib)) {
+            // metaStore has more accurate information about serde
+            if (metastoreTable.getSd() != null && metastoreTable.getSd().getSerdeInfo() != null &&
+                    metastoreTable.getSd().getSerdeInfo().getSerializationLib() != null) {
+                serdeLib = metastoreTable.getSd().getSerdeInfo().getSerializationLib();
+            }
+            hiveProperties.put(HIVE_TABLE_SERDE_LIB, serdeLib);
+        }
+
+        String inputFormat = storageFormat.getInputFormat();
+        if (!Strings.isNullOrEmpty(inputFormat)) {
+            hiveProperties.put(HIVE_TABLE_INPUT_FORMAT, inputFormat);
+        }
+
+        String dataColumnNames = metastoreTable.getSd().getCols().stream()
+                .map(FieldSchema::getName).collect(Collectors.joining(","));
+
+        if (!Strings.isNullOrEmpty(dataColumnNames)) {
+            hiveProperties.put(HIVE_TABLE_COLUMN_NAMES, dataColumnNames);
+        }
+
+        String dataColumnTypes = metastoreTable.getSd().getCols().stream()
+                .map(FieldSchema::getType).collect(Collectors.joining("#"));
+
+        if (!Strings.isNullOrEmpty(dataColumnTypes)) {
+            hiveProperties.put(HIVE_TABLE_COLUMN_TYPES, dataColumnTypes);
+        }
+
+        if (metastoreTable.getParameters() != null) {
+            hiveProperties.putAll(metastoreTable.getParameters());
+        }
+
+        return hiveProperties;
+    }
+
     public static List<Column> toFullSchemasForHiveTable(Table table) {
         List<FieldSchema> fieldSchemas = getAllFieldSchemas(table);
         List<Column> fullSchema = Lists.newArrayList();
@@ -187,6 +371,23 @@ public class HiveMetastoreApiConverter {
                 type = Type.UNKNOWN_TYPE;
             }
             Column column = new Column(fieldSchema.getName(), type, true);
+            fullSchema.add(column);
+        }
+        return fullSchema;
+    }
+
+    public static List<Column> toFullSchemasForTrinoView(Table table, TrinoViewDefinition definition) {
+        List<TrinoViewDefinition.ViewColumn> viewColumns = definition.getColumns();
+        List<Column> fullSchema = Lists.newArrayList();
+        for (TrinoViewDefinition.ViewColumn col : viewColumns) {
+            Type type;
+            try {
+                type = TrinoViewColumnTypeConverter.fromTrinoType(col.getType());
+            } catch (InternalError | Exception e) {
+                LOG.error("Failed to convert trino view type {} on {}", col.getType(), table.getTableName(), e);
+                type = Type.UNKNOWN_TYPE;
+            }
+            Column column = new Column(col.getName(), type, true);
             fullSchema.add(column);
         }
         return fullSchema;
@@ -273,34 +474,17 @@ public class HiveMetastoreApiConverter {
                 columnTypesBuilder.append("#");
             }
 
+            String columnName = hudiField.name().toLowerCase(Locale.ROOT);
             Optional<FieldSchema> field = allFields.stream()
-                    .filter(f -> f.getName().equals(hudiField.name().toLowerCase(Locale.ROOT))).findFirst();
+                    .filter(f -> f.getName().equals(columnName)).findFirst();
             if (!field.isPresent()) {
                 throw new StarRocksConnectorException(
                         "Hudi column [" + hudiField.name() + "] not exists in hive metastore.");
             }
+            columnNamesBuilder.append(columnName);
+            String columnType = fromHudiTypeToHiveTypeString(hudiField.schema());
+            columnTypesBuilder.append(columnType);
 
-            TypeInfo fieldInfo = getTypeInfoFromTypeString(field.get().getType());
-            columnNamesBuilder.append(field.get().getName());
-
-            String type = fieldInfo.getTypeName();
-            if (type.equals("timestamp")) {
-                Schema fieldSchema = hudiField.schema();
-                List<Schema> nonNullMembers = fieldSchema.getTypes().stream()
-                        .filter(schema -> !Schema.Type.NULL.equals(schema.getType()))
-                        .collect(Collectors.toList());
-                LogicalType logicalType = nonNullMembers.get(0).getLogicalType();
-                // INT64 based timestamp mark
-                if (logicalType instanceof LogicalTypes.TimestampMicros) {
-                    columnTypesBuilder.append("TimestampMicros");
-                } else if (logicalType instanceof LogicalTypes.TimestampMillis) {
-                    columnTypesBuilder.append("TimestampMillis");
-                } else {
-                    columnTypesBuilder.append(type);
-                }
-            } else {
-                columnTypesBuilder.append(type);
-            }
             isFirst = false;
         }
         hudiProperties.put(HUDI_TABLE_COLUMN_NAMES, columnNamesBuilder.toString());
@@ -310,15 +494,19 @@ public class HiveMetastoreApiConverter {
     }
 
     public static RemoteFileInputFormat toRemoteFileInputFormat(String inputFormat) {
-        if (!isHudiTable(inputFormat)) {
-            return RemoteFileInputFormat.fromHdfsInputFormatClass(inputFormat);
-        } else {
+        if (isHudiTable(inputFormat)) {
             // Currently, we only support parquet on hudi format.
             return RemoteFileInputFormat.PARQUET;
         }
+        return RemoteFileInputFormat.fromHdfsInputFormatClass(inputFormat);
     }
 
     public static TextFileFormatDesc toTextFileFormatDesc(Map<String, String> serdeParams) {
+        final String DEFAULT_FIELD_DELIM = "\001";
+        final String DEFAULT_COLLECTION_DELIM = "\002";
+        final String DEFAULT_MAPKEY_DELIM = "\003";
+        final String DEFAULT_LINE_DELIM = "\n";
+
         // Get properties 'field.delim', 'line.delim', 'collection.delim' and 'mapkey.delim' from StorageDescriptor
         // Detail refer to:
         // https://github.com/apache/hive/blob/90428cc5f594bd0abb457e4e5c391007b2ad1cb8/serde/src/gen/thrift/gen-javabean/org/apache/hadoop/hive/serde/serdeConstants.java#L34-L40
@@ -328,16 +516,27 @@ public class HiveMetastoreApiConverter {
         // https://issues.apache.org/jira/browse/HIVE-16922
         String collectionDelim;
         if (serdeParams.containsKey("colelction.delim")) {
-            collectionDelim = serdeParams.get("colelction.delim");
+            collectionDelim = serdeParams.getOrDefault("colelction.delim", "");
         } else {
-            collectionDelim = serdeParams.getOrDefault("collection.delim", "\002");
+            collectionDelim = serdeParams.getOrDefault("collection.delim", "");
         }
 
-        return new TextFileFormatDesc(
-                serdeParams.getOrDefault("field.delim", "\001"),
-                serdeParams.getOrDefault("line.delim", "\n"),
-                collectionDelim,
-                serdeParams.getOrDefault("mapkey.delim", "\003"));
+        String fieldDelim = serdeParams.getOrDefault("field.delim", "");
+        if (fieldDelim.isEmpty()) {
+            // Support for hive org.apache.hadoop.hive.serde2.OpenCSVSerde
+            // https://cwiki.apache.org/confluence/display/hive/csv+serde
+            fieldDelim = serdeParams.getOrDefault("separatorChar", "");
+        }
+        String lineDelim = serdeParams.getOrDefault("line.delim", "");
+        String mapkeyDelim = serdeParams.getOrDefault("mapkey.delim", "");
+
+        // check delim is empty, if it's empty, we convert it to null
+        fieldDelim = fieldDelim.isEmpty() ? null : fieldDelim;
+        lineDelim = lineDelim.isEmpty() ? null : lineDelim;
+        collectionDelim = collectionDelim.isEmpty() ? null : collectionDelim;
+        mapkeyDelim = mapkeyDelim.isEmpty() ? null : mapkeyDelim;
+
+        return new TextFileFormatDesc(fieldDelim, lineDelim, collectionDelim, mapkeyDelim);
     }
 
     public static HiveCommonStats toHiveCommonStats(Map<String, String> params) {
@@ -371,13 +570,32 @@ public class HiveMetastoreApiConverter {
         return hiveColumnStatistics;
     }
 
+    public static Map<String, String> updateStatisticsParameters(Map<String, String> parameters,
+                                                                 HiveCommonStats statistics) {
+        ImmutableMap.Builder<String, String> result = ImmutableMap.builder();
+
+        parameters.forEach((key, value) -> {
+            if (!(STATS_PROPERTIES.contains(key))) {
+                result.put(key, value);
+            }
+        });
+
+        result.put(ROW_COUNT, String.valueOf(statistics.getRowNums()));
+        result.put(TOTAL_SIZE, String.valueOf(statistics.getTotalFileBytes()));
+
+        if (!parameters.containsKey("STATS_GENERATED_VIA_STATS_TASK")) {
+            result.put("STATS_GENERATED_VIA_STATS_TASK", "workaround for potential lack of HIVE-12730");
+        }
+
+        return result.buildOrThrow();
+    }
+
     public static void validateHiveTableType(String hiveTableType) {
         if (hiveTableType == null) {
             throw new StarRocksConnectorException("Unknown hive table type.");
         }
         switch (hiveTableType.toUpperCase(Locale.ROOT)) {
-            case "VIRTUAL_VIEW": // hive view table not supported
-                throw new StarRocksConnectorException("Hive view table is not supported.");
+            case "VIRTUAL_VIEW": // hive view supported
             case "EXTERNAL_TABLE": // hive external table supported
             case "MANAGED_TABLE": // basic hive table supported
             case "MATERIALIZED_VIEW": // hive materialized view table supported

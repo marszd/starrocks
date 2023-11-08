@@ -22,6 +22,7 @@
 #include "column/column_helper.h"
 #include "common/status.h"
 #include "exprs/agg/count.h"
+#include "exprs/agg/window.h"
 #include "exprs/anyval_util.h"
 #include "exprs/expr.h"
 #include "exprs/expr_context.h"
@@ -29,6 +30,7 @@
 #include "gutil/strings/substitute.h"
 #include "runtime/current_thread.h"
 #include "runtime/runtime_state.h"
+#include "types/logical_type.h"
 #include "udf/java/utils.h"
 #include "util/defer_op.h"
 #include "util/runtime_profile.h"
@@ -38,8 +40,11 @@ Status window_init_jvm_context(int64_t fid, const std::string& url, const std::s
                                const std::string& symbol, FunctionContext* context);
 
 Analytor::Analytor(const TPlanNode& tnode, const RowDescriptor& child_row_desc,
-                   const TupleDescriptor* result_tuple_desc)
-        : _tnode(tnode), _child_row_desc(child_row_desc), _result_tuple_desc(result_tuple_desc) {
+                   const TupleDescriptor* result_tuple_desc, bool use_hash_based_partition)
+        : _tnode(tnode),
+          _child_row_desc(child_row_desc),
+          _result_tuple_desc(result_tuple_desc),
+          _use_hash_based_partition(use_hash_based_partition) {
     if (tnode.analytic_node.__isset.buffered_tuple_id) {
         _buffered_tuple_id = tnode.analytic_node.buffered_tuple_id;
     }
@@ -105,10 +110,12 @@ Status Analytor::prepare(RuntimeState* state, ObjectPool* pool, RuntimeProfile* 
     _agg_intput_columns.resize(agg_size);
     _agg_fn_types.resize(agg_size);
     _agg_states_offsets.resize(agg_size);
+    _partition_size_required_function_index.resize(0);
 
     bool has_outer_join_child = analytic_node.__isset.has_outer_join_child && analytic_node.has_outer_join_child;
 
     _has_lead_lag_function = false;
+    _should_set_partition_size = false;
     for (int i = 0; i < agg_size; ++i) {
         const TExpr& desc = analytic_node.analytic_functions[i];
         const TFunction& fn = desc.nodes[0].fn;
@@ -133,6 +140,16 @@ Status Analytor::prepare(RuntimeState* state, ObjectPool* pool, RuntimeProfile* 
             _need_partition_materializing = true;
         }
 
+        if (require_partition_size(fn.name.function_name)) {
+            if (!state->enable_pipeline_engine()) {
+                return Status::NotSupported(strings::Substitute(
+                        "The $0 window function is only supported by the pipeline engine.", fn.name.function_name));
+            }
+            _should_set_partition_size = true;
+            _partition_size_required_function_index.emplace_back(i);
+            _need_partition_materializing = true;
+        }
+
         if (fn.name.function_name == "sum" || fn.name.function_name == "avg" || fn.name.function_name == "count") {
             if (state->enable_pipeline_engine()) {
                 _support_cumulative_algo = true;
@@ -142,12 +159,17 @@ Status Analytor::prepare(RuntimeState* state, ObjectPool* pool, RuntimeProfile* 
         bool is_input_nullable = false;
         if (fn.name.function_name == "count" || fn.name.function_name == "row_number" ||
             fn.name.function_name == "rank" || fn.name.function_name == "dense_rank" ||
+            fn.name.function_name == "cume_dist" || fn.name.function_name == "percent_rank" ||
             fn.name.function_name == "ntile") {
+            auto return_type = TYPE_BIGINT;
+            if (fn.name.function_name == "cume_dist" || fn.name.function_name == "percent_rank") {
+                return_type = TYPE_DOUBLE;
+            }
             is_input_nullable = !fn.arg_types.empty() && (desc.nodes[0].has_nullable_child || has_outer_join_child);
-            auto* func = get_window_function(fn.name.function_name, TYPE_BIGINT, TYPE_BIGINT, is_input_nullable,
+            auto* func = get_window_function(fn.name.function_name, TYPE_BIGINT, return_type, is_input_nullable,
                                              fn.binary_type, state->func_version());
             _agg_functions[i] = func;
-            _agg_fn_types[i] = {TypeDescriptor(TYPE_BIGINT), false, false};
+            _agg_fn_types[i] = {TypeDescriptor(return_type), false, false};
             // count(*) no input column, we manually resize it to 1 to process count(*)
             // like other agg function.
             _agg_intput_columns[i].resize(1);
@@ -180,16 +202,17 @@ Status Analytor::prepare(RuntimeState* state, ObjectPool* pool, RuntimeProfile* 
             func = get_window_function(real_fn_name, arg_type.type, return_type.type, is_input_nullable, fn.binary_type,
                                        state->func_version());
             if (func == nullptr) {
-                return Status::InternalError(strings::Substitute("Invalid window function plan: $0", real_fn_name));
+                return Status::InternalError(strings::Substitute(
+                        "Invalid window function plan: ($0, $1, $2, $3, $4, $5)", real_fn_name, arg_type.type,
+                        return_type.type, is_input_nullable, fn.binary_type, state->func_version()));
             }
             _agg_functions[i] = func;
             _agg_fn_types[i] = {return_type, is_input_nullable, desc.nodes[0].is_nullable};
         }
 
         for (size_t j = 0; j < _agg_expr_ctxs[i].size(); ++j) {
-            // Currently, only lead and lag window function have multi args.
-            // For performance, we do this special handle.
-            // In future, if need, we could remove this if else easily.
+            // we always treat first argument as non const, because most window function has only one args
+            // and cant't handler const column within the function
             if (j == 0) {
                 _agg_intput_columns[i][j] =
                         ColumnHelper::create_column(_agg_expr_ctxs[i][j]->root()->type(), is_input_nullable);
@@ -248,7 +271,7 @@ Status Analytor::prepare(RuntimeState* state, ObjectPool* pool, RuntimeProfile* 
     DCHECK_EQ(_result_tuple_desc->slots().size(), _agg_functions.size());
 
     for (const auto& ctx : _agg_expr_ctxs) {
-        Expr::prepare(ctx, state);
+        RETURN_IF_ERROR(Expr::prepare(ctx, state));
     }
 
     if (!_partition_ctxs.empty() || !_order_ctxs.empty()) {
@@ -280,6 +303,7 @@ Status Analytor::open(RuntimeState* state) {
     RETURN_IF_ERROR(Expr::open(_order_ctxs, state));
     for (int i = 0; i < _agg_fn_ctxs.size(); ++i) {
         RETURN_IF_ERROR(Expr::open(_agg_expr_ctxs[i], state));
+        RETURN_IF_ERROR(_evaluate_const_columns(i));
     }
 
     _has_udaf = std::any_of(_fns.begin(), _fns.end(),
@@ -339,9 +363,9 @@ void Analytor::close(RuntimeState* state) {
 
     if (_has_udaf) {
         auto promise_st = call_function_in_pthread(state, agg_close);
-        promise_st->get_future().get();
+        (void)promise_st->get_future().get();
     } else {
-        agg_close();
+        (void)agg_close();
     }
 }
 
@@ -352,6 +376,10 @@ size_t Analytor::current_chunk_size() const {
 bool Analytor::is_chunk_buffer_empty() {
     std::lock_guard<std::mutex> l(_buffer_mutex);
     return _buffer.empty();
+}
+
+bool Analytor::is_chunk_buffer_full() {
+    return _buffer.size() >= config::pipeline_analytic_max_buffer_size;
 }
 
 ChunkPtr Analytor::poll_chunk_buffer() {
@@ -441,7 +469,11 @@ void Analytor::create_agg_result_columns(int64_t chunk_size) {
             // binary column cound't call resize method like Numeric Column,
             // so we only reserve it.
             if (_agg_fn_types[i].result_type.type == LogicalType::TYPE_CHAR ||
-                _agg_fn_types[i].result_type.type == LogicalType::TYPE_VARCHAR) {
+                _agg_fn_types[i].result_type.type == LogicalType::TYPE_VARCHAR ||
+                _agg_fn_types[i].result_type.type == LogicalType::TYPE_JSON ||
+                _agg_fn_types[i].result_type.type == LogicalType::TYPE_ARRAY ||
+                _agg_fn_types[i].result_type.type == LogicalType::TYPE_MAP ||
+                _agg_fn_types[i].result_type.type == LogicalType::TYPE_STRUCT) {
                 _result_window_columns[i]->reserve(chunk_size);
             } else {
                 _result_window_columns[i]->resize(chunk_size);
@@ -455,29 +487,35 @@ Status Analytor::add_chunk(const ChunkPtr& chunk) {
     const size_t chunk_size = chunk->num_rows();
 
     {
+        auto check_if_overflow = [](Column* column) {
+            std::string msg;
+            if (column->capacity_limit_reached(&msg)) {
+                return Status::InternalError(msg);
+            }
+            return Status::OK();
+        };
         SCOPED_TIMER(_column_resize_timer);
         for (size_t i = 0; i < _agg_fn_ctxs.size(); i++) {
             for (size_t j = 0; j < _agg_expr_ctxs[i].size(); j++) {
                 ASSIGN_OR_RETURN(ColumnPtr column, _agg_expr_ctxs[i][j]->evaluate(chunk.get()));
-                // Currently, only lead and lag window function have multi args.
-                // For performance, we do this special handle.
-                // In future, if need, we could remove this if else easily.
-                if (j == 0) {
-                    TRY_CATCH_BAD_ALLOC(_append_column(chunk_size, _agg_intput_columns[i][j].get(), column));
-                } else {
-                    TRY_CATCH_BAD_ALLOC(_agg_intput_columns[i][j]->append(*column, 0, column->size()));
-                }
+
+                // when chunk's column is const, maybe need to unpack it
+                TRY_CATCH_BAD_ALLOC(_append_column(chunk_size, _agg_intput_columns[i][j].get(), column));
+
+                RETURN_IF_ERROR(check_if_overflow(_agg_intput_columns[i][j].get()));
             }
         }
 
         for (size_t i = 0; i < _partition_ctxs.size(); i++) {
             ASSIGN_OR_RETURN(ColumnPtr column, _partition_ctxs[i]->evaluate(chunk.get()));
             TRY_CATCH_BAD_ALLOC(_append_column(chunk_size, _partition_columns[i].get(), column));
+            RETURN_IF_ERROR(check_if_overflow(_partition_columns[i].get()));
         }
 
         for (size_t i = 0; i < _order_ctxs.size(); i++) {
             ASSIGN_OR_RETURN(ColumnPtr column, _order_ctxs[i]->evaluate(chunk.get()));
             TRY_CATCH_BAD_ALLOC(_append_column(chunk_size, _order_columns[i].get(), column));
+            RETURN_IF_ERROR(check_if_overflow(_order_columns[i].get()));
         }
     }
 
@@ -488,14 +526,33 @@ Status Analytor::add_chunk(const ChunkPtr& chunk) {
     return Status::OK();
 }
 
+Status Analytor::_evaluate_const_columns(int i) {
+    if (i >= _agg_fn_ctxs.size() || _agg_fn_ctxs[i] == nullptr) {
+        // Only agg fn has this context
+        return Status::OK();
+    }
+    std::vector<ColumnPtr> const_columns;
+    const_columns.reserve(_agg_expr_ctxs[i].size());
+    for (auto& j : _agg_expr_ctxs[i]) {
+        ASSIGN_OR_RETURN(auto col, j->root()->evaluate_const(j));
+        const_columns.emplace_back(std::move(col));
+    }
+    _agg_fn_ctxs[i]->set_constant_columns(const_columns);
+    return Status::OK();
+}
+
 void Analytor::_append_column(size_t chunk_size, Column* dst_column, ColumnPtr& src_column) {
+    DCHECK(!(src_column->is_constant() && dst_column->is_constant() && (!dst_column->empty()) &&
+             (!src_column->empty()) && (src_column->compare_at(0, 0, *dst_column, 1) != 0)));
     if (src_column->only_null()) {
         static_cast<void>(dst_column->append_nulls(chunk_size));
-    } else if (src_column->is_constant()) {
-        auto* const_column = static_cast<ConstColumn*>(src_column.get());
+    } else if (src_column->is_constant() && !dst_column->is_constant()) {
+        // unpack const column, then append it to dst
+        auto* const_column = down_cast<ConstColumn*>(src_column.get());
         const_column->data_column()->assign(chunk_size, 0);
         dst_column->append(*const_column->data_column(), 0, chunk_size);
     } else {
+        // most of case
         dst_column->append(*src_column, 0, chunk_size);
     }
 }
@@ -507,7 +564,7 @@ bool Analytor::is_new_partition() {
             ((_partition_end == 0) | (_partition_end != _found_partition_end.second)));
 }
 
-int64_t Analytor::get_total_position(int64_t local_position) {
+int64_t Analytor::get_total_position(int64_t local_position) const {
     return _removed_from_buffer_rows + local_position;
 }
 
@@ -538,9 +595,14 @@ void Analytor::find_partition_end() {
     _found_partition_end.second = static_cast<int64_t>(_partition_columns[0]->size());
     {
         SCOPED_TIMER(_partition_search_timer);
-        for (auto& column : _partition_columns) {
+        if (_use_hash_based_partition) {
             _found_partition_end.second =
-                    _find_first_not_equal(column.get(), _partition_end, start, _found_partition_end.second);
+                    _find_first_not_equal_for_hash_based_partition(_partition_end, start, _found_partition_end.second);
+        } else {
+            for (auto& column : _partition_columns) {
+                _found_partition_end.second =
+                        _find_first_not_equal(column.get(), _partition_end, start, _found_partition_end.second);
+            }
         }
     }
 
@@ -629,6 +691,13 @@ void Analytor::reset_state_for_next_partition() {
     DCHECK_GE(_current_row_position, 0);
 }
 
+void Analytor::set_partition_size_for_function() {
+    for (auto i : _partition_size_required_function_index) {
+        auto& state = *reinterpret_cast<CumeDistState*>(_managed_fn_states[0]->mutable_data() + _agg_states_offsets[i]);
+        state.count = _partition_end - _partition_start;
+    }
+}
+
 void Analytor::remove_unused_buffer_values(RuntimeState* state) {
     if (_input_chunks.size() <= _output_chunk_index ||
         _input_chunk_first_row_positions[_output_chunk_index] - _removed_from_buffer_rows <
@@ -655,6 +724,10 @@ void Analytor::remove_unused_buffer_values(RuntimeState* state) {
         }
         for (size_t i = 0; i < _order_ctxs.size(); i++) {
             _order_columns[i]->remove_first_n_values(remove_count);
+        }
+        for (size_t i = 0; i < _agg_fn_ctxs.size(); i++) {
+            _agg_functions[i]->reset_state_for_contraction(
+                    _agg_fn_ctxs[i], _managed_fn_states[0]->mutable_data() + _agg_states_offsets[i], remove_count);
         }
     }
 
@@ -688,10 +761,15 @@ std::string Analytor::debug_string() const {
     std::stringstream ss;
     ss << std::boolalpha;
 
-    ss << "current_row_position=" << _current_row_position << ", partition=(" << _partition_start << ", "
-       << _partition_end << ", " << _found_partition_end.second << "/" << _found_partition_end.first
-       << "), peer_group=(" << _peer_group_start << ", " << _peer_group_end << ")"
-       << ", frame=(" << _rows_start_offset << ", " << _rows_end_offset << ")";
+    ss << "current_row_position=" << get_total_position(_current_row_position) << ", partition=("
+       << get_total_position(_partition_start) << ", " << get_total_position(_partition_end) << ", "
+       << get_total_position(_found_partition_end.second) << "/" << _found_partition_end.first << "), peer_group=("
+       << get_total_position(_peer_group_start) << ", " << get_total_position(_peer_group_end) << ", "
+       << get_total_position(_found_peer_group_end.second) << "/" << _found_peer_group_end.first << ")"
+       << ", frame=(" << _rows_start_offset << ", " << _rows_end_offset << ")"
+       << ", input_chunks_size=" << _input_chunks.size() << ", output_chunk_index=" << _output_chunk_index
+       << ", removed_from_buffer_rows=" << _removed_from_buffer_rows
+       << ", removed_chunk_index=" << _removed_chunk_index;
 
     return ss.str();
 }
@@ -720,13 +798,18 @@ void Analytor::_update_window_batch_lead_lag(int64_t peer_group_start, int64_t p
 void Analytor::_update_window_batch_normal(int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
                                            int64_t frame_end) {
     for (size_t i = 0; i < _agg_fn_ctxs.size(); i++) {
-        const Column* agg_column = _agg_intput_columns[i][0].get();
+        size_t column_size = _agg_intput_columns[i].size();
+        const Column* data_columns[column_size];
+        for (size_t j = 0; j < column_size; j++) {
+            data_columns[j] = _agg_intput_columns[i][j].get();
+        }
+
         frame_start = std::max<int64_t>(frame_start, _partition_start);
         // for rows betweend unbounded preceding and current row, we have not found the partition end, for others,
         // _found_partition_end = _partition_end, so we use _found_partition_end instead of _partition_end
         frame_end = std::min<int64_t>(frame_end, _found_partition_end.second);
         _agg_functions[i]->update_batch_single_state_with_frame(
-                _agg_fn_ctxs[i], _managed_fn_states[0]->mutable_data() + _agg_states_offsets[i], &agg_column,
+                _agg_fn_ctxs[i], _managed_fn_states[0]->mutable_data() + _agg_states_offsets[i], data_columns,
                 peer_group_start, peer_group_end, frame_start, frame_end);
     }
 }
@@ -753,6 +836,32 @@ int64_t Analytor::_find_first_not_equal(Column* column, int64_t target, int64_t 
         }
     }
     if (column->compare_at(target, end - 1, *column, 1) == 0) {
+        return end;
+    }
+    return end - 1;
+}
+
+int64_t Analytor::_find_first_not_equal_for_hash_based_partition(int64_t target, int64_t start, int64_t end) {
+    // In this case, we cannot compare each column one by one like Analytor::_find_first_not_equal does,
+    // and we must compare all the partition columns for one comparation
+    auto compare = [this](size_t left, size_t right) {
+        for (auto& column : _partition_columns) {
+            auto res = column->compare_at(left, right, *column, 1);
+            if (res != 0) {
+                return res;
+            }
+        }
+        return 0;
+    };
+    while (start + 1 < end) {
+        int64_t mid = start + (end - start) / 2;
+        if (compare(target, mid) == 0) {
+            start = mid;
+        } else {
+            end = mid;
+        }
+    }
+    if (compare(target, end - 1) == 0) {
         return end;
     }
     return end - 1;
@@ -794,7 +903,8 @@ void Analytor::_find_candidate_peer_group_ends() {
 
 AnalytorPtr AnalytorFactory::create(int i) {
     if (!_analytors[i]) {
-        _analytors[i] = std::make_shared<Analytor>(_tnode, _child_row_desc, _result_tuple_desc);
+        _analytors[i] =
+                std::make_shared<Analytor>(_tnode, _child_row_desc, _result_tuple_desc, _use_hash_based_partition);
     }
     return _analytors[i];
 }

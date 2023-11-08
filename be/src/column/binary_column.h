@@ -35,35 +35,36 @@ public:
 
     using Bytes = starrocks::raw::RawVectorPad16<uint8_t>;
 
-    using Container = Buffer<Slice>;
-
     struct BinaryDataProxyContainer {
         BinaryDataProxyContainer(const BinaryColumnBase& column) : _column(column) {}
 
         Slice operator[](size_t index) const { return _column.get_slice(index); }
 
-        size_t size() { return _column.size(); }
+        size_t size() const { return _column.size(); }
 
     private:
         const BinaryColumnBase& _column;
     };
 
+    using Container = Buffer<Slice>;
+    using ProxyContainer = BinaryDataProxyContainer;
+
     // TODO(kks): when we create our own vector, we could let vector[-1] = 0,
     // and then we don't need explicitly emplace_back zero value
-    BinaryColumnBase<T>() { _offsets.emplace_back(0); }
+    BinaryColumnBase() { _offsets.emplace_back(0); }
     // Default value is empty string
-    explicit BinaryColumnBase<T>(size_t size) : _offsets(size + 1, 0) {}
-    BinaryColumnBase<T>(Bytes bytes, Offsets offsets) : _bytes(std::move(bytes)), _offsets(std::move(offsets)) {
+    explicit BinaryColumnBase(size_t size) : _offsets(size + 1, 0) {}
+    BinaryColumnBase(Bytes bytes, Offsets offsets) : _bytes(std::move(bytes)), _offsets(std::move(offsets)) {
         if (_offsets.empty()) {
             _offsets.emplace_back(0);
         }
     }
 
     // NOTE: do *NOT* copy |_slices|
-    BinaryColumnBase<T>(const BinaryColumnBase<T>& rhs) : _bytes(rhs._bytes), _offsets(rhs._offsets) {}
+    BinaryColumnBase(const BinaryColumnBase<T>& rhs) : _bytes(rhs._bytes), _offsets(rhs._offsets) {}
 
     // NOTE: do *NOT* copy |_slices|
-    BinaryColumnBase<T>(BinaryColumnBase<T>&& rhs) noexcept
+    BinaryColumnBase(BinaryColumnBase<T>&& rhs) noexcept
             : _bytes(std::move(rhs._bytes)), _offsets(std::move(rhs._offsets)) {}
 
     BinaryColumnBase<T>& operator=(const BinaryColumnBase<T>& rhs) {
@@ -84,7 +85,15 @@ public:
 
     bool has_large_column() const override;
 
-    ~BinaryColumnBase<T>() override {
+    ~BinaryColumnBase() override {
+#ifndef NDEBUG
+        // sometimes we may fill _bytes and _offsets separately and resize them in the final stage,
+        // if an exception is thrown in the middle process, _offsets maybe inconsistent with _bytes,
+        // we should skip the check.
+        if (std::uncaught_exception()) {
+            return;
+        }
+#endif
         if (!_offsets.empty()) {
             DCHECK_EQ(_bytes.size(), _offsets.back());
         } else {
@@ -92,7 +101,6 @@ public:
         }
     }
 
-    bool low_cardinality() const override { return false; }
     bool is_binary() const override { return std::is_same_v<T, uint32_t> != 0; }
     bool is_large_binary() const override { return std::is_same_v<T, uint64_t> != 0; }
 
@@ -216,7 +224,7 @@ public:
 
     void fill_default(const Filter& filter) override;
 
-    Status update_rows(const Column& src, const uint32_t* indexes) override;
+    void update_rows(const Column& src, const uint32_t* indexes) override;
 
     uint32_t max_one_element_serialize_size() const override;
 
@@ -290,9 +298,7 @@ public:
         return _bytes.capacity() + _offsets.capacity() * sizeof(_offsets[0]) + _slices.capacity() * sizeof(_slices[0]);
     }
 
-    size_t element_memory_usage(size_t from, size_t size) const override {
-        return _offsets[from + size] - _offsets[from] + size * sizeof(T);
-    }
+    size_t reference_memory_usage(size_t from, size_t size) const override { return 0; }
 
     void swap_column(Column& rhs) override {
         auto& r = down_cast<BinaryColumnBase<T>&>(rhs);
@@ -317,15 +323,13 @@ public:
 
     std::string debug_item(size_t idx) const override;
 
+    std::string raw_item_value(size_t idx) const override;
+
     std::string debug_string() const override {
         std::stringstream ss;
         size_t size = this->size();
-        if (size == 0) {
-            return "[]";
-        }
-
         ss << "[";
-        for (size_t i = 0; i < size - 1; i++) {
+        for (size_t i = 0; i + 1 < size; ++i) {
             ss << debug_item(i) << ", ";
         }
         if (size > 0) {

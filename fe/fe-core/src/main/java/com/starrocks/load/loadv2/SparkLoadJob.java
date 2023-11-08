@@ -67,7 +67,6 @@ import com.starrocks.common.Config;
 import com.starrocks.common.DataQualityException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.DuplicatedRequestException;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.LabelAlreadyUsedException;
 import com.starrocks.common.LoadException;
 import com.starrocks.common.MetaNotFoundException;
@@ -87,8 +86,10 @@ import com.starrocks.metric.TableMetricsRegistry;
 import com.starrocks.qe.OriginStatement;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.FrontendOptions;
+import com.starrocks.sql.ast.LoadStmt;
 import com.starrocks.sql.ast.ResourceDesc;
 import com.starrocks.system.Backend;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.task.AgentBatchTask;
 import com.starrocks.task.AgentTaskExecutor;
 import com.starrocks.task.AgentTaskQueue;
@@ -96,6 +97,7 @@ import com.starrocks.task.PushTask;
 import com.starrocks.thrift.TBrokerRangeDesc;
 import com.starrocks.thrift.TBrokerScanRange;
 import com.starrocks.thrift.TBrokerScanRangeParams;
+import com.starrocks.thrift.TColumn;
 import com.starrocks.thrift.TDescriptorTable;
 import com.starrocks.thrift.TFileFormatType;
 import com.starrocks.thrift.TFileType;
@@ -103,9 +105,11 @@ import com.starrocks.thrift.THdfsProperties;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TPriority;
 import com.starrocks.thrift.TPushType;
+import com.starrocks.thrift.TReportExecStatusParams;
 import com.starrocks.thrift.TTabletType;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.transaction.BeginTransactionException;
+import com.starrocks.transaction.CommitRateExceededException;
 import com.starrocks.transaction.TabletCommitInfo;
 import com.starrocks.transaction.TabletQuorumFailedException;
 import com.starrocks.transaction.TransactionState;
@@ -119,6 +123,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -137,22 +142,30 @@ public class SparkLoadJob extends BulkLoadJob {
 
     // --- members below need persist ---
     // create from resourceDesc when job created
+    @SerializedName("spkr")
     private SparkResource sparkResource;
     // members below updated when job state changed to etl
+    @SerializedName("etlt")
     private long etlStartTimestamp = -1;
     // for spark yarn
+    @SerializedName("appi")
     private String appId = "";
     // spark job outputPath
+    @SerializedName("etlo")
     private String etlOutputPath = "";
     // members below updated when job state changed to loading
     // { tableId.partitionId.indexId.bucket.schemaHash -> (etlFilePath, etlFileSize) }
+    @SerializedName("tbtm")
     private Map<String, Pair<String, Long>> tabletMetaToFileInfo = Maps.newHashMap();
+    @SerializedName("spkh")
     private SparkLoadAppHandle sparkLoadAppHandle = new SparkLoadAppHandle();
 
     // --- members below not persist ---
     private ResourceDesc resourceDesc;
     // for straggler wait long time to commit transaction
     private long quorumFinishTimestamp = -1;
+    // spark load wait yarn response timeout
+    protected long sparkLoadSubmitTimeoutSecond = Config.spark_load_submit_timeout_second;
     // below for push task
     private final Map<Long, Set<Long>> tableToLoadPartitions = Maps.newHashMap();
     private final Map<Long, PushBrokerReaderParams> indexToPushBrokerReaderParams = Maps.newHashMap();
@@ -179,6 +192,14 @@ public class SparkLoadJob extends BulkLoadJob {
     @Override
     protected void setJobProperties(Map<String, String> properties) throws DdlException {
         super.setJobProperties(properties);
+
+        if (properties.containsKey(LoadStmt.SPARK_LOAD_SUBMIT_TIMEOUT)) {
+            try {
+                sparkLoadSubmitTimeoutSecond = Long.parseLong(properties.get(LoadStmt.SPARK_LOAD_SUBMIT_TIMEOUT));
+            } catch (NumberFormatException e) {
+                throw new DdlException("spark_load_submit_timeout is not LONG", e);
+            }
+        }
 
         // set spark resource and broker desc
         setResourceInfo();
@@ -344,8 +365,11 @@ public class SparkLoadJob extends BulkLoadJob {
             long dummyBackendId = -1L;
             loadingStatus.getLoadStatistic()
                     .initLoad(dummyId, Sets.newHashSet(dummyId), Lists.newArrayList(dummyBackendId));
+            TReportExecStatusParams params = new TReportExecStatusParams();
+            params.setDone(true);
+            params.setSource_load_rows(dppResult.scannedRows);
             loadingStatus.getLoadStatistic()
-                    .updateLoadProgress(dummyBackendId, dummyId, dummyId, dppResult.scannedRows, true);
+                    .updateLoadProgress(params);
 
             Map<String, String> counters = loadingStatus.getCounters();
             counters.put(DPP_NORMAL_ALL, String.valueOf(dppResult.normalRows));
@@ -483,6 +507,11 @@ public class SparkLoadJob extends BulkLoadJob {
                             long indexId = index.getId();
                             int schemaHash = indexToSchemaHash.get(indexId);
 
+                            List<TColumn> columnsDesc = new ArrayList<TColumn>();
+                            for (Column column : table.getSchemaByIndexId(indexId)) {
+                                columnsDesc.add(column.toThrift());
+                            }
+
                             int bucket = 0;
                             for (Tablet tablet : index.getTablets()) {
                                 long tabletId = tablet.getId();
@@ -499,12 +528,13 @@ public class SparkLoadJob extends BulkLoadJob {
                                         long replicaId = replica.getId();
                                         tabletAllReplicas.add(replicaId);
                                         long backendId = replica.getBackendId();
-                                        Backend backend = GlobalStateMgr.getCurrentState().getCurrentSystemInfo()
+                                        Backend backend = GlobalStateMgr.getCurrentSystemInfo()
                                                 .getBackend(backendId);
 
                                         pushTask(backendId, tableId, partitionId, indexId, tabletId,
                                                 replicaId, schemaHash, params, batchTask, tabletMetaStr,
-                                                backend, replica, tabletFinishedReplicas, TTabletType.TABLET_TYPE_DISK);
+                                                backend, replica, tabletFinishedReplicas,
+                                                TTabletType.TABLET_TYPE_DISK, columnsDesc);
                                     }
 
                                     if (tabletAllReplicas.size() == 0) {
@@ -521,9 +551,10 @@ public class SparkLoadJob extends BulkLoadJob {
 
                                 } else {
                                     // lake tablet
-                                    long backendId = ((LakeTablet) tablet).getPrimaryBackendId();
-                                    Backend backend = GlobalStateMgr.getCurrentSystemInfo().
-                                            getBackend(backendId);
+                                    long backendId = ((LakeTablet) tablet).getPrimaryComputeNodeId();
+                                    // TODO: need to refactor after be split into cn + dn
+                                    ComputeNode backend = GlobalStateMgr.getCurrentSystemInfo().
+                                            getBackendOrComputeNode(backendId);
                                     if (backend == null) {
                                         LOG.warn("replica {} not exists", backendId);
                                         continue;
@@ -532,7 +563,7 @@ public class SparkLoadJob extends BulkLoadJob {
                                     pushTask(backend.getId(), tableId, partitionId, indexId, tabletId,
                                             tabletId, schemaHash, params, batchTask, tabletMetaStr,
                                             backend, new Replica(tabletId, backendId, -1, NORMAL),
-                                            tabletFinishedReplicas, TTabletType.TABLET_TYPE_LAKE);
+                                            tabletFinishedReplicas, TTabletType.TABLET_TYPE_LAKE, columnsDesc);
 
                                     if (tabletFinishedReplicas.contains(tabletId)) {
                                         quorumTablets.add(tabletId);
@@ -571,8 +602,8 @@ public class SparkLoadJob extends BulkLoadJob {
                           PushBrokerReaderParams params,
                           AgentBatchTask batchTask,
                           String tabletMetaStr,
-                          Backend backend, Replica replica, Set<Long> tabletFinishedReplicas,
-                          TTabletType tabletType)
+                          ComputeNode backend, Replica replica, Set<Long> tabletFinishedReplicas,
+                          TTabletType tabletType, List<TColumn> columnDesc)
             throws AnalysisException {
 
         if (!tabletToSentReplicaPushTask.containsKey(tabletId)
@@ -617,7 +648,7 @@ public class SparkLoadJob extends BulkLoadJob {
                     0, id, TPushType.LOAD_V2,
                     TPriority.NORMAL, transactionId, taskSignature,
                     tBrokerScanRange, params.tDescriptorTable,
-                    timezone, tabletType);
+                    timezone, tabletType, columnDesc);
             if (AgentTaskQueue.addTask(pushTask)) {
                 batchTask.addTask(pushTask);
                 if (!tabletToSentReplicaPushTask.containsKey(tabletId)) {
@@ -710,8 +741,9 @@ public class SparkLoadJob extends BulkLoadJob {
                     dbId, transactionId, commitInfos, Lists.newArrayList(),
                     new LoadJobFinalOperation(id, loadingStatus, progress, loadStartTimestamp,
                             finishTimestamp, state, failMsg));
-        } catch (TabletQuorumFailedException e) {
+        } catch (TabletQuorumFailedException | CommitRateExceededException e) {
             // retry in next loop
+            LOG.info("Failed commit for txn {}, will retry. Error: {}", transactionId, e.getMessage());
         } finally {
             db.writeUnlock();
         }
@@ -857,9 +889,7 @@ public class SparkLoadJob extends BulkLoadJob {
     public void readFields(DataInput in) throws IOException {
         super.readFields(in);
         sparkResource = (SparkResource) Resource.read(in);
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_91) {
-            sparkLoadAppHandle = SparkLoadAppHandle.read(in);
-        }
+        sparkLoadAppHandle = SparkLoadAppHandle.read(in);
         etlStartTimestamp = in.readLong();
         appId = Text.readString(in);
         etlOutputPath = Text.readString(in);

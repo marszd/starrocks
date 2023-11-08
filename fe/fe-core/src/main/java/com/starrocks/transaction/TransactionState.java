@@ -40,12 +40,12 @@ import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.common.Config;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.TraceManager;
 import com.starrocks.common.UserException;
 import com.starrocks.common.io.Text;
@@ -142,7 +142,8 @@ public class TransactionState implements Writable {
         TIMEOUT,
         OFFSET_OUT_OF_RANGE,
         PAUSE,
-        NO_PARTITIONS;
+        NO_PARTITIONS,
+        FILTERED_ROWS;
 
         public static TxnStatusChangeReason fromString(String reasonString) {
             if (Strings.isNullOrEmpty(reasonString)) {
@@ -164,6 +165,8 @@ public class TransactionState implements Writable {
                     return "Offset out of range";
                 case NO_PARTITIONS:
                     return "all partitions have no load data";
+                case FILTERED_ROWS:
+                    return "too many filtered rows";
                 default:
                     return this.name();
             }
@@ -197,7 +200,9 @@ public class TransactionState implements Writable {
     }
 
     public static class TxnCoordinator {
+        @SerializedName("st")
         public TxnSourceType sourceType;
+        @SerializedName("ip")
         public String ip;
 
         public TxnCoordinator() {
@@ -219,30 +224,45 @@ public class TransactionState implements Writable {
         }
     }
 
+    @SerializedName("dd")
     private long dbId;
+    @SerializedName("tl")
     private List<Long> tableIdList;
+    @SerializedName("tx")
     private long transactionId;
+    @SerializedName("lb")
     private String label;
     // requestId is used to judge whether a begin request is an internal retry request.
     // no need to persist it.
     private TUniqueId requestId;
+    @SerializedName("ci")
     private final Map<Long, TableCommitInfo> idToTableCommitInfos;
     // coordinator is show who begin this txn (FE, or one of BE, etc...)
+    @SerializedName("tc")
     private TxnCoordinator txnCoordinator;
+    @SerializedName("ts")
     private TransactionStatus transactionStatus;
+    @SerializedName("st")
     private LoadJobSourceType sourceType;
+    @SerializedName("pt")
     private long prepareTime;
+    @SerializedName("ct")
     private long commitTime;
+    @SerializedName("ft")
     private long finishTime;
+    @SerializedName("rs")
     private String reason = "";
 
     // whether this txn is finished using new mechanism
     // this field needs to be persisted, so we shared the serialization field with `reason`.
     // `reason` is only used when txn is aborted, so it's ok to reuse the space for visible txns.
+    @SerializedName("nf")
     private boolean newFinish = false;
+    @SerializedName("fs")
     private TxnFinishState finishState;
 
     // error replica ids
+    @SerializedName("er")
     private Set<Long> errorReplicas;
     private final CountDownLatch latch;
 
@@ -252,10 +272,43 @@ public class TransactionState implements Writable {
     private long publishVersionTime = -1;
     private long publishVersionFinishTime = -1;
 
+    // The time of first commit attempt, i.e, the end time when ingestion write is completed.
+    // Measured in milliseconds since epoch.
+    // -1 means this field is unset.
+    //
+    // Protected by database lock.
+    //
+    // NOTE: This field is only used in shared data mode.
+    private long writeEndTimeMs = -1;
+
+    // The duration of the ingestion data write operation in milliseconds.
+    // This field is normally set automatically during commit based on
+    // writeEndTime and prepareTime. However, for cases like broker load
+    // with scheduling delays and concurrent ingestion, the auto calculated
+    // value may have large error compared to actual data write duration.
+    // In these cases, the upper ingestion job should set this field manually
+    // before commit.
+    //
+    // Protected by database lock.
+    //
+    // NOTE: This field is only used in shared data mode.
+    private long writeDurationMs = -1;
+
+    // The minimum time allowed to commit the transaction.
+    // Measured in milliseconds since epoch.
+    //
+    // Protected by database lock.
+    //
+    // NOTE: This field is only used in shared data mode.
+    private long allowCommitTimeMs = -1;
+
+    @SerializedName("cb")
     private long callbackId = -1;
+    @SerializedName("to")
     private long timeoutMs = Config.stream_load_default_timeout_second * 1000L;
 
     // optional
+    @SerializedName("ta")
     private TxnCommitAttachment txnCommitAttachment;
 
     // this map should be set when load execution begin, so that when the txn commit, it will know
@@ -278,6 +331,7 @@ public class TransactionState implements Writable {
     private long checkerCreationTime = 0;
     private Span txnSpan = null;
     private String traceParent = null;
+    private Set<TabletCommitInfo> tabletCommitInfos = null;
 
     public TransactionState() {
         this.dbId = -1;
@@ -334,6 +388,21 @@ public class TransactionState implements Writable {
 
     public boolean isRunning() {
         return transactionStatus == TransactionStatus.PREPARE || transactionStatus == TransactionStatus.COMMITTED;
+    }
+
+    public void setTabletCommitInfos(List<TabletCommitInfo> infos) {
+        this.tabletCommitInfos = Sets.newHashSet();
+        this.tabletCommitInfos.addAll(infos);
+    }
+
+    public boolean tabletCommitInfosContainsReplica(long tabletId, long backendId) {
+        TabletCommitInfo info = new TabletCommitInfo(tabletId, backendId);
+        if (this.tabletCommitInfos == null || this.tabletCommitInfos.contains(info)) {
+            // if tabletCommitInfos is null, skip this check and return true
+            return true;
+        } else {
+            return false;
+        }
     }
 
     // Only for OlapTable
@@ -623,7 +692,7 @@ public class TransactionState implements Writable {
         indexIds.addAll(table.getIndexIdToMeta().keySet());
     }
 
-    public List<MaterializedIndex> getPartitionLoadedTblIndexes(long tableId, Partition partition) {
+    public List<MaterializedIndex> getPartitionLoadedTblIndexes(long tableId, PhysicalPartition partition) {
         List<MaterializedIndex> loadedIndex;
         if (loadedTblIndexes.isEmpty()) {
             loadedIndex = partition.getMaterializedIndices(MaterializedIndex.IndexExtState.ALL);
@@ -652,6 +721,8 @@ public class TransactionState implements Writable {
         sb.append(", error replicas num: ").append(errorReplicas.size());
         sb.append(", replica ids: ").append(Joiner.on(",").join(errorReplicas.stream().limit(5).toArray()));
         sb.append(", prepare time: ").append(prepareTime);
+        sb.append(", write end time: ").append(writeEndTimeMs);
+        sb.append(", allow commit time: ").append(allowCommitTimeMs);
         sb.append(", commit time: ").append(commitTime);
         sb.append(", finish time: ").append(finishTime);
         if (commitTime > prepareTime) {
@@ -756,28 +827,7 @@ public class TransactionState implements Writable {
             info.readFields(in);
             idToTableCommitInfos.put(info.getTableId(), info);
         }
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_83) {
-            TxnSourceType sourceType = TxnSourceType.valueOf(in.readInt());
-            String ip = Text.readString(in);
-            txnCoordinator = new TxnCoordinator(sourceType, ip);
-        } else {
-            // to compatible old version, the old txn coordinator looks like: "BE: 192.186.1.1"
-            String coordStr = Text.readString(in);
-            String[] parts = coordStr.split(":");
-            if (parts.length != 2) {
-                // should not happen, just create a mocked TxnCoordinator
-                txnCoordinator = new TxnCoordinator(TxnSourceType.FE, "127.0.0.1");
-            } else {
-                if (parts[0].trim().equalsIgnoreCase("FE")) {
-                    txnCoordinator = new TxnCoordinator(TxnSourceType.FE, parts[1].trim());
-                } else if (parts[0].trim().equalsIgnoreCase("BE")) {
-                    txnCoordinator = new TxnCoordinator(TxnSourceType.BE, parts[1].trim());
-                } else {
-                    // unknown format, should not happen, just create a mocked TxnCoordinator
-                    txnCoordinator = new TxnCoordinator(TxnSourceType.FE, "127.0.0.1");
-                }
-            }
-        }
+        txnCoordinator = new TxnCoordinator(TxnSourceType.valueOf(in.readInt()), Text.readString(in));
         transactionStatus = TransactionStatus.valueOf(in.readInt());
         sourceType = LoadJobSourceType.valueOf(in.readInt());
         prepareTime = in.readLong();
@@ -828,20 +878,16 @@ public class TransactionState implements Writable {
             errorReplicas.add(in.readLong());
         }
 
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_49) {
-            if (in.readBoolean()) {
-                txnCommitAttachment = TxnCommitAttachment.read(in);
-            }
-            callbackId = in.readLong();
-            timeoutMs = in.readLong();
+        if (in.readBoolean()) {
+            txnCommitAttachment = TxnCommitAttachment.read(in);
         }
+        callbackId = in.readLong();
+        timeoutMs = in.readLong();
 
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_79) {
-            tableIdList = Lists.newArrayList();
-            int tableListSize = in.readInt();
-            for (int i = 0; i < tableListSize; i++) {
-                tableIdList.add(in.readLong());
-            }
+        tableIdList = Lists.newArrayList();
+        int tableListSize = in.readInt();
+        for (int i = 0; i < tableListSize; i++) {
+            tableIdList.add(in.readLong());
         }
 
         txnSpan.setAttribute("txn_id", transactionId);
@@ -886,7 +932,7 @@ public class TransactionState implements Writable {
         // public version tasks are not persisted in globalStateMgr, so publishBackends may be empty.
         // We have to send publish version task to all backends
         if (publishBackends.isEmpty()) {
-            // note: tasks are sended to all backends including dead ones, or else
+            // note: tasks are sent to all backends including dead ones, or else
             // transaction manager will treat it as success
             List<Long> allBackends = GlobalStateMgr.getCurrentSystemInfo().getBackendIds(false);
             if (!allBackends.isEmpty()) {
@@ -921,7 +967,8 @@ public class TransactionState implements Writable {
                     traceParent,
                     txnSpan,
                     createTime,
-                    this);
+                    this,
+                    Config.enable_sync_publish);
             this.addPublishVersionTask(backendId, task);
             tasks.add(task);
         }
@@ -929,7 +976,7 @@ public class TransactionState implements Writable {
     }
 
     public boolean allPublishTasksFinishedOrQuorumWaitTimeout(Set<Long> publishErrorReplicas) {
-        boolean timeout = System.currentTimeMillis() - getCommitTime() > Config.quorom_publish_wait_time_ms;
+        boolean timeout = System.currentTimeMillis() - getCommitTime() > Config.quorum_publish_wait_time_ms;
         for (PublishVersionTask publishVersionTask : getPublishVersionTasks().values()) {
             if (publishVersionTask.isFinished()) {
                 publishErrorReplicas.addAll(publishVersionTask.getErrorReplicas());
@@ -1007,5 +1054,32 @@ public class TransactionState implements Writable {
 
     public String getTraceParent() {
         return traceParent;
+    }
+
+    // A value of -1 indicates this field is not set.
+    public long getWriteEndTimeMs() {
+        return writeEndTimeMs;
+    }
+
+    public void setWriteEndTimeMs(long writeEndTimeMs) {
+        this.writeEndTimeMs = writeEndTimeMs;
+    }
+
+    // A value of -1 indicates this field is not set.
+    public long getAllowCommitTimeMs() {
+        return allowCommitTimeMs;
+    }
+
+    public void setAllowCommitTimeMs(long allowCommitTimeMs) {
+        this.allowCommitTimeMs = allowCommitTimeMs;
+    }
+
+    // A value of -1 indicates this field is not set.
+    public long getWriteDurationMs() {
+        return writeDurationMs;
+    }
+
+    public void setWriteDurationMs(long writeDurationMs) {
+        this.writeDurationMs = writeDurationMs;
     }
 }

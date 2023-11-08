@@ -86,7 +86,8 @@ public class ExpressionStatisticCalculator {
                 return new ColumnStatistic(value.getAsDouble(), value.getAsDouble(), 0,
                         operator.getType().getTypeSize(), 1);
             } else if (operator.getType().isStringType()) {
-                return new ColumnStatistic(Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, 0, 1, 1);
+                return new ColumnStatistic(Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, 0,
+                        operator.toString().length(), 1);
             } else {
                 return ColumnStatistic.unknown();
             }
@@ -106,8 +107,13 @@ public class ExpressionStatisticCalculator {
             // 2. use sum of then clause and else clause's distinct values as column distinctValues
             double distinctValues = childrenColumnStatistics.stream().mapToDouble(
                     ColumnStatistic::getDistinctValuesCount).sum();
-            return new ColumnStatistic(Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, 0,
-                    caseWhenOperator.getType().getTypeSize(), distinctValues);
+            return ColumnStatistic.builder()
+                    .setMinValue(Double.NEGATIVE_INFINITY)
+                    .setMaxValue(Double.POSITIVE_INFINITY)
+                    .setNullsFraction(0)
+                    .setAverageRowSize(caseWhenOperator.getType().getTypeSize())
+                    .setDistinctValuesCount(distinctValues)
+                    .build();
         }
 
         @Override
@@ -119,8 +125,11 @@ public class ExpressionStatisticCalculator {
                 return ColumnStatistic.unknown();
             }
 
-            // If cast destination type is number/string, it's unnecessary to cast, keep self is enough.
-            if (!cast.getType().isDateType()) {
+            if (cast.getType().isNumericType()) {
+                return ColumnStatistic.buildFrom(childStatistic).setAverageRowSize(cast.getType().getTypeSize())
+                        .build();
+            } else if (!cast.getType().isDateType()) {
+                // If cast destination type is number/string, it's unnecessary to cast, keep self is enough.
                 return childStatistic;
             }
 
@@ -146,15 +155,22 @@ public class ExpressionStatisticCalculator {
             double maxValue = Utils.getLongFromDateTime(max.getDatetime());
             double minValue = Utils.getLongFromDateTime(min.getDatetime());
 
-            return new ColumnStatistic(minValue, maxValue, childStatistic.getNullsFraction(),
-                    childStatistic.getAverageRowSize(), childStatistic.getDistinctValuesCount());
+            return ColumnStatistic.builder()
+                    .setMinValue(minValue)
+                    .setMaxValue(maxValue)
+                    .setNullsFraction(childStatistic.getNullsFraction())
+                    .setAverageRowSize(cast.getType().getTypeSize())
+                    .setDistinctValuesCount(childStatistic.getDistinctValuesCount())
+                    .build();
         }
 
         @Override
         public ColumnStatistic visitCall(CallOperator call, Void context) {
             List<ColumnStatistic> childrenColumnStatistics =
                     call.getChildren().stream().map(child -> child.accept(this, context)).collect(Collectors.toList());
-            Preconditions.checkState(childrenColumnStatistics.size() == call.getChildren().size());
+            Preconditions.checkState(childrenColumnStatistics.size() == call.getChildren().size(),
+                    "column statistics missing for expr: %s. column statistics: %s",
+                    call, childrenColumnStatistics);
             if (childrenColumnStatistics.stream().anyMatch(ColumnStatistic::isUnknown) ||
                     inputStatistics.getColumnStatistics().values().stream().allMatch(ColumnStatistic::isUnknown)) {
                 return ColumnStatistic.unknown();
@@ -219,7 +235,13 @@ public class ExpressionStatisticCalculator {
                 default:
                     return ColumnStatistic.unknown();
             }
-            return new ColumnStatistic(minValue, maxValue, 0, callOperator.getType().getTypeSize(), distinctValue);
+            return ColumnStatistic.builder()
+                    .setMinValue(minValue)
+                    .setMaxValue(maxValue)
+                    .setNullsFraction(0)
+                    .setAverageRowSize(callOperator.getType().getTypeSize())
+                    .setDistinctValuesCount(distinctValue)
+                    .build();
         }
 
         private ColumnStatistic unaryExpressionCalculate(CallOperator callOperator, ColumnStatistic columnStatistic) {
@@ -423,6 +445,12 @@ public class ExpressionStatisticCalculator {
                     minValue = Math.min(negativeMinValue, negativeMaxValue);
                     maxValue = Math.max(negativeMinValue, negativeMaxValue);
                     break;
+                case FunctionSet.MURMUR_HASH3_32:
+                    // murmur_hash3_32's range is uint32_t, so 0 ~ 4294967295
+                    minValue = 0;
+                    maxValue = 4294967295.0;
+                    distinctValue = rowCount;
+                    break;
                 case FunctionSet.POSITIVE:
                 case FunctionSet.FLOOR:
                 case FunctionSet.DFLOOR:
@@ -433,19 +461,30 @@ public class ExpressionStatisticCalculator {
                 case FunctionSet.TRUNCATE:
                     // Just use the input's statistics as output's statistics
                     break;
+                case FunctionSet.TO_BITMAP:
+                    minValue = Double.NEGATIVE_INFINITY;
+                    maxValue = Double.POSITIVE_INFINITY;
+                    break;
                 default:
                     return ColumnStatistic.unknown();
             }
 
             final double averageRowSize;
             if (callOperator.getType().isIntegerType() || callOperator.getType().isFloatingPointType()
-                    || callOperator.getType().isDateType()) {
+                    || callOperator.getType().isDateType() || callOperator.getType().isBitmapType()) {
                 averageRowSize = callOperator.getType().getTypeSize();
             } else {
-                averageRowSize = columnStatistic.getAverageRowSize();
+                averageRowSize = columnStatistic.isUnknown() ? callOperator.getType().getTypeSize() :
+                        columnStatistic.getAverageRowSize();
             }
-            return new ColumnStatistic(minValue, maxValue, columnStatistic.getNullsFraction(), averageRowSize,
-                    distinctValue);
+
+            return ColumnStatistic.builder()
+                    .setMinValue(minValue)
+                    .setMaxValue(maxValue)
+                    .setNullsFraction(columnStatistic.getNullsFraction())
+                    .setAverageRowSize(averageRowSize)
+                    .setDistinctValuesCount(distinctValue)
+                    .build();
         }
 
         private ColumnStatistic binaryExpressionCalculate(CallOperator callOperator, ColumnStatistic left,
@@ -530,6 +569,7 @@ public class ExpressionStatisticCalculator {
                 case FunctionSet.PMOD:
                     minValue = -Math.max(Math.abs(right.getMinValue()), Math.abs(right.getMaxValue()));
                     maxValue = -minValue;
+                    distinctValues = callOperator.getType().isIntegerType() ? maxValue - minValue : distinctValues;
                     break;
                 case FunctionSet.IFNULL:
                     minValue = Math.min(left.getMinValue(), right.getMinValue());
@@ -542,8 +582,13 @@ public class ExpressionStatisticCalculator {
                 default:
                     return ColumnStatistic.unknown();
             }
-
-            return new ColumnStatistic(minValue, maxValue, nullsFraction, averageRowSize, distinctValues);
+            return ColumnStatistic.builder()
+                    .setMinValue(minValue)
+                    .setMaxValue(maxValue)
+                    .setNullsFraction(nullsFraction)
+                    .setAverageRowSize(averageRowSize)
+                    .setDistinctValuesCount(distinctValues)
+                    .build();
         }
 
         private ColumnStatistic multiaryExpressionCalculate(CallOperator callOperator,

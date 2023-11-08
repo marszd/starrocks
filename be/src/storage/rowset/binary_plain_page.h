@@ -181,12 +181,10 @@ private:
 template <LogicalType Type>
 class BinaryPlainPageDecoder final : public PageDecoder {
 public:
-    explicit BinaryPlainPageDecoder(Slice data) : BinaryPlainPageDecoder(data, PageDecoderOptions()) {}
+    explicit BinaryPlainPageDecoder(Slice data)
+            : _data(data), _parsed(false), _num_elems(0), _offsets_pos(0), _cur_idx(0) {}
 
-    BinaryPlainPageDecoder(Slice data, const PageDecoderOptions& options)
-            : _data(data), _options(options), _parsed(false), _num_elems(0), _offsets_pos(0), _cur_idx(0) {}
-
-    Status init() override {
+    [[nodiscard]] Status init() override {
         RETURN_IF(_parsed, Status::OK());
 
         if (_data.size < sizeof(uint32_t)) {
@@ -208,15 +206,15 @@ public:
         return Status::OK();
     }
 
-    Status seek_to_position_in_page(uint32_t pos) override {
+    [[nodiscard]] Status seek_to_position_in_page(uint32_t pos) override {
         DCHECK_LE(pos, _num_elems);
         _cur_idx = pos;
         return Status::OK();
     }
 
-    Status next_batch(size_t* count, Column* dst) override;
+    [[nodiscard]] Status next_batch(size_t* count, Column* dst) override;
 
-    Status next_batch(const SparseRange& range, Column* dst) override;
+    [[nodiscard]] Status next_batch(const SparseRange<>& range, Column* dst) override;
 
     bool append_range(uint32_t idx, uint32_t end, Column* dst) const;
 
@@ -279,7 +277,6 @@ private:
     }
 
     Slice _data;
-    PageDecoderOptions _options;
     bool _parsed;
 
     uint32_t _num_elems;

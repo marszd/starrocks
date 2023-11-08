@@ -110,7 +110,6 @@ TABLE: supplier
 NON-PARTITION PREDICATES: 1: s_suppkey IS NOT NULL
 partitions=1/1
 avgRowSize=84.0
-numNodes=0
 cardinality: 1000000
 probe runtime filters:
 - filter_id = 1, probe_expr = (1: s_suppkey)
@@ -254,10 +253,9 @@ OutPut Exchange Id: 09
 6:HdfsScanNode
 TABLE: lineitem
 NON-PARTITION PREDICATES: 36: l_shipdate >= '1995-07-01', 36: l_shipdate < '1995-10-01'
-MIN/MAX PREDICATES: 46: l_shipdate >= '1995-07-01', 47: l_shipdate < '1995-10-01'
+MIN/MAX PREDICATES: 36: l_shipdate >= '1995-07-01', 36: l_shipdate < '1995-10-01'
 partitions=1/1
 avgRowSize=40.0
-numNodes=0
 cardinality: 21862767
 column statistics:
 * l_suppkey-->[1.0, 1000000.0, 0.0, 4.0, 1000000.0] ESTIMATE
@@ -293,10 +291,9 @@ OutPut Exchange Id: 04
 1:HdfsScanNode
 TABLE: lineitem
 NON-PARTITION PREDICATES: 18: l_shipdate >= '1995-07-01', 18: l_shipdate < '1995-10-01'
-MIN/MAX PREDICATES: 48: l_shipdate >= '1995-07-01', 49: l_shipdate < '1995-10-01'
+MIN/MAX PREDICATES: 18: l_shipdate >= '1995-07-01', 18: l_shipdate < '1995-10-01'
 partitions=1/1
 avgRowSize=40.0
-numNodes=0
 cardinality: 21862767
 column statistics:
 * l_suppkey-->[1.0, 1000000.0, 0.0, 4.0, 1000000.0] ESTIMATE

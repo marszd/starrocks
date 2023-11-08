@@ -39,6 +39,7 @@ import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
 import com.starrocks.common.io.Text;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
 import com.starrocks.thrift.TStringLiteral;
@@ -46,6 +47,7 @@ import com.starrocks.thrift.TStringLiteral;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 
@@ -53,12 +55,16 @@ public class StringLiteral extends LiteralExpr {
     private String value;
 
     public StringLiteral() {
-        super();
+        super(NodePosition.ZERO);
         type = Type.VARCHAR;
     }
 
     public StringLiteral(String value) {
-        super();
+        this(value, NodePosition.ZERO);
+    }
+
+    public StringLiteral(String value, NodePosition pos) {
+        super(pos);
         this.value = value;
         type = Type.VARCHAR;
         analysisDone();
@@ -261,5 +267,16 @@ public class StringLiteral extends LiteralExpr {
     @Override
     public boolean equals(Object obj) {
         return super.equals(obj);
+    }
+
+    @Override
+    public void parseMysqlParam(ByteBuffer data) {
+        int strLen = getParamLen(data);
+        if (strLen > data.remaining()) {
+            strLen = data.remaining();
+        }
+        byte[] bytes = new byte[strLen];
+        data.get(bytes);
+        value = new String(bytes);
     }
 }

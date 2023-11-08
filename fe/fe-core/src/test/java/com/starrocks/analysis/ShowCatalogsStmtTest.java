@@ -15,9 +15,11 @@
 
 package com.starrocks.analysis;
 
+import com.google.common.collect.Sets;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.jmockit.Deencapsulation;
+import com.starrocks.privilege.PrivilegeBuiltinConstants;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.DDLStmtExecutor;
 import com.starrocks.qe.ShowExecutor;
@@ -28,6 +30,7 @@ import com.starrocks.sql.analyzer.AnalyzeTestUtil;
 import com.starrocks.sql.ast.CreateCatalogStmt;
 import com.starrocks.sql.ast.ShowCatalogsStmt;
 import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.Assert;
@@ -59,6 +62,7 @@ public class ShowCatalogsStmtTest {
         ctx = new ConnectContext(null);
         ctx.setGlobalStateMgr(AccessTestUtil.fetchAdminCatalog());
         ctx.setCurrentUserIdentity(UserIdentity.ROOT);
+        ctx.setCurrentRoleIds(Sets.newHashSet(PrivilegeBuiltinConstants.ROOT_ROLE_ID));
     }
 
     @Test
@@ -72,7 +76,7 @@ public class ShowCatalogsStmtTest {
         Assert.assertEquals("Comment", metaData.getColumn(2).getName());
         Assert.assertEquals("[default_catalog, Internal, An internal catalog contains this cluster's self-managed tables.]",
                 resultSet.getResultRows().get(0).toString());
-        Assert.assertEquals("[hive_catalog_1, hive, hive_catalog]", resultSet.getResultRows().get(1).toString());
+        Assert.assertEquals("[hive_catalog_1, Hive, hive_catalog]", resultSet.getResultRows().get(1).toString());
     }
 
     @Test

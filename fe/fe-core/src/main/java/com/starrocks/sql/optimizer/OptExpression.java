@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.starrocks.sql.common.DebugOperatorTracer;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.base.LogicalProperty;
 import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
@@ -55,6 +55,7 @@ public class OptExpression {
     private List<PhysicalPropertySet> requiredProperties;
     // MV Operator property, inferred from best plan
     private MVOperatorProperty mvOperatorProperty;
+    private PhysicalPropertySet outputProperty;
 
     public OptExpression(Operator op) {
         this.op = op;
@@ -145,6 +146,14 @@ public class OptExpression {
         return this.requiredProperties;
     }
 
+    public void setOutputProperty(PhysicalPropertySet requiredProperties) {
+        this.outputProperty = requiredProperties;
+    }
+
+    public PhysicalPropertySet getOutputProperty() {
+        return this.outputProperty;
+    }
+
     // This function assume the child expr logical property has been derived
     public void deriveLogicalPropertyItself() {
         ExpressionContext context = new ExpressionContext(this);
@@ -191,18 +200,26 @@ public class OptExpression {
         return op + " child size " + inputs.size();
     }
 
-    public String explain() {
-        return explain("", "");
+    public String debugString() {
+        return debugString("", "", Integer.MAX_VALUE);
     }
 
-    private String explain(String headlinePrefix, String detailPrefix) {
+    public String debugString(int limitLine) {
+        return debugString("", "", limitLine);
+    }
+
+    private String debugString(String headlinePrefix, String detailPrefix, int limitLine) {
         StringBuilder sb = new StringBuilder();
-        sb.append(headlinePrefix).
-                append(op.accept(new OptimizerTraceUtil.OperatorTracePrinter(), null)).append('\n');
+        sb.append(headlinePrefix).append(op.accept(new DebugOperatorTracer(), null));
+        limitLine -= 1;
+        if (limitLine <= 0) {
+            return sb.toString();
+        }
+        sb.append('\n');
         String childHeadlinePrefix = detailPrefix + "->  ";
         String childDetailPrefix = detailPrefix + "    ";
         for (OptExpression input : inputs) {
-            sb.append(input.explain(childHeadlinePrefix, childDetailPrefix));
+            sb.append(input.debugString(childHeadlinePrefix, childDetailPrefix, limitLine));
         }
         return sb.toString();
     }

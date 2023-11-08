@@ -59,6 +59,7 @@
 #include "runtime/runtime_filter_cache.h"
 #include "runtime/runtime_filter_worker.h"
 #include "service/backend_options.h"
+#include "util/misc.h"
 #include "util/starrocks_metrics.h"
 #include "util/stopwatch.hpp"
 #include "util/thread.h"
@@ -92,16 +93,16 @@ public:
 
     ~FragmentExecState();
 
-    Status prepare(const TExecPlanFragmentParams& params);
+    [[nodiscard]] Status prepare(const TExecPlanFragmentParams& params);
 
     // just no use now
     void callback(const Status& status, RuntimeProfile* profile, bool done);
 
     std::string to_http_path(const std::string& file_name);
 
-    Status execute();
+    [[nodiscard]] Status execute();
 
-    Status cancel(const PPlanFragmentCancelReason& reason);
+    void cancel(const PPlanFragmentCancelReason& reason);
 
     TUniqueId fragment_instance_id() const { return _fragment_instance_id; }
 
@@ -118,7 +119,7 @@ public:
     int backend_num() const { return _backend_num; }
 
     // Update status of this fragment execute
-    Status update_status(const Status& status) {
+    [[nodiscard]] Status update_status(const Status& status) {
         std::lock_guard<std::mutex> l(_status_lock);
         if (!status.ok() && _exec_status.ok()) {
             _exec_status = status;
@@ -180,7 +181,8 @@ FragmentExecState::~FragmentExecState() = default;
 Status FragmentExecState::prepare(const TExecPlanFragmentParams& params) {
     _runtime_state = std::make_shared<RuntimeState>(params.params.query_id, params.params.fragment_instance_id,
                                                     params.query_options, params.query_globals, _exec_env);
-    int func_version = params.__isset.func_version ? params.func_version : 2;
+    int func_version = params.__isset.func_version ? params.func_version
+                                                   : TFunctionVersion::type::RUNTIME_FILTER_SERIALIZE_VERSION_2;
     _runtime_state->set_func_version(func_version);
     _runtime_state->init_mem_trackers(_query_id);
     _executor.set_runtime_state(_runtime_state.get());
@@ -205,14 +207,16 @@ Status FragmentExecState::execute() {
     return Status::OK();
 }
 
-Status FragmentExecState::cancel(const PPlanFragmentCancelReason& reason) {
+void FragmentExecState::cancel(const PPlanFragmentCancelReason& reason) {
     std::lock_guard<std::mutex> l(_status_lock);
-    RETURN_IF_ERROR(_exec_status);
+    if (!_exec_status.ok()) {
+        return;
+    }
+
     if (reason == PPlanFragmentCancelReason::LIMIT_REACH) {
         _executor.set_is_report_on_cancel(false);
     }
     _executor.cancel();
-    return Status::OK();
 }
 
 void FragmentExecState::callback(const Status& status, RuntimeProfile* profile, bool done) {}
@@ -237,7 +241,8 @@ void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfil
     if (!coord_status.ok()) {
         std::stringstream ss;
         ss << "couldn't get a client for " << _coord_addr;
-        update_status(Status::InternalError(ss.str()));
+        LOG(WARNING) << ss.str();
+        (void)update_status(Status::InternalError(ss.str()));
         return;
     }
 
@@ -269,21 +274,24 @@ void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfil
                 params.delta_urls.push_back(to_http_path(it));
             }
         }
-        if (runtime_state->num_rows_load_from_sink() > 0 || runtime_state->num_rows_load_filtered() > 0) {
+        if (runtime_state->num_rows_load_sink() > 0 || runtime_state->num_rows_load_filtered() > 0 ||
+            runtime_state->num_rows_load_unselected() > 0) {
             params.__isset.load_counters = true;
-            // TODO(zc)
             static std::string s_dpp_normal_all = "dpp.norm.ALL";
             static std::string s_dpp_abnormal_all = "dpp.abnorm.ALL";
             static std::string s_unselected_rows = "unselected.rows";
             static std::string s_loaded_bytes = "loaded.bytes";
 
-            params.load_counters.emplace(s_dpp_normal_all, std::to_string(runtime_state->num_rows_load_sink_success()));
+            params.load_counters.emplace(s_dpp_normal_all, std::to_string(runtime_state->num_rows_load_sink()));
             params.load_counters.emplace(s_dpp_abnormal_all, std::to_string(runtime_state->num_rows_load_filtered()));
             params.load_counters.emplace(s_unselected_rows, std::to_string(runtime_state->num_rows_load_unselected()));
-            params.load_counters.emplace(s_loaded_bytes, std::to_string(runtime_state->num_bytes_load_from_sink()));
+            params.load_counters.emplace(s_loaded_bytes, std::to_string(runtime_state->num_bytes_load_sink()));
         }
         if (!runtime_state->get_error_log_file_path().empty()) {
             params.__set_tracking_url(to_load_error_http_path(runtime_state->get_error_log_file_path()));
+        }
+        if (!runtime_state->get_rejected_record_file_path().empty()) {
+            params.__set_rejected_record_path(runtime_state->get_rejected_record_file_path());
         }
         if (!runtime_state->export_output_files().empty()) {
             params.__isset.export_files = true;
@@ -323,7 +331,7 @@ void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfil
 
             if (!rpc_status.ok()) {
                 // we need to cancel the execution of this fragment
-                update_status(rpc_status);
+                (void)update_status(rpc_status);
                 _executor.cancel();
                 return;
             }
@@ -340,7 +348,7 @@ void FragmentExecState::coordinator_callback(const Status& status, RuntimeProfil
 
     if (!rpc_status.ok()) {
         // we need to cancel the execution of this fragment
-        update_status(rpc_status);
+        (void)update_status(rpc_status);
         _executor.cancel();
     }
 }
@@ -354,11 +362,12 @@ FragmentMgr::FragmentMgr(ExecEnv* exec_env)
     });
     // TODO(zc): we need a better thread-pool
     // now one user can use all the thread pool, others have no resource.
-    ThreadPoolBuilder("fragment_mgr")
-            .set_min_threads(config::fragment_pool_thread_num_min)
-            .set_max_threads(config::fragment_pool_thread_num_max)
-            .set_max_queue_size(config::fragment_pool_queue_size)
-            .build(&_thread_pool);
+    auto st = ThreadPoolBuilder("fragment_mgr")
+                      .set_min_threads(config::fragment_pool_thread_num_min)
+                      .set_max_threads(config::fragment_pool_thread_num_max)
+                      .set_max_queue_size(config::fragment_pool_queue_size)
+                      .build(&_thread_pool);
+    CHECK(st.ok()) << st;
 }
 
 FragmentMgr::~FragmentMgr() {
@@ -388,7 +397,8 @@ void FragmentMgr::exec_actual(const std::shared_ptr<FragmentExecState>& exec_sta
     MemTracker* prev_tracker = tls_thread_status.set_mem_tracker(s_tracker.get());
     DeferOp op([&] { tls_thread_status.set_mem_tracker(prev_tracker); });
 
-    exec_state->execute();
+    WARN_IF_ERROR(exec_state->execute(),
+                  strings::Substitute("Fail to execute fragment $0", print_id(exec_state->fragment_instance_id())));
 
     // Callback after remove from this id
     cb(exec_state->executor());
@@ -418,7 +428,8 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params, co
 
 Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params, const StartSuccCallback& start_cb,
                                        const FinishCallback& cb) {
-    RETURN_IF_ERROR(_exec_env->query_pool_mem_tracker()->check_mem_limit("Start execute plan fragment."));
+    RETURN_IF_ERROR(
+            GlobalEnv::GetInstance()->query_pool_mem_tracker()->check_mem_limit("Start execute plan fragment."));
 
     const TUniqueId& fragment_instance_id = params.params.fragment_instance_id;
     std::shared_ptr<FragmentExecState> exec_state;
@@ -440,6 +451,10 @@ Status FragmentMgr::exec_plan_fragment(const TExecPlanFragmentParams& params, co
         if (iter != _fragment_map.end()) {
             // Duplicated
             return Status::InternalError("Double execute");
+        }
+        // check if shutting down in progress under the lock
+        if (_closed) {
+            return Status::Cancelled("FragmentManager shutdown in progress.");
         }
         // register exec_state before starting exec thread
         _fragment_map.insert(std::make_pair(fragment_instance_id, exec_state));
@@ -525,6 +540,25 @@ void FragmentMgr::receive_runtime_filter(const PTransmitRuntimeFilterParams& par
     }
 }
 
+void FragmentMgr::close() {
+    std::vector<TUniqueId> frag_instance_ids;
+    {
+        std::lock_guard<std::mutex> lock(_lock);
+        // reject all fragments from now on.
+        // expect no fragment can be added into `_fragment_map` after the lock is released.
+        _closed = true;
+        frag_instance_ids.reserve(_fragment_map.size());
+        for (auto& it : _fragment_map) {
+            frag_instance_ids.push_back(it.first);
+        }
+    }
+    // cancel all the fragments without lock.
+    for (auto& id : frag_instance_ids) {
+        WARN_IF_ERROR(cancel(id, PPlanFragmentCancelReason::USER_CANCEL),
+                      strings::Substitute("Fail to cancel fragment $0", print_id(id)));
+    }
+}
+
 void FragmentMgr::cancel_worker() {
     LOG(INFO) << "FragmentMgr cancel worker start working.";
     while (!_stop) {
@@ -539,12 +573,11 @@ void FragmentMgr::cancel_worker() {
             }
         }
         for (auto& id : to_delete) {
-            cancel(id, PPlanFragmentCancelReason::TIMEOUT);
+            WARN_IF_ERROR(cancel(id, PPlanFragmentCancelReason::TIMEOUT),
+                          strings::Substitute("Fail to cancel fragment $0", print_id(id)));
             LOG(INFO) << "FragmentMgr cancel worker going to cancel timeout fragment " << print_id(id);
         }
-
-        // check every 1 seconds
-        sleep(1);
+        nap_sleep(1, [this] { return _stop; });
     }
     LOG(INFO) << "FragmentMgr cancel worker is going to exit.";
 }
@@ -597,7 +630,7 @@ void FragmentMgr::report_fragments_with_same_host(
             Status executor_status = executor->status();
             if (!executor_status.ok()) {
                 reported[i] = true;
-                starrocks::ExecEnv::GetInstance()->profile_report_worker()->unregister_non_pipeline_load(
+                ExecEnv::GetInstance()->profile_report_worker()->unregister_non_pipeline_load(
                         fragment_exec_state->fragment_instance_id());
                 continue;
             }
@@ -662,7 +695,7 @@ void FragmentMgr::report_fragments(const std::vector<TUniqueId>& non_pipeline_ne
 
             Status executor_status = executor->status();
             if (!executor_status.ok()) {
-                starrocks::ExecEnv::GetInstance()->profile_report_worker()->unregister_non_pipeline_load(
+                ExecEnv::GetInstance()->profile_report_worker()->unregister_non_pipeline_load(
                         fragment_exec_state->fragment_instance_id());
                 continue;
             }
@@ -675,7 +708,7 @@ void FragmentMgr::report_fragments(const std::vector<TUniqueId>& non_pipeline_ne
                 std::stringstream ss;
                 ss << "couldn't get a client for " << fragment_exec_state->coord_addr();
                 LOG(WARNING) << ss.str();
-                starrocks::ExecEnv::GetInstance()->profile_report_worker()->unregister_non_pipeline_load(
+                ExecEnv::GetInstance()->profile_report_worker()->unregister_non_pipeline_load(
                         fragment_exec_state->fragment_instance_id());
                 fragment_exec_state->exec_env()->frontend_client_cache()->close_connections(
                         fragment_exec_state->coord_addr());
@@ -744,7 +777,7 @@ void FragmentMgr::report_fragments(const std::vector<TUniqueId>& non_pipeline_ne
                     int32_t index = cur_batch_report_indexes[j];
                     FragmentExecState* fragment_exec_state = need_report_exec_states[index].get();
                     PlanFragmentExecutor* executor = fragment_exec_state->executor();
-                    fragment_exec_state->update_status(rpc_status);
+                    (void)fragment_exec_state->update_status(rpc_status);
                     executor->cancel();
                 }
             }
@@ -752,7 +785,7 @@ void FragmentMgr::report_fragments(const std::vector<TUniqueId>& non_pipeline_ne
     }
 
     for (const auto& fragment_instance_id : fragments_non_exist) {
-        starrocks::ExecEnv::GetInstance()->profile_report_worker()->unregister_non_pipeline_load(fragment_instance_id);
+        ExecEnv::GetInstance()->profile_report_worker()->unregister_non_pipeline_load(fragment_instance_id);
     }
 }
 
@@ -851,12 +884,12 @@ Status FragmentMgr::exec_external_plan_fragment(const TScanOpenParams& params, c
     TPlanFragmentExecParams fragment_exec_params;
     fragment_exec_params.query_id = t_query_plan_info.query_id;
     fragment_exec_params.fragment_instance_id = fragment_instance_id;
-    std::map<::starrocks::TPlanNodeId, std::vector<TScanRangeParams>> per_node_scan_ranges;
+    std::map<TPlanNodeId, std::vector<TScanRangeParams>> per_node_scan_ranges;
     std::vector<TScanRangeParams> scan_ranges;
     std::vector<int64_t> tablet_ids = params.tablet_ids;
     TNetworkAddress address;
     address.hostname = BackendOptions::get_localhost();
-    address.port = starrocks::config::be_port;
+    address.port = config::be_port;
     std::map<int64_t, TTabletVersionInfo> tablet_info = t_query_plan_info.tablet_info;
     for (auto tablet_id : params.tablet_ids) {
         TInternalScanRange scan_range;
@@ -881,7 +914,7 @@ Status FragmentMgr::exec_external_plan_fragment(const TScanOpenParams& params, c
         scan_range_params.scan_range = starrocks_scan_range;
         scan_ranges.push_back(scan_range_params);
     }
-    per_node_scan_ranges.insert(std::make_pair((::starrocks::TPlanNodeId)0, scan_ranges));
+    per_node_scan_ranges.insert(std::make_pair((TPlanNodeId)0, scan_ranges));
     fragment_exec_params.per_node_scan_ranges = per_node_scan_ranges;
     // set a mock sender id
     fragment_exec_params.__set_sender_id(0);
@@ -893,6 +926,9 @@ Status FragmentMgr::exec_external_plan_fragment(const TScanOpenParams& params, c
     query_options.query_timeout = params.query_timeout;
     query_options.mem_limit = params.mem_limit;
     query_options.query_type = TQueryType::EXTERNAL;
+    // For spark sql / flink sql, we dont use page cache.
+    query_options.use_page_cache = false;
+    query_options.use_column_pool = false;
     exec_fragment_params.__set_query_options(query_options);
     VLOG_ROW << "external exec_plan_fragment params is "
              << apache::thrift::ThriftDebugString(exec_fragment_params).c_str();

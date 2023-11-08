@@ -59,7 +59,7 @@ public:
     void copy_one(PageDecoderType* decoder, typename TypeTraits<type>::CppType* ret) {
         auto column = ChunkHelper::column_from_field_type(type, true);
         size_t n = 1;
-        decoder->next_batch(&n, column.get());
+        ASSERT_TRUE(decoder->next_batch(&n, column.get()).ok());
         ASSERT_EQ(1, n);
         *ret = *reinterpret_cast<const typename TypeTraits<type>::CppType*>(column->raw_data());
     }
@@ -95,8 +95,7 @@ public:
         Status st = StoragePageDecoder::decode_page(&footer, 0, starrocks::BIT_SHUFFLE, &page, &encoded_data);
         ASSERT_TRUE(st.ok());
 
-        PageDecoderOptions decoder_options;
-        PageDecoderType page_decoder(encoded_data, decoder_options);
+        PageDecoderType page_decoder(encoded_data);
         Status status = page_decoder.init();
         ASSERT_TRUE(status.ok());
         ASSERT_EQ(0, page_decoder.current_index());
@@ -117,7 +116,7 @@ public:
         // Test Seek within block by ordinal
         for (int i = 0; i < 100; i++) {
             uint32_t seek_off = random() % size;
-            page_decoder.seek_to_position_in_page(seek_off);
+            ASSERT_TRUE(page_decoder.seek_to_position_in_page(seek_off).ok());
             EXPECT_EQ((int32_t)(seek_off), page_decoder.current_index());
             CppType ret;
             copy_one<Type, PageDecoderType>(&page_decoder, &ret);
@@ -156,8 +155,7 @@ public:
             ASSERT_TRUE(st.ok());
 
             // read whole the page
-            PageDecoderOptions decoder_options;
-            PageDecoderType page_decoder(encoded_data, decoder_options);
+            PageDecoderType page_decoder(encoded_data);
             Status status = page_decoder.init();
             ASSERT_TRUE(status.ok());
             ASSERT_EQ(0, page_decoder.current_index());
@@ -178,8 +176,7 @@ public:
 
         {
             // read half of the page
-            PageDecoderOptions decoder_options;
-            PageDecoderType page_decoder(encoded_data, decoder_options);
+            PageDecoderType page_decoder(encoded_data);
             Status status = page_decoder.init();
             ASSERT_TRUE(status.ok());
             ASSERT_EQ(0, page_decoder.current_index());
@@ -200,17 +197,16 @@ public:
 
         {
             // read range data of page
-            PageDecoderOptions decoder_options;
-            PageDecoderType page_decoder(encoded_data, decoder_options);
+            PageDecoderType page_decoder(encoded_data);
             Status status = page_decoder.init();
             ASSERT_TRUE(status.ok());
             ASSERT_EQ(0, page_decoder.current_index());
 
             auto dst = ChunkHelper::column_from_field_type(Type, false);
-            SparseRange read_range;
-            read_range.add(Range(0, count / 3));
-            read_range.add(Range(count / 2, (count * 2 / 3)));
-            read_range.add(Range((count * 3 / 4), count));
+            SparseRange<> read_range;
+            read_range.add(Range<>(0, count / 3));
+            read_range.add(Range<>(count / 2, (count * 2 / 3)));
+            read_range.add(Range<>((count * 3 / 4), count));
             size_t read_num = read_range.span_size();
 
             dst->reserve(read_range.span_size());
@@ -220,9 +216,9 @@ public:
 
             TypeInfoPtr type_info = get_type_info(Type);
             size_t offset = 0;
-            SparseRangeIterator read_iter = read_range.new_iterator();
+            SparseRangeIterator<> read_iter = read_range.new_iterator();
             while (read_iter.has_more()) {
-                Range r = read_iter.next(read_num);
+                Range<> r = read_iter.next(read_num);
                 for (int i = 0; i < r.span_size(); ++i) {
                     ASSERT_EQ(0, type_info->cmp(src->get(r.begin() + i), dst->get(i + offset)))
                             << " row " << i << ": " << datum_to_string(type_info.get(), src->get(r.begin() + i))
@@ -255,8 +251,7 @@ public:
         Status st = StoragePageDecoder::decode_page(&footer, 0, starrocks::BIT_SHUFFLE, &page, &encoded_data);
         ASSERT_TRUE(st.ok());
 
-        PageDecoderOptions decoder_options;
-        PageDecoderType page_decoder(encoded_data, decoder_options);
+        PageDecoderType page_decoder(encoded_data);
         Status status = page_decoder.init();
         ASSERT_TRUE(status.ok());
         ASSERT_EQ(0, page_decoder.current_index());

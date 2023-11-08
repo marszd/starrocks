@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Splitter;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.InPredicate;
 import com.starrocks.analysis.Predicate;
@@ -49,7 +49,7 @@ public class ResourceGroupAnalyzer {
         ResourceGroupClassifier classifier = new ResourceGroupClassifier();
         for (Predicate pred : predicates) {
             if (pred instanceof BinaryPredicate &&
-                    ((BinaryPredicate) pred).getOp().equals(BinaryPredicate.Operator.EQ)) {
+                    ((BinaryPredicate) pred).getOp().equals(BinaryType.EQ)) {
                 BinaryPredicate eqPred = (BinaryPredicate) pred;
                 Expr lhs = eqPred.getChild(0);
                 Expr rhs = eqPred.getChild(1);
@@ -59,7 +59,7 @@ public class ResourceGroupAnalyzer {
                 String key = ((SlotRef) lhs).getColumnName();
                 String value = ((StringLiteral) rhs).getValue();
                 if (key.equalsIgnoreCase(ResourceGroup.USER)) {
-                    if (!ResourceGroupClassifier.USE_ROLE_PATTERN.matcher(value).matches()) {
+                    if (!ResourceGroupClassifier.USER_PATTERN.matcher(value).matches()) {
                         throw new SemanticException(
                                 String.format("Illegal classifier specifier '%s': '%s'", ResourceGroup.USER,
                                         eqPred.toSql()));
@@ -91,6 +91,22 @@ public class ResourceGroupAnalyzer {
                         databaseIds.add(db.getId());
                     }
                     classifier.setDatabases(databaseIds);
+                } else if (key.equalsIgnoreCase(ResourceGroup.PLAN_CPU_COST_RANGE)) {
+                    ResourceGroupClassifier.CostRange planCpuCostRange = ResourceGroupClassifier.CostRange.fromString(value);
+                    if (planCpuCostRange == null) {
+                        throw new SemanticException(String.format("Illegal classifier specifier '%s': '%s', and "
+                                        + ResourceGroupClassifier.CostRange.FORMAT_STR_RANGE_MESSAGE,
+                                ResourceGroup.PLAN_CPU_COST_RANGE, eqPred.toSql()));
+                    }
+                    classifier.setPlanCpuCostRange(planCpuCostRange);
+                } else if (key.equalsIgnoreCase(ResourceGroup.PLAN_MEM_COST_RANGE)) {
+                    ResourceGroupClassifier.CostRange planMemCostRange = ResourceGroupClassifier.CostRange.fromString(value);
+                    if (planMemCostRange == null) {
+                        throw new SemanticException(String.format("Illegal classifier specifier '%s': '%s', and "
+                                        + ResourceGroupClassifier.CostRange.FORMAT_STR_RANGE_MESSAGE,
+                                ResourceGroup.PLAN_MEM_COST_RANGE, eqPred.toSql()));
+                    }
+                    classifier.setPlanMemCostRange(planMemCostRange);
                 } else {
                     throw new SemanticException(String.format("Unsupported classifier specifier: '%s'", key));
                 }
@@ -126,8 +142,11 @@ public class ResourceGroupAnalyzer {
                 classifier.getRole() == null &&
                 (classifier.getQueryTypes() == null || classifier.getQueryTypes().isEmpty()) &&
                 classifier.getSourceIp() == null &&
-                classifier.getDatabases() == null) {
-            throw new SemanticException("At least one of ('user', 'role', 'query_type', 'source_ip') should be given");
+                classifier.getDatabases() == null &&
+                classifier.getPlanCpuCostRange() == null &&
+                classifier.getPlanMemCostRange() == null) {
+            throw new SemanticException("At least one of ('user', 'role', 'query_type', 'db', 'source_ip', " +
+                    "'plan_cpu_cost_range', 'plan_mem_cost_range') should be given");
         }
         return classifier;
     }
@@ -145,6 +164,15 @@ public class ResourceGroupAnalyzer {
                     throw new SemanticException(String.format("cpu_core_limit should range from 1 to %d", avgCoreNum));
                 }
                 resourceGroup.setCpuCoreLimit(Integer.parseInt(value));
+                continue;
+            }
+            if (key.equalsIgnoreCase(ResourceGroup.MAX_CPU_CORES)) {
+                int maxCpuCores = Integer.parseInt(value);
+                int avgCoreNum = BackendCoreStat.getAvgNumOfHardwareCoresOfBe();
+                if (maxCpuCores > avgCoreNum) {
+                    throw new SemanticException(String.format("max_cpu_cores should range from 0 to %d", avgCoreNum));
+                }
+                resourceGroup.setMaxCpuCores(Integer.parseInt(value));
                 continue;
             }
             if (key.equalsIgnoreCase(ResourceGroup.MEM_LIMIT)) {
@@ -201,11 +229,12 @@ public class ResourceGroupAnalyzer {
                 try {
                     resourceGroup.setResourceGroupType(TWorkGroupType.valueOf("WG_" + value.toUpperCase()));
                     if (resourceGroup.getResourceGroupType() != TWorkGroupType.WG_NORMAL &&
-                            resourceGroup.getResourceGroupType() != TWorkGroupType.WG_SHORT_QUERY) {
-                        throw new SemanticException("Only support 'normal' and 'short_query' type");
+                            resourceGroup.getResourceGroupType() != TWorkGroupType.WG_SHORT_QUERY &&
+                            resourceGroup.getResourceGroupType() != TWorkGroupType.WG_MV) {
+                        throw new SemanticException("Only support 'normal', 'mv' and 'short_query' type");
                     }
                 } catch (Exception ignored) {
-                    throw new SemanticException("Only support 'normal' and 'short_query' type");
+                    throw new SemanticException("Only support 'normal', 'mv' and 'short_query' type");
                 }
                 continue;
             }

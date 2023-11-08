@@ -16,8 +16,8 @@
 package com.starrocks.privilege;
 
 import com.google.gson.annotations.SerializedName;
-import com.starrocks.analysis.UserIdentity;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.UserIdentity;
 
 import java.util.Objects;
 
@@ -38,7 +38,7 @@ public class UserPEntryObject implements PEntryObject {
             return new UserPEntryObject(null);
         }
 
-        if (!mgr.getAuthenticationManager().doesUserExist(user)) {
+        if (!mgr.getAuthenticationMgr().doesUserExist(user)) {
             throw new PrivObjNotFoundException("cannot find user " + user);
         }
         return new UserPEntryObject(user);
@@ -69,14 +69,15 @@ public class UserPEntryObject implements PEntryObject {
     }
 
     /**
-     * normally we check if a user exists by AuthenticationManager, but here we checked by PrivilegeManager to avoid deadlock.
+     * normally we check if a user exists by AuthenticationManager,
+     * but here we checked by AuthorizationManager to avoid deadlock.
      * lock order should always be:
-     * AuthenticationManager.lock -> PrivilegeManager.userLock -> PrivilegeManager.roleLock
-     * All validation are made in com.starrocks.privilege.PrivilegeManager#removeInvalidObject()
+     * AuthenticationManager.lock -> AuthorizationManager.userLock -> AuthorizationManager.roleLock
+     * All validation are made in com.starrocks.privilege.AuthorizationManager#removeInvalidObject()
      */
     @Override
     public boolean validate(GlobalStateMgr globalStateMgr) {
-        return globalStateMgr.getPrivilegeManager().getUserPrivilegeCollectionUnlockedAllowNull(userIdentity) != null;
+        return globalStateMgr.getAuthorizationMgr().getUserPrivilegeCollectionUnlockedAllowNull(userIdentity) != null;
     }
 
     @Override
@@ -125,5 +126,14 @@ public class UserPEntryObject implements PEntryObject {
     @Override
     public PEntryObject clone() {
         return new UserPEntryObject(userIdentity);
+    }
+
+    @Override
+    public String toString() {
+        if (userIdentity == null) {
+            return "ALL USERS";
+        } else {
+            return userIdentity.toString();
+        }
     }
 }

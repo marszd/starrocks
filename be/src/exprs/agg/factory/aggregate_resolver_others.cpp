@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "exprs/agg/aggregate_factory.h"
+#include "exprs/agg/any_value.h"
 #include "exprs/agg/factory/aggregate_factory.hpp"
 #include "exprs/agg/factory/aggregate_resolver.hpp"
 #include "exprs/agg/group_concat.h"
@@ -22,6 +23,17 @@
 
 namespace starrocks {
 
+struct PercentileDiscDispatcher {
+    template <LogicalType pt>
+    void operator()(AggregateFuncResolver* resolver) {
+        if constexpr (lt_is_datetime<pt> || lt_is_date<pt> || lt_is_arithmetic<pt> || lt_is_string<pt> ||
+                      lt_is_decimal_of_any_version<pt>) {
+            resolver->add_aggregate_mapping_variadic<pt, pt, PercentileState<pt>>(
+                    "percentile_disc", false, AggregateFactory::MakePercentileDiscAggregateFunction<pt>());
+        }
+    }
+};
+
 void AggregateFuncResolver::register_others() {
     add_aggregate_mapping_notnull<TYPE_BIGINT, TYPE_DOUBLE>("percentile_approx", false,
                                                             AggregateFactory::MakePercentileApproxAggregateFunction());
@@ -30,12 +42,16 @@ void AggregateFuncResolver::register_others() {
     add_aggregate_mapping<TYPE_PERCENTILE, TYPE_PERCENTILE, PercentileValue>(
             "percentile_union", false, AggregateFactory::MakePercentileUnionAggregateFunction());
 
-    add_aggregate_mapping_variadic<TYPE_DOUBLE, TYPE_DOUBLE, PercentileContState<TYPE_DOUBLE>>(
+    add_aggregate_mapping_variadic<TYPE_DOUBLE, TYPE_DOUBLE, PercentileState<TYPE_DOUBLE>>(
             "percentile_cont", false, AggregateFactory::MakePercentileContAggregateFunction<TYPE_DOUBLE>());
-    add_aggregate_mapping_variadic<TYPE_DATETIME, TYPE_DATETIME, PercentileContState<TYPE_DATETIME>>(
+    add_aggregate_mapping_variadic<TYPE_DATETIME, TYPE_DATETIME, PercentileState<TYPE_DATETIME>>(
             "percentile_cont", false, AggregateFactory::MakePercentileContAggregateFunction<TYPE_DATETIME>());
-    add_aggregate_mapping_variadic<TYPE_DATE, TYPE_DATE, PercentileContState<TYPE_DATE>>(
+    add_aggregate_mapping_variadic<TYPE_DATE, TYPE_DATE, PercentileState<TYPE_DATE>>(
             "percentile_cont", false, AggregateFactory::MakePercentileContAggregateFunction<TYPE_DATE>());
+
+    for (auto type : sortable_types()) {
+        type_dispatch_all(type, PercentileDiscDispatcher(), this);
+    }
 
     add_aggregate_mapping_variadic<TYPE_CHAR, TYPE_VARCHAR, GroupConcatAggregateState>(
             "group_concat", false, AggregateFactory::MakeGroupConcatAggregateFunction<TYPE_CHAR>());
@@ -56,6 +72,10 @@ void AggregateFuncResolver::register_others() {
     add_array_mapping<TYPE_BIGINT, TYPE_INT>("window_funnel");
     add_array_mapping<TYPE_DATETIME, TYPE_INT>("window_funnel");
     add_array_mapping<TYPE_DATE, TYPE_INT>("window_funnel");
+
+    add_general_mapping<AnyValueSemiState>("any_value", false, AggregateFactory::MakeAnyValueSemiAggregateFunction());
+    add_general_mapping_notnull("array_agg2", false, AggregateFactory::MakeArrayAggAggregateFunctionV2());
+    add_general_mapping_notnull("group_concat2", false, AggregateFactory::MakeGroupConcatAggregateFunctionV2());
 }
 
 } // namespace starrocks

@@ -82,7 +82,8 @@ public class AlterOperations {
 
     // MODIFY_TABLE_PROPERTY is also processed by SchemaChangeHandler
     public boolean hasSchemaChangeOp() {
-        return currentOps.contains(AlterOpType.SCHEMA_CHANGE) || currentOps.contains(AlterOpType.MODIFY_TABLE_PROPERTY);
+        return currentOps.contains(AlterOpType.SCHEMA_CHANGE) || currentOps.contains(AlterOpType.MODIFY_TABLE_PROPERTY)
+                || currentOps.contains(AlterOpType.OPTIMIZE);
     }
 
     public boolean hasRollupOp() {
@@ -99,6 +100,14 @@ public class AlterOperations {
 
     public boolean hasTruncatePartitionOp() {
         return currentOps.contains(AlterOpType.TRUNCATE_PARTITION);
+    }
+
+    public boolean hasCompactOp() {
+        return currentOps.contains(AlterOpType.COMPACT);
+    }
+
+    public boolean hasAlterCommentOp() {
+        return currentOps.contains(AlterOpType.ALTER_COMMENT);
     }
 
     public boolean contains(AlterOpType op) {

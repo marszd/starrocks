@@ -89,14 +89,28 @@ void FixedLengthColumnBase<T>::fill_default(const Filter& filter) {
 }
 
 template <typename T>
-Status FixedLengthColumnBase<T>::update_rows(const Column& src, const uint32_t* indexes) {
+Status FixedLengthColumnBase<T>::fill_range(const Buffer<T>& ids, const std::vector<uint8_t>& filter) {
+    DCHECK_EQ(filter.size(), _data.size());
+    size_t j = 0;
+    for (size_t i = 0; i < _data.size(); ++i) {
+        if (filter[i] == 1) {
+            _data[i] = ids[j];
+            ++j;
+        }
+    }
+    DCHECK_EQ(j, ids.size());
+
+    return Status::OK();
+}
+
+template <typename T>
+void FixedLengthColumnBase<T>::update_rows(const Column& src, const uint32_t* indexes) {
     const T* src_data = reinterpret_cast<const T*>(src.raw_data());
     size_t replace_num = src.size();
     for (uint32_t i = 0; i < replace_num; ++i) {
         DCHECK_LT(indexes[i], _data.size());
         _data[indexes[i]] = src_data[i];
     }
-    return Status::OK();
 }
 
 template <typename T>
@@ -304,7 +318,7 @@ std::string FixedLengthColumnBase<T>::debug_string() const {
     std::stringstream ss;
     ss << "[";
     size_t size = this->size();
-    for (size_t i = 0; i < size - 1; ++i) {
+    for (size_t i = 0; i + 1 < size; ++i) {
         ss << debug_item(i) << ", ";
     }
     if (size > 0) {

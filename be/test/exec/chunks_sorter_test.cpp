@@ -14,12 +14,16 @@
 
 #include "exec/chunks_sorter.h"
 
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <gtest/gtest.h>
 
 #include <cstdio>
 #include <memory>
+#include <string_view>
 
 #include "column/column_helper.h"
+#include "column/datum.h"
 #include "column/datum_tuple.h"
 #include "column/nullable_column.h"
 #include "column/vectorized_fwd.h"
@@ -128,17 +132,17 @@ public:
         col_nation_2->append_datum(Datum(Slice("null0")));
         col_region_2->append_datum(Datum(Slice("null0")));
         col_mkt_sgmt_2->append_datum(Datum(Slice("null0")));
-        col_nation_2->set_null(col_nation_2->size() - 1);
-        col_region_2->set_null(col_region_2->size() - 1);
-        col_mkt_sgmt_2->set_null(col_mkt_sgmt_2->size() - 1);
+        (void)col_nation_2->set_null(col_nation_2->size() - 1);
+        (void)col_region_2->set_null(col_region_2->size() - 1);
+        (void)col_mkt_sgmt_2->set_null(col_mkt_sgmt_2->size() - 1);
 
         col_cust_key_3->append_datum(Datum(int32_t(70)));
         col_nation_3->append_datum(Datum(Slice("null1")));
         col_region_3->append_datum(Datum(Slice("null1")));
         col_mkt_sgmt_3->append_datum(Datum(Slice("null1")));
-        col_nation_3->set_null(col_nation_3->size() - 1);
-        col_region_3->set_null(col_region_3->size() - 1);
-        col_mkt_sgmt_3->set_null(col_mkt_sgmt_3->size() - 1);
+        (void)col_nation_3->set_null(col_nation_3->size() - 1);
+        (void)col_region_3->set_null(col_region_3->size() - 1);
+        (void)col_mkt_sgmt_3->set_null(col_mkt_sgmt_3->size() - 1);
 
         col_cust_key_1->append_datum(Datum(int32_t(71)));
         col_nation_1->append_datum(Datum());
@@ -273,7 +277,7 @@ static Permutation make_permutation(int len) {
     bool eos = false;
     while (!eos) {
         ChunkPtr chunk;
-        sorter.get_next(&chunk, &eos);
+        (void)sorter.get_next(&chunk, &eos);
         if (chunk) {
             result.push_back(chunk);
         }
@@ -286,7 +290,7 @@ static ChunkPtr consume_page_from_sorter(ChunksSorter& sorter) {
     bool eos = false;
     while (!eos) {
         ChunkPtr chunk;
-        sorter.get_next(&chunk, &eos);
+        (void)sorter.get_next(&chunk, &eos);
         if (chunk) {
             if (!res) {
                 res.reset(chunk->clone_unique().release());
@@ -310,13 +314,17 @@ TEST_F(ChunksSorterTest, full_sort_incremental) {
     sort_exprs.push_back(new ExprContext(_expr_cust_key.get()));
     ASSERT_OK(Expr::prepare(sort_exprs, _runtime_state.get()));
     ASSERT_OK(Expr::open(sort_exprs, _runtime_state.get()));
-
-    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "");
+    auto pool = std::make_unique<ObjectPool>();
+    std::vector<SlotId> slots{_expr_region->slot_id(), _expr_cust_key->slot_id()};
+    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "", 1024000, 16777216,
+                                slots);
+    sorter.setup_runtime(_runtime_state.get(), pool->add(new RuntimeProfile("", false)),
+                         pool->add(new MemTracker(1L << 62, "", nullptr)));
     size_t total_rows = _chunk_1->num_rows() + _chunk_2->num_rows() + _chunk_3->num_rows();
-    sorter.update(_runtime_state.get(), _chunk_1);
-    sorter.update(_runtime_state.get(), _chunk_2);
-    sorter.update(_runtime_state.get(), _chunk_3);
-    sorter.done(_runtime_state.get());
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_1));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_2));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_3));
+    ASSERT_OK(sorter.done(_runtime_state.get()));
 
     ChunkPtr page_1 = consume_page_from_sorter(sorter);
 
@@ -433,10 +441,10 @@ TEST_F(ChunksSorterTest, topn_sort_with_limit) {
             std::cerr << fmt::format("order by column {} limit {}", name, limit) << std::endl;
             ChunksSorterTopn sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "", 0, limit);
             size_t total_rows = _chunk_1->num_rows() + _chunk_2->num_rows() + _chunk_3->num_rows();
-            sorter.update(_runtime_state.get(), ChunkPtr(_chunk_1->clone_unique().release()));
-            sorter.update(_runtime_state.get(), ChunkPtr(_chunk_2->clone_unique().release()));
-            sorter.update(_runtime_state.get(), ChunkPtr(_chunk_3->clone_unique().release()));
-            sorter.done(_runtime_state.get());
+            ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_1->clone_unique().release())));
+            ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_2->clone_unique().release())));
+            ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_3->clone_unique().release())));
+            ASSERT_OK(sorter.done(_runtime_state.get()));
 
             ChunkPtr page_1 = consume_page_from_sorter(sorter);
 
@@ -478,13 +486,13 @@ TEST_F(ChunksSorterTest, rank_topn) {
             ChunksSorterTopn sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "", 0, limit,
                                     TTopNType::RANK, 1);
             if (ranking1_first) {
-                sorter.update(_runtime_state.get(), ChunkPtr(_chunk_ranking_1->clone_unique().release()));
-                sorter.update(_runtime_state.get(), ChunkPtr(_chunk_ranking_2->clone_unique().release()));
+                ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_ranking_1->clone_unique().release())));
+                ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_ranking_2->clone_unique().release())));
             } else {
-                sorter.update(_runtime_state.get(), ChunkPtr(_chunk_ranking_2->clone_unique().release()));
-                sorter.update(_runtime_state.get(), ChunkPtr(_chunk_ranking_1->clone_unique().release()));
+                ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_ranking_2->clone_unique().release())));
+                ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_ranking_1->clone_unique().release())));
             }
-            sorter.done(_runtime_state.get());
+            ASSERT_OK(sorter.done(_runtime_state.get()));
 
             ChunkPtr page = consume_page_from_sorter(sorter);
             int res_num_rows = res_num_rows_by_limit[limit];
@@ -516,12 +524,17 @@ TEST_F(ChunksSorterTest, full_sort_by_2_columns_null_first) {
     ASSERT_OK(Expr::prepare(sort_exprs, _runtime_state.get()));
     ASSERT_OK(Expr::open(sort_exprs, _runtime_state.get()));
 
-    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "");
+    auto pool = std::make_unique<ObjectPool>();
+    std::vector<SlotId> slots{_expr_region->slot_id(), _expr_cust_key->slot_id()};
+    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "", 1024000, 16777216,
+                                slots);
+    sorter.setup_runtime(_runtime_state.get(), pool->add(new RuntimeProfile("", false)),
+                         pool->add(new MemTracker(1L << 62, "", nullptr)));
     size_t total_rows = _chunk_1->num_rows() + _chunk_2->num_rows() + _chunk_3->num_rows();
-    sorter.update(_runtime_state.get(), _chunk_1);
-    sorter.update(_runtime_state.get(), _chunk_2);
-    sorter.update(_runtime_state.get(), _chunk_3);
-    sorter.done(_runtime_state.get());
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_1));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_2));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_3));
+    ASSERT_OK(sorter.done(_runtime_state.get()));
 
     ChunkPtr page_1 = consume_page_from_sorter(sorter);
 
@@ -551,12 +564,17 @@ TEST_F(ChunksSorterTest, full_sort_by_2_columns_null_last) {
     ASSERT_OK(Expr::prepare(sort_exprs, _runtime_state.get()));
     ASSERT_OK(Expr::open(sort_exprs, _runtime_state.get()));
 
-    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "");
+    auto pool = std::make_unique<ObjectPool>();
+    std::vector<SlotId> slots{_expr_region->slot_id(), _expr_cust_key->slot_id()};
+    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "", 1024000, 16777216,
+                                slots);
+    sorter.setup_runtime(_runtime_state.get(), pool->add(new RuntimeProfile("", false)),
+                         pool->add(new MemTracker(1L << 62, "", nullptr)));
     size_t total_rows = _chunk_1->num_rows() + _chunk_2->num_rows() + _chunk_3->num_rows();
-    sorter.update(_runtime_state.get(), _chunk_1);
-    sorter.update(_runtime_state.get(), _chunk_2);
-    sorter.update(_runtime_state.get(), _chunk_3);
-    sorter.done(_runtime_state.get());
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_1));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_2));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_3));
+    ASSERT_OK(sorter.done(_runtime_state.get()));
 
     ChunkPtr page_1 = consume_page_from_sorter(sorter);
 
@@ -589,12 +607,17 @@ TEST_F(ChunksSorterTest, full_sort_by_3_columns) {
     ASSERT_OK(Expr::prepare(sort_exprs, _runtime_state.get()));
     ASSERT_OK(Expr::open(sort_exprs, _runtime_state.get()));
 
-    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "");
+    auto pool = std::make_unique<ObjectPool>();
+    std::vector<SlotId> slots{_expr_region->slot_id(), _expr_cust_key->slot_id()};
+    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "", 1024000, 16777216,
+                                slots);
+    sorter.setup_runtime(_runtime_state.get(), pool->add(new RuntimeProfile("", false)),
+                         pool->add(new MemTracker(1L << 62, "", nullptr)));
     size_t total_rows = _chunk_1->num_rows() + _chunk_2->num_rows() + _chunk_3->num_rows();
-    sorter.update(_runtime_state.get(), _chunk_1);
-    sorter.update(_runtime_state.get(), _chunk_2);
-    sorter.update(_runtime_state.get(), _chunk_3);
-    sorter.done(_runtime_state.get());
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_1));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_2));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_3));
+    ASSERT_OK(sorter.done(_runtime_state.get()));
 
     ChunkPtr page_1 = consume_page_from_sorter(sorter);
 
@@ -630,12 +653,17 @@ TEST_F(ChunksSorterTest, full_sort_by_4_columns) {
     ASSERT_OK(Expr::prepare(sort_exprs, _runtime_state.get()));
     ASSERT_OK(Expr::open(sort_exprs, _runtime_state.get()));
 
-    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "");
+    auto pool = std::make_unique<ObjectPool>();
+    std::vector<SlotId> slots{_expr_region->slot_id(), _expr_cust_key->slot_id()};
+    ChunksSorterFullSort sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "", 1024000, 16777216,
+                                slots);
+    sorter.setup_runtime(_runtime_state.get(), pool->add(new RuntimeProfile("", false)),
+                         pool->add(new MemTracker(1L << 62, "", nullptr)));
     size_t total_rows = _chunk_1->num_rows() + _chunk_2->num_rows() + _chunk_3->num_rows();
-    sorter.update(_runtime_state.get(), _chunk_1);
-    sorter.update(_runtime_state.get(), _chunk_2);
-    sorter.update(_runtime_state.get(), _chunk_3);
-    sorter.done(_runtime_state.get());
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_1));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_2));
+    ASSERT_OK(sorter.update(_runtime_state.get(), _chunk_3));
+    ASSERT_OK(sorter.done(_runtime_state.get()));
 
     ChunkPtr page_1 = consume_page_from_sorter(sorter);
     // print_chunk(page_1);
@@ -673,10 +701,10 @@ TEST_F(ChunksSorterTest, part_sort_by_3_columns_null_fisrt) {
                             2);
 
     size_t total_rows = _chunk_1->num_rows() + _chunk_2->num_rows() + _chunk_3->num_rows();
-    sorter.update(_runtime_state.get(), ChunkPtr(_chunk_1->clone_unique().release()));
-    sorter.update(_runtime_state.get(), ChunkPtr(_chunk_2->clone_unique().release()));
-    sorter.update(_runtime_state.get(), ChunkPtr(_chunk_3->clone_unique().release()));
-    sorter.done(_runtime_state.get());
+    ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_1->clone_unique().release())));
+    ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_2->clone_unique().release())));
+    ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_3->clone_unique().release())));
+    ASSERT_OK(sorter.done(_runtime_state.get()));
 
     ChunkPtr page_1 = consume_page_from_sorter(sorter);
 
@@ -713,10 +741,10 @@ TEST_F(ChunksSorterTest, part_sort_by_3_columns_null_last) {
         ChunksSorterTopn sorter(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "", offset, limit,
                                 TTopNType::ROW_NUMBER, 2);
         size_t total_rows = _chunk_1->num_rows() + _chunk_2->num_rows() + _chunk_3->num_rows();
-        sorter.update(_runtime_state.get(), ChunkPtr(_chunk_1->clone_unique().release()));
-        sorter.update(_runtime_state.get(), ChunkPtr(_chunk_2->clone_unique().release()));
-        sorter.update(_runtime_state.get(), ChunkPtr(_chunk_3->clone_unique().release()));
-        sorter.done(_runtime_state.get());
+        ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_1->clone_unique().release())));
+        ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_2->clone_unique().release())));
+        ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_3->clone_unique().release())));
+        ASSERT_OK(sorter.done(_runtime_state.get()));
 
         ChunkPtr page_1 = consume_page_from_sorter(sorter);
 
@@ -734,10 +762,10 @@ TEST_F(ChunksSorterTest, part_sort_by_3_columns_null_last) {
         // part sort with large offset
         ChunksSorterTopn sorter2(_runtime_state.get(), &sort_exprs, &is_asc, &is_null_first, "", 100, limit,
                                  TTopNType::ROW_NUMBER, 2);
-        sorter.update(_runtime_state.get(), ChunkPtr(_chunk_1->clone_unique().release()));
-        sorter.update(_runtime_state.get(), ChunkPtr(_chunk_2->clone_unique().release()));
-        sorter.update(_runtime_state.get(), ChunkPtr(_chunk_3->clone_unique().release()));
-        sorter2.done(_runtime_state.get());
+        ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_1->clone_unique().release())));
+        ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_2->clone_unique().release())));
+        ASSERT_OK(sorter.update(_runtime_state.get(), ChunkPtr(_chunk_3->clone_unique().release())));
+        ASSERT_OK(sorter2.done(_runtime_state.get()));
         page_1 = consume_page_from_sorter(sorter2);
         ASSERT_TRUE(page_1 == nullptr);
     }
@@ -767,10 +795,10 @@ TEST_F(ChunksSorterTest, order_by_with_unequal_sized_chunks) {
         chunk_1->get_column_by_index(i)->append(*(_chunk_1->get_column_by_index(i)), 0, 1);
         chunk_2->get_column_by_index(i)->append(*(_chunk_2->get_column_by_index(i)), 0, 1);
     }
-    full_sorter.update(_runtime_state.get(), chunk_1);
-    full_sorter.update(_runtime_state.get(), chunk_2);
-    full_sorter.update(_runtime_state.get(), _chunk_3);
-    full_sorter.done(_runtime_state.get());
+    ASSERT_OK(full_sorter.update(_runtime_state.get(), chunk_1));
+    ASSERT_OK(full_sorter.update(_runtime_state.get(), chunk_2));
+    ASSERT_OK(full_sorter.update(_runtime_state.get(), _chunk_3));
+    ASSERT_OK(full_sorter.done(_runtime_state.get()));
 
     ChunkPtr page_1 = consume_page_from_sorter(full_sorter);
 
@@ -1010,6 +1038,41 @@ TEST_F(ChunksSorterTest, find_zero) {
     }
 }
 
+TEST_F(ChunksSorterTest, test_compare_column) {
+    std::vector<int8_t> cmp_vector;
+    std::vector<Datum> rhs_values;
+
+    rhs_values.emplace_back(int32_t(1));
+
+    // get filter array x < 1
+    TypeDescriptor type_desc = TypeDescriptor(TYPE_INT);
+    ColumnPtr nullable_column = ColumnHelper::create_column(type_desc, true);
+
+    nullable_column->append_datum(Datum(1));
+    nullable_column->append_datum(Datum(2));
+    nullable_column->append_nulls(2);
+
+    cmp_vector.resize(nullable_column->size());
+
+    auto desc_null_last = SortDescs();
+    desc_null_last.descs.emplace_back(false, false);
+    compare_columns(Columns{nullable_column}, cmp_vector, rhs_values, desc_null_last);
+
+    std::vector<int8_t> expected = {0, -1, 1, 1};
+    EXPECT_EQ(cmp_vector, expected);
+
+    // test asc null last
+    // get filter array x > 1
+    auto asc_null_last = SortDescs();
+    asc_null_last.descs.emplace_back(true, true);
+
+    cmp_vector.assign(4, 0);
+    compare_columns(Columns{nullable_column}, cmp_vector, rhs_values, asc_null_last);
+
+    expected = {0, 1, -1, -1};
+    EXPECT_EQ(cmp_vector, expected);
+}
+
 TEST_F(ChunksSorterTest, test_tie) {
     using Ranges = std::vector<std::pair<int, int>>;
     Tie tie{0, 1, 1, 1, 0, 1, 1, 0, 1, 0, 1};
@@ -1083,6 +1146,26 @@ TEST_F(ChunksSorterTest, test_tie) {
         ASSERT_EQ(iterator.range_last, 5);
         ASSERT_FALSE(iterator.next());
     }
+}
+
+// https://github.com/StarRocks/starrocks/issues/30758
+TEST_F(ChunksSorterTest, test_nan) {
+    std::ifstream ifs("./be/test/exec/test_data/nan_column");
+    std::string context((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
+    DoubleColumn double_column;
+    double_column.resize(86016);
+    auto& data = double_column.get_data();
+    memcpy(data.data(), context.data(), context.size());
+    auto permutation = create_small_permutation(double_column.size());
+    auto inlined = create_inline_permutation<double>(permutation, data);
+    auto begin = inlined.begin() + 26012;
+    auto end = inlined.begin() + 26047;
+
+    auto cmp = [](auto& lhs, auto& rhs) {
+        return SorterComparator<double>::compare(lhs.inline_value, rhs.inline_value);
+    };
+    auto greater = [&](auto lhs, auto rhs) { return cmp(lhs, rhs) > 0; };
+    ::pdqsort(begin, end, greater);
 }
 
 } // namespace starrocks

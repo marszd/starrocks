@@ -15,8 +15,8 @@
 
 package com.starrocks.common.proc;
 
-import com.clearspring.analytics.util.Lists;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.util.QueryStatisticsFormatter;
 import com.starrocks.qe.QueryStatisticsItem;
@@ -52,7 +52,7 @@ public class CurrentQueryHostProcNode implements ProcNodeInterface {
             rowData.add(host);
             rowData.add(QueryStatisticsFormatter.getBytes(statistics.scanBytes));
             rowData.add(QueryStatisticsFormatter.getRowsReturned(statistics.scanRows));
-            rowData.add(QueryStatisticsFormatter.getCPUCostSeconds(statistics.cpuCostNs));
+            rowData.add(QueryStatisticsFormatter.getSecondsFromNano(statistics.cpuCostNs));
             rowData.add(QueryStatisticsFormatter.getBytes(statistics.memUsageBytes));
             sortedRowDatas.add(rowData);
         }

@@ -14,17 +14,21 @@
 
 package com.starrocks.statistic;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.Table;
 import com.starrocks.common.DdlException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.QueryState;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.plan.ConnectorPlanTestBase;
 import com.starrocks.sql.plan.PlanTestBase;
+import com.starrocks.thrift.TStatisticData;
 import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
@@ -44,6 +48,7 @@ public class StatisticsExecutorTest extends PlanTestBase {
     public static void beforeClass() throws Exception {
         PlanTestBase.beforeClass();
         GlobalStateMgr globalStateMgr = connectContext.getGlobalStateMgr();
+        ConnectorPlanTestBase.mockHiveCatalog(connectContext);
 
         starRocksAssert.withTable("CREATE TABLE `t0_stats` (\n" +
                 "  `v1` bigint NULL COMMENT \"\",\n" +
@@ -56,8 +61,7 @@ public class StatisticsExecutorTest extends PlanTestBase {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         OlapTable t0 = (OlapTable) globalStateMgr.getDb("test").getTable("t0_stats");
@@ -78,11 +82,12 @@ public class StatisticsExecutorTest extends PlanTestBase {
 
         Database database = connectContext.getGlobalStateMgr().getDb("test");
         OlapTable table = (OlapTable) database.getTable("t0_stats");
-        List<Long> partitionIdList = table.getAllPartitions().stream().map(Partition::getId).collect(Collectors.toList());
+        List<Long> partitionIdList =
+                table.getAllPartitions().stream().map(Partition::getId).collect(Collectors.toList());
 
-        FullStatisticsCollectJob collectJob = new FullStatisticsCollectJob(database, table, partitionIdList,
+        SampleStatisticsCollectJob collectJob = new SampleStatisticsCollectJob(database, table,
                 Lists.newArrayList("v1", "v2", "v3", "v4", "v5"),
-                StatsConstants.AnalyzeType.FULL,
+                StatsConstants.AnalyzeType.SAMPLE,
                 StatsConstants.ScheduleType.SCHEDULE,
                 Maps.newHashMap());
 
@@ -116,6 +121,38 @@ public class StatisticsExecutorTest extends PlanTestBase {
         };
 
         collectJob.collectStatisticSync(sql, context);
+    }
+
+    @Test
+    public void testQueryStatisticSync() {
+        String res;
+        new MockUp<StatisticExecutor>() {
+            @Mock
+            public List<TStatisticData> executeStatisticDQL(ConnectContext context, String sql) {
+                Assert.assertEquals("SELECT cast(6 as INT), column_name, sum(row_count), cast(sum(data_size) as bigint), " +
+                            "hll_union_agg(ndv), sum(null_count),  cast(max(cast(max as int(11))) as string), " +
+                            "cast(min(cast(min as int(11))) as string) " +
+                            "FROM external_column_statistics " +
+                            "WHERE table_uuid = \"hive0.partitioned_db.t1.0\" " +
+                            "and column_name = \"c1\" " +
+                            "GROUP BY table_uuid, column_name UNION ALL " +
+                            "SELECT cast(6 as INT), column_name, sum(row_count), cast(sum(data_size) as bigint), " +
+                            "hll_union_agg(ndv), sum(null_count),  cast(max(cast(max as varchar(1073741824))) as string), " +
+                            "cast(min(cast(min as varchar(1073741824))) as string) " +
+                            "FROM external_column_statistics " +
+                            "WHERE table_uuid = \"hive0.partitioned_db.t1.0\"" +
+                            " and column_name = \"c2\" " +
+                            "GROUP BY table_uuid, column_name", sql);
+                return Lists.newArrayList();
+            }
+        };
+
+        ConnectContext context = StatisticUtils.buildConnectContext();
+        Table table = connectContext.getGlobalStateMgr().getMetadataMgr().getTable("hive0", "partitioned_db",
+                "t1");
+        String tableUUID = table.getUUID();
+        StatisticExecutor statisticExecutor = new StatisticExecutor();
+        statisticExecutor.queryStatisticSync(context, tableUUID, table, ImmutableList.of("c1", "c2"));
     }
 
     @Test

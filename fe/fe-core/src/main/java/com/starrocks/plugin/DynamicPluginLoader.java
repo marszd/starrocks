@@ -121,7 +121,8 @@ public class DynamicPluginLoader extends PluginLoader {
      */
     public void install() throws UserException, IOException {
         if (hasInstalled()) {
-            throw new UserException("Plugin " + pluginInfo.getName() + " has already been installed.");
+            String targetPath = pluginDir.toString() + "/" + pluginInfo.getName();
+            throw new UserException("Plugin " + pluginInfo.getName() + " has already been installed at:" + targetPath);
         }
 
         getPluginInfo();
@@ -154,7 +155,11 @@ public class DynamicPluginLoader extends PluginLoader {
     public void uninstall() throws IOException, UserException {
         if (plugin != null) {
             pluginUninstallValid();
-            plugin.close();
+            try {
+                plugin.close();
+            } catch (Throwable t) {
+                LOG.warn("close plugin failed", t);
+            }
         }
 
         if (null != installPath && Files.exists(installPath)
@@ -217,8 +222,9 @@ public class DynamicPluginLoader extends PluginLoader {
         // create a child to load the plugin in this bundle
         ClassLoader parentLoader = PluginClassLoader.createLoader(getClass().getClassLoader(), Collections.EMPTY_LIST);
 
+        URLClassLoader loader = URLClassLoader.newInstance(jarList.toArray(new URL[0]), parentLoader);
         Class<? extends Plugin> pluginClass;
-        try (URLClassLoader loader = URLClassLoader.newInstance(jarList.toArray(new URL[0]), parentLoader)) {
+        try  {
             pluginClass = loader.loadClass(pluginInfo.getClassName()).asSubclass(Plugin.class);
         } catch (ClassNotFoundException | NoClassDefFoundError t) {
             throw new UserException("Could not find plugin class [" + pluginInfo.getClassName() + "]", t);

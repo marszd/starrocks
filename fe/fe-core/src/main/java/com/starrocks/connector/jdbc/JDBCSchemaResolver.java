@@ -59,8 +59,25 @@ public abstract class JDBCSchemaResolver {
     }
 
     public Table getTable(long id, String name, List<Column> schema, String dbName,
-                          Map<String, String> properties) throws DdlException {
-        return new JDBCTable(id, name, schema, dbName, properties);
+                          String catalogName, Map<String, String> properties) throws DdlException {
+        return new JDBCTable(id, name, schema, dbName, catalogName, properties);
+    }
+
+    public Table getTable(long id, String name, List<Column> schema, List<Column> partitionColumns, String dbName,
+                          String catalogName, Map<String, String> properties) throws DdlException {
+        return new JDBCTable(id, name, schema, partitionColumns, dbName, catalogName, properties);
+    }
+
+    public List<String> listPartitionNames(Connection connection, String databaseName, String tableName) {
+        return Lists.newArrayList();
+    }
+
+    public List<String> listPartitionColumns(Connection connection, String databaseName, String tableName) {
+        return Lists.newArrayList();
+    }
+
+    public List<Partition> getPartitions(Connection connection, Table table) {
+        return Lists.newArrayList();
     }
 
     public List<Column> convertToSRTable(ResultSet columnSet) throws SQLException {

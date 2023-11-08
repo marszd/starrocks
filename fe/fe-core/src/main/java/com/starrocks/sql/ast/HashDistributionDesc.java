@@ -15,6 +15,7 @@
 
 package com.starrocks.sql.ast;
 
+import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.AggregateType;
 import com.starrocks.catalog.Column;
@@ -24,6 +25,7 @@ import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.io.Text;
 import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -36,11 +38,15 @@ public class HashDistributionDesc extends DistributionDesc {
     private final List<String> distributionColumnNames;
 
     public HashDistributionDesc() {
-        type = DistributionInfoType.HASH;
-        distributionColumnNames = Lists.newArrayList();
+        this(0, Lists.newArrayList(), NodePosition.ZERO);
     }
 
     public HashDistributionDesc(int numBucket, List<String> distributionColumnNames) {
+        this(numBucket, distributionColumnNames, NodePosition.ZERO);
+    }
+
+    public HashDistributionDesc(int numBucket, List<String> distributionColumnNames, NodePosition pos) {
+        super(pos);
         type = DistributionInfoType.HASH;
         this.numBucket = numBucket;
         this.distributionColumnNames = distributionColumnNames;
@@ -118,6 +124,15 @@ public class HashDistributionDesc extends DistributionDesc {
         int count = in.readInt();
         for (int i = 0; i < count; i++) {
             distributionColumnNames.add(Text.readString(in));
+        }
+    }
+ 
+    @Override
+    public String toString() {
+        if (numBucket > 0) {
+            return "DISTRIBUTED BY HASH(" + Joiner.on(", ").join(distributionColumnNames) + ") BUCKETS " + numBucket;
+        } else {
+            return "DISTRIBUTED BY HASH(" + Joiner.on(", ").join(distributionColumnNames) + ")";
         }
     }
 }

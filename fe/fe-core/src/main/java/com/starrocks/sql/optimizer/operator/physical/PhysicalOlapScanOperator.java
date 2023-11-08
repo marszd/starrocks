@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.operator.physical;
 
 import com.google.common.collect.Lists;
@@ -24,10 +23,10 @@ import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.base.DistributionSpec;
 import com.starrocks.sql.optimizer.base.HashDistributionDesc;
-import com.starrocks.sql.optimizer.base.HashDistributionSpec;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.OperatorVisitor;
 import com.starrocks.sql.optimizer.operator.Projection;
+import com.starrocks.sql.optimizer.operator.logical.LogicalOlapScanOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.statistics.ColumnDict;
@@ -39,19 +38,20 @@ import java.util.Objects;
 import java.util.Set;
 
 public class PhysicalOlapScanOperator extends PhysicalScanOperator {
-    private final HashDistributionSpec hashDistributionSpec;
+    private final DistributionSpec distributionSpec;
     private final long selectedIndexId;
     private final List<Long> selectedTabletId;
+    private final List<Long> hintsReplicaId;
     private final List<Long> selectedPartitionId;
 
     private boolean isPreAggregation;
     private String turnOffReason;
     protected boolean needSortedByKeyPerTablet = false;
+    protected boolean needOutputChunkByBucket = false;
+
+    private boolean usePkIndex = false;
 
     private List<Pair<Integer, ColumnDict>> globalDicts = Lists.newArrayList();
-    // For the simple predicate k1 = "olap", could apply global dict optimization,
-    // need to store the string column k1 and generate the string slot in plan fragment builder
-    private List<ColumnRefOperator> globalDictStringColumns = Lists.newArrayList();
     // TODO: remove this
     private Map<Integer, Integer> dictStringIdToIntIds = Maps.newHashMap();
 
@@ -59,20 +59,35 @@ public class PhysicalOlapScanOperator extends PhysicalScanOperator {
 
     public PhysicalOlapScanOperator(Table table,
                                     Map<ColumnRefOperator, Column> colRefToColumnMetaMap,
-                                    HashDistributionSpec hashDistributionDesc,
+                                    DistributionSpec distributionDesc,
                                     long limit,
                                     ScalarOperator predicate,
                                     long selectedIndexId,
                                     List<Long> selectedPartitionId,
                                     List<Long> selectedTabletId,
+                                    List<Long> hintsReplicaId,
                                     List<ScalarOperator> prunedPartitionPredicates,
-                                    Projection projection) {
+                                    Projection projection,
+                                    boolean usePkIndex) {
         super(OperatorType.PHYSICAL_OLAP_SCAN, table, colRefToColumnMetaMap, limit, predicate, projection);
-        this.hashDistributionSpec = hashDistributionDesc;
+        this.distributionSpec = distributionDesc;
         this.selectedIndexId = selectedIndexId;
         this.selectedPartitionId = selectedPartitionId;
         this.selectedTabletId = selectedTabletId;
+        this.hintsReplicaId = hintsReplicaId;
         this.prunedPartitionPredicates = prunedPartitionPredicates;
+        this.usePkIndex = usePkIndex;
+    }
+
+    public PhysicalOlapScanOperator(LogicalOlapScanOperator scanOperator) {
+        super(OperatorType.PHYSICAL_OLAP_SCAN, scanOperator);
+        this.distributionSpec = scanOperator.getDistributionSpec();
+        this.selectedIndexId = scanOperator.getSelectedIndexId();
+        this.selectedPartitionId = scanOperator.getSelectedPartitionId();
+        this.selectedTabletId = scanOperator.getSelectedTabletId();
+        this.hintsReplicaId = scanOperator.getHintsReplicaIds();
+        this.prunedPartitionPredicates = scanOperator.getPrunedPartitionPredicates();
+        this.usePkIndex = scanOperator.isUsePkIndex();
     }
 
     public long getSelectedIndexId() {
@@ -85,6 +100,10 @@ public class PhysicalOlapScanOperator extends PhysicalScanOperator {
 
     public List<Long> getSelectedTabletId() {
         return selectedTabletId;
+    }
+
+    public List<Long> getHintsReplicaId() {
+        return hintsReplicaId;
     }
 
     public boolean isPreAggregation() {
@@ -112,15 +131,6 @@ public class PhysicalOlapScanOperator extends PhysicalScanOperator {
         this.globalDicts = globalDicts;
     }
 
-    public List<ColumnRefOperator> getGlobalDictStringColumns() {
-        return globalDictStringColumns;
-    }
-
-    public void setGlobalDictStringColumns(
-            List<ColumnRefOperator> globalDictStringColumns) {
-        this.globalDictStringColumns = globalDictStringColumns;
-    }
-
     public Map<Integer, Integer> getDictStringIdToIntIds() {
         return dictStringIdToIntIds;
     }
@@ -141,8 +151,20 @@ public class PhysicalOlapScanOperator extends PhysicalScanOperator {
         return needSortedByKeyPerTablet;
     }
 
+    public boolean needOutputChunkByBucket() {
+        return needOutputChunkByBucket;
+    }
+
     public void setNeedSortedByKeyPerTablet(boolean needSortedByKeyPerTablet) {
         this.needSortedByKeyPerTablet = needSortedByKeyPerTablet;
+    }
+
+    public void setNeedOutputChunkByBucket(boolean needOutputChunkByBucket) {
+        this.needOutputChunkByBucket = needOutputChunkByBucket;
+    }
+
+    public boolean isUsePkIndex() {
+        return usePkIndex;
     }
 
     @Override
@@ -182,15 +204,15 @@ public class PhysicalOlapScanOperator extends PhysicalScanOperator {
         }
         PhysicalOlapScanOperator that = (PhysicalOlapScanOperator) o;
         return selectedIndexId == that.selectedIndexId &&
-                Objects.equals(hashDistributionSpec, that.hashDistributionSpec) &&
+                Objects.equals(distributionSpec, that.distributionSpec) &&
                 Objects.equals(selectedPartitionId, that.selectedPartitionId) &&
                 Objects.equals(selectedTabletId, that.selectedTabletId);
     }
 
-    public HashDistributionSpec getDistributionSpec() {
+    public DistributionSpec getDistributionSpec() {
         // In UT, the distributionInfo may be null
-        if (hashDistributionSpec != null) {
-            return hashDistributionSpec;
+        if (distributionSpec != null) {
+            return distributionSpec;
         } else {
             // 1023 is a placeholder column id, only in order to pass UT
             HashDistributionDesc leftHashDesc = new HashDistributionDesc(Collections.singletonList(1023),

@@ -57,7 +57,7 @@ public class UnionNode extends SetOperationNode {
     }
 
     @Override
-    public boolean canUsePipeLine() {
-        return getChildren().stream().allMatch(PlanNode::canUsePipeLine);
+    public boolean canUseRuntimeAdaptiveDop() {
+        return getChildren().stream().allMatch(PlanNode::canUseRuntimeAdaptiveDop);
     }
 }

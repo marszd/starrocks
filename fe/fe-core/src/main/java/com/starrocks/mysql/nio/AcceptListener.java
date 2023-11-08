@@ -33,6 +33,7 @@
 // under the License.
 package com.starrocks.mysql.nio;
 
+import com.starrocks.common.util.LogUtil;
 import com.starrocks.mysql.MysqlProto;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.ConnectProcessor;
@@ -45,6 +46,7 @@ import org.xnio.StreamConnection;
 import org.xnio.channels.AcceptingChannel;
 
 import java.io.IOException;
+import java.net.SocketAddress;
 import javax.net.ssl.SSLContext;
 
 /**
@@ -67,21 +69,27 @@ public class AcceptListener implements ChannelListener<AcceptingChannel<StreamCo
             if (connection == null) {
                 return;
             }
-            LOG.info("Connection established. remote={}", connection.getPeerAddress());
             // connection has been established, so need to call context.cleanup()
             // if exception happens.
             NConnectContext context = new NConnectContext(connection, sslContext);
             context.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
             connectScheduler.submit(context);
+            int connectionId = context.getConnectionId();
+            SocketAddress remoteAddr = connection.getPeerAddress();
+            LOG.info("Connection established. remote={}, connectionId={}", remoteAddr, connectionId);
 
             try {
                 channel.getWorker().execute(() -> {
+                    MysqlProto.NegotiateResult result = null;
                     try {
                         // Set thread local info
                         context.setThreadLocalInfo();
+                        LOG.info("Connection scheduled to worker thread {}. remote={}, connectionId={}",
+                                Thread.currentThread().getId(), remoteAddr, connectionId);
                         context.setConnectScheduler(connectScheduler);
                         // authenticate check failed.
-                        if (!MysqlProto.negotiate(context)) {
+                        result = MysqlProto.negotiate(context);
+                        if (!result.isSuccess()) {
                             throw new AfterConnectedException("mysql negotiate failed");
                         }
                         if (connectScheduler.registerConnection(context)) {
@@ -109,6 +117,8 @@ public class AcceptListener implements ChannelListener<AcceptingChannel<StreamCo
                         }
                         context.cleanup();
                     } finally {
+                        LogUtil.logConnectionInfoToAuditLogAndQueryQueue(context,
+                                result == null ? null : result.getAuthPacket());
                         ConnectContext.remove();
                     }
                 });

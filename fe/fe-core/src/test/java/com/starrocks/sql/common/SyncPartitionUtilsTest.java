@@ -14,33 +14,30 @@
 
 package com.starrocks.sql.common;
 
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.starrocks.analysis.DateLiteral;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Column;
-import com.starrocks.catalog.Database;
-import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.ScalarType;
-import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.common.Config;
-import com.starrocks.common.FeConstants;
-import com.starrocks.qe.ConnectContext;
-import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.common.util.DateUtils;
 import com.starrocks.sql.ast.PartitionValue;
-import com.starrocks.utframe.StarRocksAssert;
-import com.starrocks.utframe.UtFrameUtils;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -98,14 +95,14 @@ public class SyncPartitionUtilsTest {
         dstRangeMap.put("p202011_202012", createRange("2020-11-01", "2020-12-01"));
         dstRangeMap.put("p202012_202101", createRange("2020-12-01", "2021-01-01"));
 
-        Map<String, Set<String>> partitionRefMap = SyncPartitionUtils.generatePartitionRefMap(srcRangeMap, dstRangeMap);
+        Map<String, Set<String>> partitionRefMap = SyncPartitionUtils.getIntersectedPartitions(srcRangeMap, dstRangeMap);
 
         Assert.assertTrue(partitionRefMap.get("p20201015_20201115").contains("p202010_202011"));
         Assert.assertTrue(partitionRefMap.get("p20201015_20201115").contains("p202011_202012"));
         Assert.assertTrue(partitionRefMap.get("p20201115_20201215").contains("p202011_202012"));
         Assert.assertTrue(partitionRefMap.get("p20201115_20201215").contains("p202012_202101"));
 
-        partitionRefMap = SyncPartitionUtils.generatePartitionRefMap(dstRangeMap, srcRangeMap);
+        partitionRefMap = SyncPartitionUtils.getIntersectedPartitions(dstRangeMap, srcRangeMap);
 
         Assert.assertTrue(partitionRefMap.get("p202010_202011").contains("p20201015_20201115"));
         Assert.assertTrue(partitionRefMap.get("p202011_202012").contains("p20201015_20201115"));
@@ -119,10 +116,10 @@ public class SyncPartitionUtilsTest {
         dstRangeMap = Maps.newHashMap();
         dstRangeMap.put("p202011_202012", createRange("2020-11-01", "2020-12-01"));
 
-        partitionRefMap = SyncPartitionUtils.generatePartitionRefMap(srcRangeMap, dstRangeMap);
+        partitionRefMap = SyncPartitionUtils.getIntersectedPartitions(srcRangeMap, dstRangeMap);
         Assert.assertEquals(0, partitionRefMap.get("p20201015").size());
 
-        partitionRefMap = SyncPartitionUtils.generatePartitionRefMap(dstRangeMap, srcRangeMap);
+        partitionRefMap = SyncPartitionUtils.getIntersectedPartitions(dstRangeMap, srcRangeMap);
         Assert.assertEquals(0, partitionRefMap.get("p202011_202012").size());
 
     }
@@ -139,7 +136,7 @@ public class SyncPartitionUtilsTest {
         dstRangeMap.put("p202011_202012", createRange("2020-11-01", "2020-12-01"));
         dstRangeMap.put("p202012_202101", createRange("2020-12-01", "2021-01-01"));
 
-        Map<String, Set<String>> partitionRefMap = SyncPartitionUtils.generatePartitionRefMap(srcRangeMap, dstRangeMap);
+        Map<String, Set<String>> partitionRefMap = SyncPartitionUtils.getIntersectedPartitions(srcRangeMap, dstRangeMap);
 
         Assert.assertEquals(1, partitionRefMap.get("p202010_202011").size());
         Assert.assertEquals(1, partitionRefMap.get("p202011_202012").size());
@@ -161,14 +158,14 @@ public class SyncPartitionUtilsTest {
         Map<String, Range<PartitionKey>> dstRange = Maps.newHashMap();
         dstRange.put("p20200101", createRange("2020-01-01", "2020-01-02"));
 
-        Map<String, Range<PartitionKey>> diff = SyncPartitionUtils.diffRange(srcRange, dstRange);
+        Map<String, Range<PartitionKey>> diff = PartitionDiffer.diffRange(srcRange, dstRange);
         Assert.assertEquals(1, diff.size());
         Assert.assertEquals("2020-01-02 00:00:00",
                 diff.get("p20200102").lowerEndpoint().getKeys().get(0).getStringValue());
         Assert.assertEquals("2020-01-03 00:00:00",
                 diff.get("p20200102").upperEndpoint().getKeys().get(0).getStringValue());
 
-        diff = SyncPartitionUtils.diffRange(dstRange, srcRange);
+        diff = PartitionDiffer.diffRange(dstRange, srcRange);
         Assert.assertEquals(0, diff.size());
 
         // two range
@@ -184,7 +181,7 @@ public class SyncPartitionUtilsTest {
         dstRange.put("p20200102", createRange("2020-01-02", "2020-01-06"));
         dstRange.put("p20200106", createRange("2020-01-06", "2020-01-07"));
 
-        diff = SyncPartitionUtils.diffRange(srcRange, dstRange);
+        diff = PartitionDiffer.diffRange(srcRange, dstRange);
         Assert.assertEquals(2, diff.size());
         Assert.assertEquals("2020-01-02 00:00:00",
                 diff.get("p20200102").lowerEndpoint().getKeys().get(0).getStringValue());
@@ -195,7 +192,7 @@ public class SyncPartitionUtilsTest {
         Assert.assertEquals("2020-01-06 00:00:00",
                 diff.get("p20200105").upperEndpoint().getKeys().get(0).getStringValue());
 
-        diff = SyncPartitionUtils.diffRange(dstRange, srcRange);
+        diff = PartitionDiffer.diffRange(dstRange, srcRange);
         Assert.assertEquals(1, diff.size());
         Assert.assertEquals("2020-01-02 00:00:00",
                 diff.get("p20200102").lowerEndpoint().getKeys().get(0).getStringValue());
@@ -204,7 +201,45 @@ public class SyncPartitionUtilsTest {
     }
 
     @Test
-    public void testCalcSyncSamePartition() throws AnalysisException {
+    public void testDiffList() {
+        // same
+        Map<String, List<List<String>>> baseListMap = Maps.newHashMap();
+        baseListMap.put("p20230619", Collections.singletonList(Lists.newArrayList("2023-06-19")));
+        baseListMap.put("p20230620", Collections.singletonList(Lists.newArrayList("2023-06-20")));
+        baseListMap.put("p20230621", Collections.singletonList(Lists.newArrayList("2023-06-21")));
+
+        Map<String, List<List<String>>> mvListMap = Maps.newHashMap();
+        mvListMap.put("p20230619", Collections.singletonList(Lists.newArrayList("2023-06-19")));
+        mvListMap.put("p20230621", Collections.singletonList(Lists.newArrayList("2023-06-21")));
+        mvListMap.put("p20230620", Collections.singletonList(Lists.newArrayList("2023-06-20")));
+
+        Map<String, List<List<String>>> diff = SyncPartitionUtils.diffList(baseListMap, mvListMap);
+        Assert.assertEquals(0, diff.size());
+
+        baseListMap = Maps.newHashMap();
+        baseListMap.put("p20230619", Collections.singletonList(Lists.newArrayList("2023-06-19")));
+        baseListMap.put("p20230620", Collections.singletonList(Lists.newArrayList("2023-06-20")));
+
+        mvListMap = Maps.newHashMap();
+        mvListMap.put("p20230619", Collections.singletonList(Lists.newArrayList("2023-06-19")));
+
+        diff = SyncPartitionUtils.diffList(baseListMap, mvListMap);
+        Assert.assertEquals(1, diff.size());
+        Assert.assertEquals("2023-06-20", diff.get("p20230620").get(0).get(0));
+
+        baseListMap = Maps.newHashMap();
+        baseListMap.put("p20230619", Collections.singletonList(Lists.newArrayList("2023-06-19")));
+
+        mvListMap = Maps.newHashMap();
+        mvListMap.put("p20230619", Collections.singletonList(Lists.newArrayList("2023-06-19")));
+        mvListMap.put("p20230620", Collections.singletonList(Lists.newArrayList("2023-06-20")));
+
+        diff = SyncPartitionUtils.diffList(baseListMap, mvListMap);
+        Assert.assertEquals(0, diff.size());
+    }
+
+    @Test
+    public void testCalcSyncSameRangePartition() throws AnalysisException {
 
         Map<String, Range<PartitionKey>> baseRange = Maps.newHashMap();
         baseRange.put("p20200101", createRange("2020-01-01", "2020-01-02"));
@@ -214,7 +249,7 @@ public class SyncPartitionUtilsTest {
         Map<String, Range<PartitionKey>> mvRange = Maps.newHashMap();
         mvRange.put("p202001", createRange("2020-01-01", "2020-02-01"));
 
-        PartitionDiff diff = SyncPartitionUtils.calcSyncSamePartition(baseRange, mvRange);
+        RangePartitionDiff diff = SyncPartitionUtils.getRangePartitionDiffOfSlotRef(baseRange, mvRange);
 
         Map<String, Range<PartitionKey>> adds = diff.getAdds();
         Assert.assertEquals(3, adds.size());
@@ -249,7 +284,7 @@ public class SyncPartitionUtilsTest {
         mvRange.put("p20200102", createRange("2020-01-02", "2020-01-03"));
         mvRange.put("p20200103", createRange("2020-01-03", "2020-01-04"));
 
-        diff = SyncPartitionUtils.calcSyncSamePartition(baseRange, mvRange);
+        diff = SyncPartitionUtils.getRangePartitionDiffOfSlotRef(baseRange, mvRange);
 
         adds = diff.getAdds();
         deletes = diff.getDeletes();
@@ -437,7 +472,7 @@ public class SyncPartitionUtilsTest {
         baseRange.put("p2", createRange("2020-05-04", "2020-11-12"));
 
         Map<String, Range<PartitionKey>> mvRange = Maps.newHashMap();
-        PartitionDiff diff = SyncPartitionUtils.calcSyncRollupPartition(baseRange, mvRange,
+        RangePartitionDiff diff = SyncPartitionUtils.getRangePartitionDiffOfExpr(baseRange, mvRange,
                 "month", PrimitiveType.DATETIME);
         Map<String, Range<PartitionKey>> adds = diff.getAdds();
         Map<String, Range<PartitionKey>> deletes = diff.getDeletes();
@@ -463,7 +498,7 @@ public class SyncPartitionUtilsTest {
 
         mvRange = Maps.newHashMap();
         mvRange.put("p20200101_20200102", createRange("2020-01-01", "2020-01-02"));
-        diff = SyncPartitionUtils.calcSyncRollupPartition(baseRange, mvRange,
+        diff = SyncPartitionUtils.getRangePartitionDiffOfExpr(baseRange, mvRange,
                 "day", PrimitiveType.DATETIME);
         adds = diff.getAdds();
         deletes = diff.getDeletes();
@@ -483,7 +518,7 @@ public class SyncPartitionUtilsTest {
         baseRange.put("p2", createRange("2020-10-12", "2020-11-12"));
 
         Map<String, Range<PartitionKey>> mvRange = Maps.newHashMap();
-        PartitionDiff diff = SyncPartitionUtils.calcSyncRollupPartition(baseRange, mvRange,
+        RangePartitionDiff diff = SyncPartitionUtils.getRangePartitionDiffOfExpr(baseRange, mvRange,
                 granularity, PrimitiveType.DATETIME);
 
         Map<String, Range<PartitionKey>> adds = diff.getAdds();
@@ -510,7 +545,7 @@ public class SyncPartitionUtilsTest {
         mvRange = Maps.newHashMap();
         mvRange.put("p202001_202002", createRange("2020-01-01", "2020-02-01"));
 
-        diff = SyncPartitionUtils.calcSyncRollupPartition(baseRange, mvRange,
+        diff = SyncPartitionUtils.getRangePartitionDiffOfExpr(baseRange, mvRange,
                 granularity, PrimitiveType.DATETIME);
         adds = diff.getAdds();
         deletes = diff.getDeletes();
@@ -530,7 +565,7 @@ public class SyncPartitionUtilsTest {
         baseRange.put("p20200503", createRange("2020-05-03", "2020-06-05"));
         mvRange = Maps.newHashMap();
         mvRange.put("p202005_202006", createRange("2020-05-01", "2020-06-01"));
-        diff = SyncPartitionUtils.calcSyncRollupPartition(baseRange, mvRange,
+        diff = SyncPartitionUtils.getRangePartitionDiffOfExpr(baseRange, mvRange,
                 "month", PrimitiveType.DATETIME);
         adds = diff.getAdds();
         deletes = diff.getDeletes();
@@ -550,7 +585,7 @@ public class SyncPartitionUtilsTest {
         baseRange.put("p20200503", createRange("2020-05-03", "2020-06-05"));
         mvRange = Maps.newHashMap();
         mvRange.put("p202005_202006", createRange("2020-05-01", "2020-06-01"));
-        diff = SyncPartitionUtils.calcSyncRollupPartition(baseRange, mvRange,
+        diff = SyncPartitionUtils.getRangePartitionDiffOfExpr(baseRange, mvRange,
                 "month", PrimitiveType.DATETIME);
         adds = diff.getAdds();
         deletes = diff.getDeletes();
@@ -566,45 +601,32 @@ public class SyncPartitionUtilsTest {
         Assert.assertEquals(0, deletes.size());
     }
 
+    private PartitionRange buildPartitionRange(String name, String start, String end) throws AnalysisException {
+        return new PartitionRange(name,
+                Range.closedOpen(
+                        PartitionKey.ofDateTime(DateUtils.parseStrictDateTime(start)),
+                        PartitionKey.ofDateTime(DateUtils.parseStrictDateTime(end))));
+    }
+
     @Test
-    public void testDropBaseVersionMeta() throws Exception {
-        FeConstants.runningUnitTest = true;
-        Config.enable_experimental_mv = true;
-        UtFrameUtils.createMinStarRocksCluster();
-        ConnectContext connectContext = UtFrameUtils.createDefaultCtx();
-        StarRocksAssert starRocksAssert = new StarRocksAssert(connectContext);
-        starRocksAssert.withDatabase("test").useDatabase("test")
-                .withTable("CREATE TABLE test.tbl1\n" +
-                        "(\n" +
-                        "    k1 date,\n" +
-                        "    k2 int,\n" +
-                        "    v1 int sum\n" +
-                        ")\n" +
-                        "PARTITION BY RANGE(k1)\n" +
-                        "(\n" +
-                        "    PARTITION p1 values [('2022-02-01'),('2022-02-16')),\n" +
-                        "    PARTITION p2 values [('2022-02-16'),('2022-03-01'))\n" +
-                        ")\n" +
-                        "DISTRIBUTED BY HASH(k2) BUCKETS 3\n" +
-                        "PROPERTIES('replication_num' = '1');")
-                .withMaterializedView("create materialized view mv1\n" +
-                        "PARTITION BY k1\n" +
-                        "distributed by hash(k2) buckets 3\n" +
-                        "refresh async\n" +
-                        "as select k1, k2, sum(v1) as total from tbl1 group by k1, k2;");
-
-        Database testDb = GlobalStateMgr.getCurrentState().getDb("test");
-        Table tbl1 = testDb.getTable("tbl1");
-        MaterializedView mv = ((MaterializedView) testDb.getTable("mv1"));
-        Map<Long, Map<String, MaterializedView.BasePartitionInfo>> versionMap =
-                mv.getRefreshScheme().getAsyncRefreshContext().getBaseTableVisibleVersionMap();
-        Map<String, MaterializedView.BasePartitionInfo> tableMap = Maps.newHashMap();
-        tableMap.put("p1", new MaterializedView.BasePartitionInfo(1, 2));
-        tableMap.put("p2", new MaterializedView.BasePartitionInfo(3, 4));
-        versionMap.put(tbl1.getId(), tableMap);
-        SyncPartitionUtils.dropBaseVersionMeta(mv, "p1");
-
-        Assert.assertNull(tableMap.get("p1"));
+    public void test_getIntersectedPartitions() throws AnalysisException {
+        List<PartitionRange> srcs = Arrays.asList(
+                buildPartitionRange("p20230801", "00000101", "20230801"),
+                buildPartitionRange("p20230802", "20230801", "20230802"),
+                buildPartitionRange("p20230803", "20230802", "20230803")
+        );
+        List<PartitionRange> dsts = Arrays.asList(
+                buildPartitionRange("p000101_202308", "0001-01-01", "2023-08-01"),
+                buildPartitionRange("p202308_202309", "2023-08-01", "2023-09-01")
+        );
+        Map<String, Set<String>> res = SyncPartitionUtils.getIntersectedPartitions(srcs, dsts);
+        Assert.assertEquals(
+                ImmutableMap.of(
+                        "p20230801", ImmutableSet.of("p000101_202308"),
+                        "p20230802", ImmutableSet.of("p202308_202309"),
+                        "p20230803", ImmutableSet.of("p202308_202309")
+                ),
+                res);
     }
 
 }

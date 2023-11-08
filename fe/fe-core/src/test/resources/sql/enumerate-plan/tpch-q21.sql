@@ -39,7 +39,7 @@ order by
     numwait desc,
     s_name limit 100;
 [planCount]
-1
+2
 [plan-1]
 TOP-N (order by [[77: count DESC NULLS LAST, 2: S_NAME ASC NULLS FIRST]])
     TOP-N (order by [[77: count DESC NULLS LAST, 2: S_NAME ASC NULLS FIRST]])
@@ -63,4 +63,5 @@ TOP-N (order by [[77: count DESC NULLS LAST, 2: S_NAME ASC NULLS FIRST]])
                     EXCHANGE SHUFFLE[59]
                         SCAN (columns[70: L_COMMITDATE, 71: L_RECEIPTDATE, 59: L_ORDERKEY, 61: L_SUPPKEY] predicate[71: L_RECEIPTDATE > 70: L_COMMITDATE])
 [end]
+
 

@@ -66,7 +66,6 @@ AgentStatus MasterServerClient::finish_task(const TFinishTaskRequest& request, T
         try {
             client->finishTask(*result, request);
         } catch (TTransportException& e) {
-            LOG(WARNING) << "master client, retry finishTask: " << e.what();
             client_status = client.reopen(config::thrift_rpc_timeout_ms);
             if (!client_status.ok()) {
                 LOG(WARNING) << "Fail to get master client from cache. "
@@ -77,7 +76,7 @@ AgentStatus MasterServerClient::finish_task(const TFinishTaskRequest& request, T
             client->finishTask(*result, request);
         }
     } catch (TException& e) {
-        client.reopen(config::thrift_rpc_timeout_ms);
+        (void)client.reopen(config::thrift_rpc_timeout_ms);
         LOG(WARNING) << "Fail to finish_task. "
                      << "host=" << network_address.hostname << ", port=" << network_address.port
                      << ", error=" << e.what();
@@ -106,8 +105,6 @@ AgentStatus MasterServerClient::report(const TReportRequest& request, TMasterRes
             TTransportException::TTransportExceptionType type = e.getType();
             if (type != TTransportException::TTransportExceptionType::TIMED_OUT) {
                 // if not TIMED_OUT, retry
-                LOG(WARNING) << "master client, retry finishTask: " << e.what();
-
                 client_status = client.reopen(config::thrift_rpc_timeout_ms);
                 if (!client_status.ok()) {
                     LOG(WARNING) << "Fail to get master client from cache. "
@@ -125,7 +122,7 @@ AgentStatus MasterServerClient::report(const TReportRequest& request, TMasterRes
             }
         }
     } catch (TException& e) {
-        client.reopen(config::thrift_rpc_timeout_ms);
+        (void)client.reopen(config::thrift_rpc_timeout_ms);
         LOG(WARNING) << "Fail to report to master. "
                      << "host=" << network_address.hostname << ", port=" << network_address.port
                      << ", code=" << client_status.code();

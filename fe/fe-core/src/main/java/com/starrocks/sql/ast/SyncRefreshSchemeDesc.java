@@ -16,12 +16,15 @@
 package com.starrocks.sql.ast;
 
 import com.starrocks.catalog.MaterializedView;
+import com.starrocks.sql.parser.NodePosition;
 
-public class SyncRefreshSchemeDesc extends RefreshSchemeDesc {
+public class SyncRefreshSchemeDesc extends RefreshSchemeClause {
 
     public SyncRefreshSchemeDesc() {
-        super(MaterializedView.RefreshType.SYNC);
+        this(NodePosition.ZERO);
     }
 
+    public SyncRefreshSchemeDesc(NodePosition pos) {
+        super(MaterializedView.RefreshType.SYNC, pos, MaterializedView.RefreshMoment.IMMEDIATE);
+    }
 }
-

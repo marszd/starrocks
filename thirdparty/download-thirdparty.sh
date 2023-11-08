@@ -301,6 +301,7 @@ if [ ! -f $PATCHED_MARK ] && [ $BRPC_SOURCE == "brpc-0.9.7" ]; then
 fi
 if [ ! -f $PATCHED_MARK ] && [ $BRPC_SOURCE == "brpc-1.3.0" ]; then
     patch -p1 < $TP_PATCH_DIR/brpc-1.3.0.patch
+    patch -p1 < $TP_PATCH_DIR/brpc-1.3.0-CVE-2023-31039.patch
     touch $PATCHED_MARK
 fi
 cd -
@@ -355,16 +356,25 @@ echo "Finished patching $GPERFTOOLS_SOURCE"
 
 # patch librdkafka
 cd $TP_SOURCE_DIR/$LIBRDKAFKA_SOURCE
-if [ ! -f $PATCHED_MARK ] && [ $LIBRDKAFKA_SOURCE = "librdkafka-1.7.0" ]; then
+if [ ! -f $PATCHED_MARK ] && [ $LIBRDKAFKA_SOURCE = "librdkafka-2.0.2" ]; then
     patch -p0 < $TP_PATCH_DIR/librdkafka.patch
     touch $PATCHED_MARK
 fi
 cd -
 echo "Finished patching $LIBRDKAFKA_SOURCE"
 
+# patch roaring-bitmap
+cd $TP_SOURCE_DIR/$CROARINGBITMAP_SOURCE
+if [ ! -f $PATCHED_MARK ] && [ $CROARINGBITMAP_SOURCE = "CRoaring-0.2.60" ]; then
+    patch -p1 < $TP_PATCH_DIR/roaring-bitmap-patch-v0.2.60.patch
+    touch $PATCHED_MARK
+fi
+cd -
+echo "Finished patching $CROARINGBITMAP_SOURCE"
+
 # patch pulsar
 cd $TP_SOURCE_DIR/$PULSAR_SOURCE
-if [ ! -f $PATCHED_MARK ] && [ $PULSAR_SOURCE = "pulsar-2.10.1" ]; then
+if [ ! -f $PATCHED_MARK ] && [ $PULSAR_SOURCE = "pulsar-client-cpp-3.3.0" ]; then
     patch -p1 < $TP_PATCH_DIR/pulsar.patch
     touch $PATCHED_MARK
 fi
@@ -390,6 +400,22 @@ if [ ! -f $PATCHED_MARK ] && [ $AWS_SDK_CPP_SOURCE = "aws-sdk-cpp-1.9.179" ]; th
     patch -p0 < $TP_PATCH_DIR/aws-sdk-cpp-1.9.179.patch    
     # Fix crt BB, refer to https://github.com/aws/s2n-tls/issues/3166
     patch -p1 -f -i $TP_PATCH_DIR/aws-sdk-cpp-patch-1.9.179-s2n-compile-error.patch
+    # refer to https://github.com/aws/aws-sdk-cpp/issues/1824
+    patch -p1 < $TP_PATCH_DIR/aws-sdk-cpp-patch-1.9.179-LINK_LIBRARIES_ALL.patch
+    touch $PATCHED_MARK
+    echo "Finished patching $AWS_SDK_CPP_SOURCE"
+else
+    echo "$AWS_SDK_CPP_SOURCE not patched"
+fi
+
+cd $TP_SOURCE_DIR/$AWS_SDK_CPP_SOURCE
+if [ ! -f $PATCHED_MARK ] && [ $AWS_SDK_CPP_SOURCE = "aws-sdk-cpp-1.10.36" ]; then
+    if [ ! -f prefetch_crt_dep_ok ]; then
+        bash ./prefetch_crt_dependency.sh
+        touch prefetch_crt_dep_ok
+    fi
+    # Fix InstanceProfile deadlock, refer to https://github.com/aws/aws-sdk-cpp/issues/2251
+    patch -p1 < $TP_PATCH_DIR/aws-sdk-cpp-1.10.36-instance-profile-deadlock.patch   
     touch $PATCHED_MARK
     echo "Finished patching $AWS_SDK_CPP_SOURCE"
 else
@@ -398,7 +424,7 @@ fi
 
 # patch jemalloc_hook
 cd $TP_SOURCE_DIR/$JEMALLOC_SOURCE
-if [ ! -f $PATCHED_MARK ] && [ $JEMALLOC_SOURCE = "jemalloc-5.2.1" ]; then
+if [ ! -f $PATCHED_MARK ] && [ $JEMALLOC_SOURCE = "jemalloc-5.3.0" ]; then
     patch -p0 < $TP_PATCH_DIR/jemalloc_hook.patch
     touch $PATCHED_MARK
 fi
@@ -432,6 +458,45 @@ fi
 cd -
 echo "Finished patching $VPACK_SOURCE"
 
+# patch avro-c
+cd $TP_SOURCE_DIR/$AVRO_SOURCE/lang/c
+if [ ! -f $PATCHED_MARK ] && [ $AVRO_SOURCE = "avro-release-1.10.2" ]; then
+    patch -p0 < $TP_PATCH_DIR/avro-1.10.2.c.patch
+    cp $TP_PATCH_DIR/avro-1.10.2.c.findjansson.patch $TP_SOURCE_DIR/$AVRO_SOURCE/lang/c/Findjansson.cmake
+    touch $PATCHED_MARK
+fi
+cd -
+echo "Finished patching $AVRO_SOURCE-c"
 
+# patch serdes
+cd $TP_SOURCE_DIR/$SERDES_SOURCE
+if [ ! -f $PATCHED_MARK ] && [ $SERDES_SOURCE = "libserdes-7.3.1" ]; then
+    patch -p0 < $TP_PATCH_DIR/libserdes-7.3.1.patch
+    touch $PATCHED_MARK
+fi
+echo "Finished patching $SERDES_SOURCE"
 cd -
 
+# patch sasl2
+cd $TP_SOURCE_DIR/$SASL_SOURCE
+if [ ! -f $PATCHED_MARK ] && [ $SASL_SOURCE = "cyrus-sasl-2.1.28" ]; then
+    patch -p1 < $TP_PATCH_DIR/sasl2-add-k5support-link.patch
+    touch $PATCHED_MARK
+fi
+echo "Finished patching $SASL_SOURCE"
+cd -
+
+# patch arrow
+if [[ -d $TP_SOURCE_DIR/$ARROW_SOURCE ]] ; then
+    cd $TP_SOURCE_DIR/$ARROW_SOURCE
+    if [ ! -f $PATCHED_MARK ] && [ $ARROW_SOURCE = "arrow-apache-arrow-5.0.0" ] ; then
+        # use our built jemalloc
+        patch -p1 < $TP_PATCH_DIR/arrow-5.0.0-force-use-external-jemalloc.patch
+        # fix exception handling
+        patch -p1 < $TP_PATCH_DIR/arrow-5.0.0-fix-exception-handling.patch
+        patch -p1 < $TP_PATCH_DIR/arrow-5.0.0-parquet-map-key.patch
+        touch $PATCHED_MARK
+    fi
+    cd -
+    echo "Finished patching $ARROW_SOURCE"
+fi

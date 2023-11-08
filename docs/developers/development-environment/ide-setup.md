@@ -18,14 +18,12 @@ The overall idea is to write code on the MacBook,  then automatically synchroniz
 
 ### MacBook Setup
 
-**Thrift 0.13**
+#### Thrift 0.13
 
-There is no 0.13 version of Thrift in brew repository, you can use the following command:
+There is no 0.13 version of Thrift in the official brew repository; one of our committers created a version in their repo to install. 
 
 ```bash
-brew tap-new $USER/local-tap
-brew extract --version='0.13.0' thrift $USER/local-tap
-brew install thrift@0.13.0
+brew install alberttwong/thrift/thrift@0.13
 ```
 
 You can check whether Thrift is installed successfully with the following command:
@@ -35,7 +33,7 @@ $ thrift -version
 Thrift version 0.13.0
 ```
 
-**Protobuf**
+#### Protobuf
 
 Just use the latest version v3 directly, because the latest version of Protobuf is compatible with the v2 version of the Protobuf protocol in StarRocks.
 
@@ -43,23 +41,23 @@ Just use the latest version v3 directly, because the latest version of Protobuf 
 brew install protobuf
 ```
 
-**Maven**
+#### Maven
 
 ```bash
 brew install maven
 ```
 
-**OpenJDK 1.8 or 11**
+#### OpenJDK 1.8 or 11
 
 ```bash
 brew install openjdk@11
 ```
 
-**Python3**
+#### Python3
 
 MacOS comes with it, no installation is needed.
 
-**Setup system env**
+#### Setup system env
 
 ```bash
 export JAVA_HOME=xxxxx
@@ -68,11 +66,11 @@ export PYTHON=/usr/bin/python3
 
 ### Ubuntu22 server setup
 
-**Clone StarRocks code**
+#### Clone StarRocks code
 
 `git clone https://github.com/StarRocks/starrocks.git`
 
-**Install required tools for compilation**：
+#### Install required tools for compilation
 
 ```bash
 sudo apt update
@@ -88,7 +86,7 @@ Setup `JAVA_HOME` env
 export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
 ```
 
-**Do a compilation of StarRocks**
+#### Do a compilation of StarRocks
 
 ```bash
 cd starrocks/
@@ -103,21 +101,21 @@ The first time compile needs to compile thirdparty, it will require some time.
 
 ### FE
 
-FE development is simple because you can compile it in MacOS directly. Just enter `fe` folder and run the command  `mvn install -DskipTests` 。
+FE development is simple because you can compile it in MacOS directly. Just enter `fe` folder and run the command `mvn install -DskipTests`.
 
 Then you can use IDEA to open `fe` folder directly, everything is ok.
 
-**Local debug**
+#### Local debug
 
 The same as other Java applications.
 
-**Remote debug**
+#### Remote debug
 
 In Ubuntu server, run with `./start_fe.sh --debug`, then use IDEA remote debug to connect it. The default port is 5005, you can change it in `start_fe.sh` scripts.
 
 Debug java parameter: `-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005` is just copied from IDEA.
 
-<img src="../../assets/ide-1.png" alt="ide-1" style="zoom:50%;" />
+![IDE](../../assets/ide-1.png)
 
 ### BE
 
@@ -129,11 +127,11 @@ Use Clion to open `be` folder.
 
 Enter `Settings`, add `Toolchains`. Add a remote server first, then setup Build Tool, C and C++ Compiler separately.
 
-<img src="../../assets/ide-2.png" alt="ide-2" style="zoom:50%;" />
+![IDE](../../assets/ide-2.png)
 
 In `Settings` / `Deployment`. Change folder `mappings`.
 
-<img src="../../assets/ide-3.png" alt="ide-3" style="zoom:50%;" />
+![IDE](../../assets/ide-3.png)
 
 In `Settings` / `Cmake`. Change Toolchain to be the remote toolchain just added. Add the following environment variables:
 
@@ -143,15 +141,15 @@ STARROCKS_GCC_HOME=/usr/
 STARROCKS_THIRDPARTY=/root/starrocks/thirdparty
 ```
 
-Notice: Be careful not to check `Include system environment variables`。
+Notice: Be careful not to check `Include system environment variables`.
 
-<img src="../../assets/ide-4.png" alt="ide-4" style="zoom:50%;" />
+![IDE](../../assets/ide-4.png)
 
-<img src="../../assets/ide-5.png" alt="ide-5" style="zoom:50%;" />
+![IDE](../../assets/ide-5.png)
 
 From here on, all setup is complete. After Clion and the remote server are synchronized for a while, the code jump will work normally.
 
-**Debug**
+#### Debug
 
 BE debug is a little difficult, you have to use gdb in your remote server. Of course, you can use gdb server + Clion remote gdb, but I don't recommend it, it's too stuck. 
 
@@ -185,11 +183,11 @@ Then just run `./bin/start_be.sh` without any flag.
 
 > If you face the error report when debugging for lakehouse, just add `handle SIGSEGV nostop noprint pass` in `~/.gdbinit`.
 
-**LLVM**
+#### LLVM
 
 Of course, you can use LLVM tools to development be.
 
-Ubuntu LLVM installtion refer to：https://apt.llvm.org/
+Ubuntu LLVM installtion refer to: https://apt.llvm.org/
 
 Then use the command:  `CC=clang-15 CXX=clang++-15 ./build.sh` to compile be. But the premise is that your thirdparty has been compiled with gcc.
 

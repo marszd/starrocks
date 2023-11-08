@@ -225,6 +225,13 @@ StatusOr<LogicalType> JDBCScanner::_precheck_data_type(const std::string& java_c
                     slot_desc->col_name()));
         }
         return TYPE_BIGINT;
+    } else if (java_class == "java.math.BigInteger") {
+        if (type != TYPE_LARGEINT && type != TYPE_VARCHAR) {
+            return Status::NotSupported(fmt::format(
+                    "Type mismatches on column[{}], JDBC result type is BigInteger, please set the type to largeint",
+                    slot_desc->col_name()));
+        }
+        return TYPE_VARCHAR;
     } else if (java_class == "java.lang.Boolean") {
         if (type != TYPE_BOOLEAN && type != TYPE_SMALLINT && type != TYPE_INT && type != TYPE_BIGINT) {
             return Status::NotSupported(
@@ -269,15 +276,21 @@ StatusOr<LogicalType> JDBCScanner::_precheck_data_type(const std::string& java_c
         }
         return TYPE_VARCHAR;
     } else if (java_class == "java.math.BigDecimal") {
-        if (type != TYPE_DECIMAL32 && type != TYPE_DECIMAL64 && type != TYPE_DECIMAL128) {
-            return Status::NotSupported(fmt::format(
-                    "Type mismatches on column[{}], JDBC result type is BigDecimal, please set the type to decimal",
-                    slot_desc->col_name()));
+        if (type != TYPE_DECIMAL32 && type != TYPE_DECIMAL64 && type != TYPE_DECIMAL128 && type != TYPE_VARCHAR) {
+            return Status::NotSupported(
+                    fmt::format("Type mismatches on column[{}], JDBC result type is BigDecimal, please set the type to "
+                                "decimal or varchar",
+                                slot_desc->col_name()));
         }
         return TYPE_VARCHAR;
     } else {
-        return Status::NotSupported(fmt::format("Type is not supported on column[{}], JDBC result type is [{}]",
-                                                slot_desc->col_name(), java_class));
+        if (type != TYPE_VARCHAR) {
+            return Status::NotSupported(
+                    fmt::format("JDBC result type of column[{}] is [{}], StarRocks does not recognize it, please set "
+                                "the type of this column to varchar to avoid information loss.",
+                                slot_desc->col_name(), java_class));
+        }
+        return TYPE_VARCHAR;
     }
     __builtin_unreachable();
 }
@@ -395,24 +408,6 @@ Status JDBCScanner::_fill_chunk(jobject jchunk, size_t num_rows, ChunkPtr* chunk
             auto st =
                     helper.get_result_from_boxed_array(_result_column_types[i], result_column.get(), jcolumn, num_rows);
             RETURN_IF_ERROR(st);
-            // check data's length for string type
-            auto origin_type = _slot_descs[i]->type().type;
-            if (origin_type == TYPE_VARCHAR || origin_type == TYPE_CHAR) {
-                DCHECK_EQ(_result_column_types[i], TYPE_VARCHAR);
-                int max_len = _slot_descs[i]->type().len;
-                ColumnViewer<TYPE_VARCHAR> viewer(result_column);
-                for (int row = 0; row < viewer.size(); row++) {
-                    if (viewer.is_null(row)) {
-                        continue;
-                    }
-                    auto value = viewer.value(row);
-                    if ((int)value.size > max_len) {
-                        return Status::DataQualityError(fmt::format(
-                                "Value length exceeds limit on column[{}], max length is [{}], value is [{}]",
-                                _slot_descs[i]->col_name(), max_len, value));
-                    }
-                }
-            }
             down_cast<NullableColumn*>(result_column.get())->update_has_null();
         }
     }
@@ -421,8 +416,12 @@ Status JDBCScanner::_fill_chunk(jobject jchunk, size_t num_rows, ChunkPtr* chunk
     // TODO: avoid the cast overhead when from type == to type
     for (size_t col_idx = 0; col_idx < _slot_descs.size(); col_idx++) {
         SlotDescriptor* slot_desc = _slot_descs[col_idx];
+        // use reference, then we check the column's nullable and set the final result to the referred column.
         ColumnPtr& column = (*chunk)->get_column_by_slot_id(slot_desc->id());
         ASSIGN_OR_RETURN(auto result, _cast_exprs[col_idx]->evaluate(_result_chunk.get()));
+        // unfold const_nullable_column to avoid error down_cast.
+        // unpack_and_duplicate_const_column is not suitable, we need set correct type.
+        result = ColumnHelper::unfold_const_column(slot_desc->type(), num_rows, result);
         if (column->is_nullable() == result->is_nullable()) {
             column = result;
         } else if (column->is_nullable() && !result->is_nullable()) {
@@ -432,8 +431,7 @@ Status JDBCScanner::_fill_chunk(jobject jchunk, size_t num_rows, ChunkPtr* chunk
                 return Status::DataQualityError(
                         fmt::format("Unexpected NULL value occurs on NOT NULL column[{}]", slot_desc->col_name()));
             }
-            column->swap_column(*down_cast<NullableColumn*>(result.get())->data_column());
-            result->reset_column();
+            column = down_cast<NullableColumn*>(result.get())->data_column();
         }
     }
     return Status::OK();

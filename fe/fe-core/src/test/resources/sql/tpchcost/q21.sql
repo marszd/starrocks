@@ -45,7 +45,7 @@ PARTITION: UNPARTITIONED
 
 RESULT SINK
 
-28:MERGING-EXCHANGE
+29:MERGING-EXCHANGE
 limit: 100
 
 PLAN FRAGMENT 1
@@ -53,28 +53,33 @@ OUTPUT EXPRS:
 PARTITION: HASH_PARTITIONED: 2: S_NAME
 
 STREAM DATA SINK
-EXCHANGE ID: 28
+EXCHANGE ID: 29
 UNPARTITIONED
 
-27:TOP-N
+28:TOP-N
 |  order by: <slot 77> 77: count DESC, <slot 2> 2: S_NAME ASC
 |  offset: 0
 |  limit: 100
 |
-26:AGGREGATE (update finalize)
-|  output: count(*)
+27:AGGREGATE (merge finalize)
+|  output: count(77: count)
 |  group by: 2: S_NAME
 |
-25:EXCHANGE
+26:EXCHANGE
 
 PLAN FRAGMENT 2
 OUTPUT EXPRS:
 PARTITION: RANDOM
 
 STREAM DATA SINK
-EXCHANGE ID: 25
+EXCHANGE ID: 26
 HASH_PARTITIONED: 2: S_NAME
 
+25:AGGREGATE (update serialize)
+|  STREAMING
+|  output: count(*)
+|  group by: 2: S_NAME
+|
 24:Project
 |  <slot 2> : 2: S_NAME
 |
@@ -94,7 +99,6 @@ rollup: lineitem
 tabletRatio=20/20
 cardinality=600000000
 avgRowSize=12.0
-numNodes=0
 
 PLAN FRAGMENT 3
 OUTPUT EXPRS:
@@ -130,7 +134,6 @@ rollup: lineitem
 tabletRatio=20/20
 cardinality=300000000
 avgRowSize=20.0
-numNodes=0
 
 PLAN FRAGMENT 4
 OUTPUT EXPRS:
@@ -164,7 +167,6 @@ rollup: orders
 tabletRatio=10/10
 cardinality=50000000
 avgRowSize=9.0
-numNodes=0
 
 PLAN FRAGMENT 5
 OUTPUT EXPRS:
@@ -199,7 +201,6 @@ rollup: lineitem
 tabletRatio=20/20
 cardinality=300000000
 avgRowSize=20.0
-numNodes=0
 
 PLAN FRAGMENT 6
 OUTPUT EXPRS:
@@ -228,7 +229,6 @@ rollup: supplier
 tabletRatio=1/1
 cardinality=1000000
 avgRowSize=33.0
-numNodes=0
 
 PLAN FRAGMENT 7
 OUTPUT EXPRS:
@@ -250,6 +250,5 @@ rollup: nation
 tabletRatio=1/1
 cardinality=1
 avgRowSize=29.0
-numNodes=0
 [end]
 

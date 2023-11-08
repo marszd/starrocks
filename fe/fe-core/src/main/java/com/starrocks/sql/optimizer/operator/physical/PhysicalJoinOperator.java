@@ -12,16 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.operator.physical;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.starrocks.analysis.JoinOperator;
+import com.starrocks.sql.optimizer.OptExpression;
+import com.starrocks.sql.optimizer.RowOutputInfo;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
+import com.starrocks.sql.optimizer.operator.ColumnOutputInfo;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
@@ -29,6 +33,7 @@ public abstract class PhysicalJoinOperator extends PhysicalOperator {
     protected final JoinOperator joinType;
     protected final ScalarOperator onPredicate;
     protected final String joinHint;
+    protected boolean canLocalShuffle;
 
     protected PhysicalJoinOperator(OperatorType operatorType, JoinOperator joinType,
                                    ScalarOperator onPredicate,
@@ -61,7 +66,6 @@ public abstract class PhysicalJoinOperator extends PhysicalOperator {
         return joinHint;
     }
 
-
     @Override
     public ColumnRefSet getUsedColumns() {
         ColumnRefSet refs = super.getUsedColumns();
@@ -69,6 +73,17 @@ public abstract class PhysicalJoinOperator extends PhysicalOperator {
             refs.union(onPredicate.getUsedColumns());
         }
         return refs;
+    }
+
+    @Override
+    public RowOutputInfo deriveRowOutputInfo(List<OptExpression> inputs) {
+        List<ColumnOutputInfo> entryList = Lists.newArrayList();
+        for (OptExpression input : inputs) {
+            for (ColumnOutputInfo entry : input.getRowOutputInfo().getColumnOutputInfo()) {
+                entryList.add(new ColumnOutputInfo(entry.getColumnRef(), entry.getColumnRef()));
+            }
+        }
+        return new RowOutputInfo(entryList);
     }
 
     @Override
@@ -93,10 +108,7 @@ public abstract class PhysicalJoinOperator extends PhysicalOperator {
     @Override
     public boolean couldApplyStringDict(Set<Integer> childDictColumns) {
         Preconditions.checkState(!childDictColumns.isEmpty());
-        ColumnRefSet dictSet = new ColumnRefSet();
-        for (Integer id : childDictColumns) {
-            dictSet.union(id);
-        }
+        ColumnRefSet dictSet = ColumnRefSet.createByIds(childDictColumns);
 
         if (predicate != null && predicate.getUsedColumns().isIntersect(dictSet)) {
             return false;
@@ -119,4 +131,11 @@ public abstract class PhysicalJoinOperator extends PhysicalOperator {
         }
     }
 
+    public void setCanLocalShuffle(boolean v) {
+        canLocalShuffle = v;
+    }
+
+    public boolean getCanLocalShuffle() {
+        return canLocalShuffle;
+    }
 }

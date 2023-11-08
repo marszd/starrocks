@@ -16,7 +16,14 @@
 
 #include <fmt/format.h>
 
-#include "block_cache/fb_cachelib.h"
+#include <filesystem>
+
+#ifdef WITH_CACHELIB
+#include "block_cache/cachelib_wrapper.h"
+#endif
+#ifdef WITH_STARCACHE
+#include "block_cache/starcache_wrapper.h"
+#endif
 #include "common/config.h"
 #include "common/logging.h"
 #include "common/statusor.h"
@@ -24,9 +31,13 @@
 
 namespace starrocks {
 
-BlockCache::BlockCache() {
-    _kv_cache = std::make_unique<FbCacheLib>();
-}
+namespace fs = std::filesystem;
+
+// The cachelib doesn't support a item (key+valueu+attribute) larger than 4 MB without chain.
+// So, we check and limit the block_size configured by users to avoid unexpected errors.
+// For starcache, in theory we doesn't have a hard limitation for block size, but a very large
+// block_size may cause heavy read amplification. So, we also limit it to 2 MB as an empirical value.
+const size_t BlockCache::MAX_BLOCK_SIZE = 2 * 1024 * 1024;
 
 BlockCache* BlockCache::instance() {
     static BlockCache cache;
@@ -34,51 +45,104 @@ BlockCache* BlockCache::instance() {
 }
 
 Status BlockCache::init(const CacheOptions& options) {
-    // TODO: check block size limit
-    _block_size = options.block_size;
+    for (auto& dir : options.disk_spaces) {
+        if (dir.size == 0) {
+            continue;
+        }
+        fs::path dir_path(dir.path);
+        if (fs::exists(dir_path)) {
+            if (!fs::is_directory(dir_path)) {
+                LOG(ERROR) << "the block cache disk path already exists but not a directory, path: " << dir.path;
+                return Status::InvalidArgument("invalid block cache disk path");
+            }
+        } else {
+            std::error_code ec;
+            if (!fs::create_directory(dir_path, ec)) {
+                LOG(ERROR) << "create block cache disk path failed, path: " << dir.path << ", reason: " << ec.message();
+                return Status::InvalidArgument("invalid block cache disk path");
+            }
+        }
+    }
+    _block_size = std::min(options.block_size, MAX_BLOCK_SIZE);
+#ifdef WITH_CACHELIB
+    if (options.engine == "cachelib") {
+        _kv_cache = std::make_unique<CacheLibWrapper>();
+        LOG(INFO) << "init cachelib engine, block_size: " << _block_size;
+    }
+#endif
+#ifdef WITH_STARCACHE
+    if (options.engine == "starcache") {
+        _kv_cache = std::make_unique<StarCacheWrapper>();
+        LOG(INFO) << "init starcache engine, block_size: " << _block_size;
+    }
+#endif
+    if (!_kv_cache) {
+        LOG(ERROR) << "unsupported block cache engine: " << options.engine;
+        return Status::NotSupported("unsupported block cache engine");
+    }
     return _kv_cache->init(options);
 }
 
-Status BlockCache::write_cache(const CacheKey& cache_key, off_t offset, size_t size, const char* buffer,
-                               size_t ttl_seconds) {
+Status BlockCache::write_buffer(const CacheKey& cache_key, off_t offset, const IOBuffer& buffer,
+                                WriteCacheOptions* options) {
     if (offset % _block_size != 0) {
         LOG(WARNING) << "write block key: " << cache_key << " with invalid args, offset: " << offset;
         return Status::InvalidArgument(strings::Substitute("offset must be aligned by block size $0", _block_size));
     }
-    if (!buffer) {
+    if (buffer.empty()) {
+        return Status::OK();
+    }
+
+    size_t index = offset / _block_size;
+    std::string block_key = fmt::format("{}/{}", cache_key, index);
+    return _kv_cache->write_buffer(block_key, buffer, options);
+}
+
+static void empty_deleter(void*) {}
+
+Status BlockCache::write_buffer(const CacheKey& cache_key, off_t offset, size_t size, const char* data,
+                                WriteCacheOptions* options) {
+    if (!data) {
         return Status::InvalidArgument("invalid data buffer");
     }
+
+    IOBuffer buffer;
+    buffer.append_user_data((void*)data, size, empty_deleter);
+    return write_buffer(cache_key, offset, buffer, options);
+}
+
+Status BlockCache::write_object(const CacheKey& cache_key, const void* ptr, size_t size, DeleterFunc deleter,
+                                CacheHandle* handle, WriteCacheOptions* options) {
+    if (!ptr) {
+        return Status::InvalidArgument("invalid object pointer");
+    }
+    return _kv_cache->write_object(cache_key, ptr, size, std::move(deleter), handle, options);
+}
+
+Status BlockCache::read_buffer(const CacheKey& cache_key, off_t offset, size_t size, IOBuffer* buffer,
+                               ReadCacheOptions* options) {
     if (size == 0) {
         return Status::OK();
     }
 
-    size_t start_block_index = offset / _block_size;
-    size_t end_block_index = (offset + size - 1) / _block_size + 1;
-    off_t off_in_buf = 0;
-    for (size_t index = start_block_index; index < end_block_index; ++index) {
-        std::string block_key = fmt::format("{}/{}", cache_key, index);
-        const char* block_buf = buffer + off_in_buf;
-        const size_t block_size = std::min(size - off_in_buf, _block_size);
-        RETURN_IF_ERROR(_kv_cache->write_cache(block_key, block_buf, block_size, ttl_seconds));
-        off_in_buf += block_size;
-    }
-
-    return Status::OK();
-}
-
-StatusOr<size_t> BlockCache::read_cache(const CacheKey& cache_key, off_t offset, size_t size, char* buffer) {
-    if (!buffer) {
-        return Status::InvalidArgument("invalid data buffer");
-    }
-    if (size == 0) {
-        return 0;
-    }
     size_t index = offset / _block_size;
     std::string block_key = fmt::format("{}/{}", cache_key, index);
-    return _kv_cache->read_cache(block_key, buffer, offset - index * _block_size, size);
+    return _kv_cache->read_buffer(block_key, offset - index * _block_size, size, buffer, options);
 }
 
-Status BlockCache::remove_cache(const CacheKey& cache_key, off_t offset, size_t size) {
+StatusOr<size_t> BlockCache::read_buffer(const CacheKey& cache_key, off_t offset, size_t size, char* data,
+                                         ReadCacheOptions* options) {
+    IOBuffer buffer;
+    RETURN_IF_ERROR(read_buffer(cache_key, offset, size, &buffer, options));
+    buffer.copy_to(data);
+    return buffer.size();
+}
+
+Status BlockCache::read_object(const CacheKey& cache_key, CacheHandle* handle, ReadCacheOptions* options) {
+    return _kv_cache->read_object(cache_key, handle, options);
+}
+
+Status BlockCache::remove(const CacheKey& cache_key, off_t offset, size_t size) {
     if (offset % _block_size != 0) {
         LOG(WARNING) << "remove block key: " << cache_key << " with invalid args, offset: " << offset
                      << ", size: " << size;
@@ -89,17 +153,23 @@ Status BlockCache::remove_cache(const CacheKey& cache_key, off_t offset, size_t 
         return Status::OK();
     }
 
-    size_t start_block_index = offset / _block_size;
-    size_t end_block_index = (offset + size - 1) / _block_size + 1;
-    for (size_t index = start_block_index; index < end_block_index; ++index) {
-        std::string block_key = fmt::format("{}/{}", cache_key, index);
-        RETURN_IF_ERROR(_kv_cache->remove_cache(block_key));
-    }
-    return Status::OK();
+    size_t index = offset / _block_size;
+    std::string block_key = fmt::format("{}/{}", cache_key, index);
+    return _kv_cache->remove(block_key);
+}
+
+void BlockCache::record_read_remote(size_t size, int64_t lateny_us) {
+    _kv_cache->record_read_remote(size, lateny_us);
+}
+
+void BlockCache::record_read_cache(size_t size, int64_t lateny_us) {
+    _kv_cache->record_read_cache(size, lateny_us);
 }
 
 Status BlockCache::shutdown() {
-    return _kv_cache->shutdown();
+    Status st = _kv_cache->shutdown();
+    _kv_cache = nullptr;
+    return st;
 }
 
 } // namespace starrocks

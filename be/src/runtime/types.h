@@ -96,10 +96,41 @@ struct TypeDescriptor {
         return ret;
     }
 
+    static TypeDescriptor create_varbinary_type(int len) {
+        TypeDescriptor ret;
+        ret.type = TYPE_VARBINARY;
+        ret.len = len;
+        return ret;
+    }
+
     static TypeDescriptor create_json_type() {
         TypeDescriptor res;
         res.type = TYPE_JSON;
         res.len = kJsonDefaultSize;
+        return res;
+    }
+
+    static TypeDescriptor create_array_type(const TypeDescriptor& children) {
+        TypeDescriptor res;
+        res.type = TYPE_ARRAY;
+        res.children.push_back(children);
+        return res;
+    }
+
+    static TypeDescriptor create_map_type(const TypeDescriptor& key, const TypeDescriptor& value) {
+        TypeDescriptor res;
+        res.type = TYPE_MAP;
+        res.children.push_back(key);
+        res.children.push_back(value);
+        return res;
+    }
+
+    static TypeDescriptor create_struct_type(const std::vector<std::string> field_names,
+                                             const std::vector<TypeDescriptor>& filed_types) {
+        TypeDescriptor res;
+        res.type = TYPE_STRUCT;
+        res.field_names = field_names;
+        res.children = filed_types;
         return res;
     }
 
@@ -153,9 +184,9 @@ struct TypeDescriptor {
         return ret;
     }
 
-    static TypeDescriptor from_primtive_type(LogicalType type,
-                                             [[maybe_unused]] int len = TypeDescriptor::MAX_VARCHAR_LENGTH,
-                                             [[maybe_unused]] int precision = 27, [[maybe_unused]] int scale = 9) {
+    static TypeDescriptor from_logical_type(LogicalType type,
+                                            [[maybe_unused]] int len = TypeDescriptor::MAX_VARCHAR_LENGTH,
+                                            [[maybe_unused]] int precision = 27, [[maybe_unused]] int scale = 9) {
         switch (type) {
         case TYPE_CHAR:
             return TypeDescriptor::create_char_type(MAX_CHAR_LENGTH);
@@ -190,10 +221,10 @@ struct TypeDescriptor {
 
     static TypeDescriptor from_storage_type_info(TypeInfo* type_info);
 
-    static TypeDescriptor from_protobuf(const PTypeDesc& ptype) {
+    static TypeDescriptor from_protobuf(const PTypeDesc& ltype) {
         int idx = 0;
-        TypeDescriptor result(ptype.types(), &idx);
-        DCHECK_EQ(idx, ptype.types_size());
+        TypeDescriptor result(ltype.types(), &idx);
+        DCHECK_EQ(idx, ltype.types_size());
         return result;
     }
 
@@ -214,13 +245,6 @@ struct TypeDescriptor {
         } else {
             return type == o.type;
         }
-    }
-
-    bool is_implicit_castable(const TypeDescriptor& from) const {
-        if (is_decimal_type()) {
-            return precision == from.precision && scale == from.scale;
-        }
-        return false;
     }
 
     bool operator==(const TypeDescriptor& o) const {
@@ -293,6 +317,8 @@ struct TypeDescriptor {
 
     /// Returns the size of a slot for this type.
     int get_slot_size() const;
+
+    size_t get_flat_size() const;
 
     static inline int get_decimal_byte_size(int precision) {
         DCHECK_GT(precision, 0);

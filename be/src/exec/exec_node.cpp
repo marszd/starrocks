@@ -124,8 +124,8 @@ void ExecNode::push_down_predicate(RuntimeState* state, std::list<ExprContext*>*
     auto iter = expr_ctxs->begin();
     while (iter != expr_ctxs->end()) {
         if ((*iter)->root()->is_bound(_tuple_ids)) {
-            (*iter)->prepare(state);
-            (*iter)->open(state);
+            WARN_IF_ERROR((*iter)->prepare(state), "prepare expression failed");
+            WARN_IF_ERROR((*iter)->open(state), "open expression failed");
             _conjunct_ctxs.push_back(*iter);
             iter = expr_ctxs->erase(iter);
         } else {
@@ -216,7 +216,8 @@ Status ExecNode::prepare(RuntimeState* state) {
                 return RuntimeProfile::units_per_second(capture0, capture1);
             },
             "");
-    _mem_tracker.reset(new MemTracker(_runtime_profile.get(), -1, _runtime_profile->name(), nullptr));
+    _mem_tracker.reset(new MemTracker(_runtime_profile.get(), std::make_tuple(true, false, false), "", -1,
+                                      _runtime_profile->name(), nullptr));
     RETURN_IF_ERROR(Expr::prepare(_conjunct_ctxs, state));
     RETURN_IF_ERROR(_runtime_filter_collector.prepare(state, row_desc(), _runtime_profile.get()));
 
@@ -261,6 +262,7 @@ Status ExecNode::get_next_big_chunk(RuntimeState* state, ChunkPtr* chunk, bool* 
         ChunkPtr cur_chunk = nullptr;
 
         RETURN_IF_ERROR(specific_get_next(state, &cur_chunk, &cur_eos));
+        TRY_CATCH_ALLOC_SCOPE_START()
         if (cur_eos) {
             if (pre_output_chunk != nullptr) {
                 *eos = false;
@@ -304,6 +306,7 @@ Status ExecNode::get_next_big_chunk(RuntimeState* state, ChunkPtr* chunk, bool* 
                 }
             }
         }
+        TRY_CATCH_ALLOC_SCOPE_END()
     }
 }
 
@@ -318,34 +321,28 @@ Status ExecNode::reset(RuntimeState* state) {
 Status ExecNode::collect_query_statistics(QueryStatistics* statistics) {
     DCHECK(statistics != nullptr);
     for (auto child_node : _children) {
-        child_node->collect_query_statistics(statistics);
+        (void)child_node->collect_query_statistics(statistics);
     }
     return Status::OK();
 }
 
-Status ExecNode::close(RuntimeState* state) {
+void ExecNode::close(RuntimeState* state) {
     if (_is_closed) {
-        return Status::OK();
+        return;
     }
     _is_closed = true;
-    exec_debug_action(TExecNodePhase::CLOSE);
+    (void)exec_debug_action(TExecNodePhase::CLOSE);
 
     if (_rows_returned_counter != nullptr) {
         COUNTER_SET(_rows_returned_counter, _num_rows_returned);
     }
 
-    Status result;
     for (auto& i : _children) {
-        auto st = i->close(state);
-        if (result.ok() && !st.ok()) {
-            result = st;
-        }
+        i->close(state);
     }
 
     Expr::close(_conjunct_ctxs, state);
     _runtime_filter_collector.close(state);
-
-    return result;
 }
 
 Status ExecNode::create_tree(RuntimeState* state, ObjectPool* pool, const TPlan& plan, const DescriptorTbl& descs,
@@ -554,7 +551,7 @@ Status ExecNode::create_vectorized_node(starrocks::RuntimeState* state, starrock
         }
         default:
             return Status::InternalError(fmt::format("Stream scan node does not support source type {}", source_type));
-        };
+        }
         TConnectorScanNode connector_scan_node;
         connector_scan_node.connector_name = connector_name;
         new_node.connector_scan_node = connector_scan_node;
@@ -611,7 +608,7 @@ Status eager_prune_eval_conjuncts(const std::vector<ExprContext*>& ctxs, Chunk* 
     int zero_count = 0;
 
     for (auto* ctx : ctxs) {
-        ASSIGN_OR_RETURN(ColumnPtr column, ctx->evaluate(chunk));
+        ASSIGN_OR_RETURN(ColumnPtr column, ctx->evaluate(chunk))
         size_t true_count = ColumnHelper::count_true_with_notnull(column);
 
         if (true_count == column->size()) {
@@ -675,7 +672,7 @@ Status ExecNode::eval_conjuncts(const std::vector<ExprContext*>& ctxs, Chunk* ch
     Filter* raw_filter = filter.get();
 
     for (auto* ctx : ctxs) {
-        ASSIGN_OR_RETURN(ColumnPtr column, ctx->evaluate(chunk));
+        ASSIGN_OR_RETURN(ColumnPtr column, ctx->evaluate(chunk))
         size_t true_count = ColumnHelper::count_true_with_notnull(column);
 
         if (true_count == column->size()) {
@@ -718,7 +715,7 @@ StatusOr<size_t> ExecNode::eval_conjuncts_into_filter(const std::vector<ExprCont
         return 0;
     }
     for (auto* ctx : ctxs) {
-        ASSIGN_OR_RETURN(ColumnPtr column, ctx->evaluate(chunk, filter->data()));
+        ASSIGN_OR_RETURN(ColumnPtr column, ctx->evaluate(chunk, filter->data()))
         size_t true_count = ColumnHelper::count_true_with_notnull(column);
 
         if (true_count == column->size()) {

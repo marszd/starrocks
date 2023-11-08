@@ -134,7 +134,6 @@ TABLE: lineitem
 NON-PARTITION PREDICATES: 2: l_partkey IS NOT NULL
 partitions=1/1
 avgRowSize=24.0
-numNodes=0
 cardinality: 600037902
 probe runtime filters:
 - filter_id = 0, probe_expr = (2: l_partkey)
@@ -159,10 +158,9 @@ OutPut Exchange Id: 03
 1:HdfsScanNode
 TABLE: part
 NON-PARTITION PREDICATES: 20: p_brand = 'Brand#35', 23: p_container = 'JUMBO CASE'
-MIN/MAX PREDICATES: 48: p_brand <= 'Brand#35', 49: p_brand >= 'Brand#35', 50: p_container <= 'JUMBO CASE', 51: p_container >= 'JUMBO CASE'
+MIN/MAX PREDICATES: 20: p_brand <= 'Brand#35', 20: p_brand >= 'Brand#35', 23: p_container <= 'JUMBO CASE', 23: p_container >= 'JUMBO CASE'
 partitions=1/1
 avgRowSize=28.0
-numNodes=0
 cardinality: 20000
 column statistics:
 * p_partkey-->[1.0, 2.0E7, 0.0, 8.0, 20000.0] ESTIMATE

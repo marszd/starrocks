@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.statistic;
 
 import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.Column;
 import org.apache.velocity.VelocityContext;
@@ -26,9 +26,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
+import static com.starrocks.statistic.StatsConstants.EXTERNAL_FULL_STATISTICS_TABLE_NAME;
 import static com.starrocks.statistic.StatsConstants.FULL_STATISTICS_TABLE_NAME;
 import static com.starrocks.statistic.StatsConstants.SAMPLE_STATISTICS_TABLE_NAME;
 import static com.starrocks.statistic.StatsConstants.STATISTIC_DATA_VERSION;
+import static com.starrocks.statistic.StatsConstants.STATISTIC_EXTERNAL_QUERY_VERSION;
 import static com.starrocks.statistic.StatsConstants.STATISTIC_HISTOGRAM_VERSION;
 import static com.starrocks.statistic.StatsConstants.STATISTIC_TABLE_VERSION;
 
@@ -52,6 +54,14 @@ public class StatisticSQLBuilder {
                     + " FROM " + StatsConstants.FULL_STATISTICS_TABLE_NAME
                     + " WHERE $predicate"
                     + " GROUP BY db_id, table_id, column_name";
+
+    private static final String QUERY_EXTERNAL_FULL_STATISTIC_TEMPLATE =
+            "SELECT cast(" + STATISTIC_EXTERNAL_QUERY_VERSION + " as INT), column_name,"
+                    + " sum(row_count), cast(sum(data_size) as bigint), hll_union_agg(ndv), sum(null_count), "
+                    + " cast(max(cast(max as $type)) as string), cast(min(cast(min as $type)) as string)"
+                    + " FROM " + StatsConstants.EXTERNAL_FULL_STATISTICS_TABLE_NAME
+                    + " WHERE $predicate"
+                    + " GROUP BY table_uuid, column_name";
 
     private static final String QUERY_HISTOGRAM_STATISTIC_TEMPLATE =
             "SELECT cast(" + STATISTIC_HISTOGRAM_VERSION + " as INT), db_id, table_id, column_name,"
@@ -122,6 +132,23 @@ public class StatisticSQLBuilder {
         return Joiner.on(" UNION ALL ").join(querySQL);
     }
 
+    public static String buildQueryExternalFullStatisticsSQL(String tableUUID, List<Column> columns) {
+        List<String> querySQL = new ArrayList<>();
+        for (Column column : columns) {
+            VelocityContext context = new VelocityContext();
+
+            if (column.getType().canStatistic()) {
+                context.put("type", column.getType().toSql());
+            } else {
+                context.put("type", "string");
+            }
+            context.put("predicate", "table_uuid = \"" + tableUUID + "\"" + " and column_name = \"" + column.getName() + "\"");
+            querySQL.add(build(context, QUERY_EXTERNAL_FULL_STATISTIC_TEMPLATE));
+        }
+
+        return Joiner.on(" UNION ALL ").join(querySQL);
+    }
+
     public static String buildDropStatisticsSQL(Long tableId, StatsConstants.AnalyzeType analyzeType) {
         String tableName;
         if (analyzeType.equals(StatsConstants.AnalyzeType.SAMPLE)) {
@@ -131,6 +158,29 @@ public class StatisticSQLBuilder {
         }
 
         return "DELETE FROM " + tableName + " WHERE TABLE_ID = " + tableId;
+    }
+
+    public static String buildDropExternalStatSQL(String tableUUID) {
+        return "DELETE FROM " + EXTERNAL_FULL_STATISTICS_TABLE_NAME + " WHERE TABLE_UUID = '" + tableUUID + "'";
+    }
+
+    public static String buildDropPartitionSQL(List<Long> pids) {
+        return "DELETE FROM " + FULL_STATISTICS_TABLE_NAME + " WHERE " +
+                " PARTITION_ID IN (" +
+                pids.stream().map(String::valueOf).collect(Collectors.joining(", ")) +
+                ");";
+    }
+
+    public static String buildDropTableInvalidPartitionSQL(List<Long> tables, List<Long> partitions) {
+        Preconditions.checkState(!tables.isEmpty() && !partitions.isEmpty());
+
+        StringBuilder sql = new StringBuilder();
+        sql.append("DELETE FROM " + FULL_STATISTICS_TABLE_NAME + " WHERE");
+        String tids = tables.stream().map(String::valueOf).collect(Collectors.joining(", "));
+        String pids = partitions.stream().map(String::valueOf).collect(Collectors.joining(", "));
+        sql.append(" TABLE_ID IN (").append(tids).append(")");
+        sql.append(" AND PARTITION_ID NOT IN (").append(pids).append(")");
+        return sql.toString();
     }
 
     public static String buildQueryHistogramStatisticsSQL(Long tableId, List<String> columnNames) {

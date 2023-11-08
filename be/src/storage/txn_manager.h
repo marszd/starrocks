@@ -34,6 +34,8 @@
 
 #pragma once
 
+#include <bthread/condition_variable.h>
+#include <bthread/mutex.h>
 #include <pthread.h>
 #include <rapidjson/document.h>
 
@@ -61,15 +63,19 @@
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_meta.h"
 #include "storage/tablet.h"
+#include "util/countdown_latch.h"
 #include "util/lru_cache.h"
 #include "util/time.h"
 
 namespace starrocks {
 
+struct TxnInfo;
+
 struct TabletTxnInfo {
     PUniqueId load_id;
     RowsetSharedPtr rowset;
-    int64_t creation_time;
+    int64_t creation_time{0};
+    int64_t commit_time{0};
 
     TabletTxnInfo(PUniqueId load_id, RowsetSharedPtr rowset)
             : load_id(std::move(load_id)), rowset(std::move(rowset)), creation_time(UnixSeconds()) {}
@@ -84,45 +90,48 @@ public:
 
     ~TxnManager() = default;
 
-    Status prepare_txn(TPartitionId partition_id, const TabletSharedPtr& tablet, TTransactionId transaction_id,
-                       const PUniqueId& load_id);
+    [[nodiscard]] Status prepare_txn(TPartitionId partition_id, const TabletSharedPtr& tablet,
+                                     TTransactionId transaction_id, const PUniqueId& load_id);
 
-    Status commit_txn(TPartitionId partition_id, const TabletSharedPtr& tablet, TTransactionId transaction_id,
-                      const PUniqueId& load_id, const RowsetSharedPtr& rowset_ptr, bool is_recovery);
+    [[nodiscard]] Status commit_txn(TPartitionId partition_id, const TabletSharedPtr& tablet,
+                                    TTransactionId transaction_id, const PUniqueId& load_id,
+                                    const RowsetSharedPtr& rowset_ptr, bool is_recovery);
 
-    Status publish_txn(TPartitionId partition_id, const TabletSharedPtr& tablet, TTransactionId transaction_id,
-                       int64_t version, const RowsetSharedPtr& rowset, uint32_t wait_time = 0);
+    [[nodiscard]] Status publish_txn(TPartitionId partition_id, const TabletSharedPtr& tablet,
+                                     TTransactionId transaction_id, int64_t version, const RowsetSharedPtr& rowset,
+                                     uint32_t wait_time = 0);
 
     // persist_tablet_related_txns persists the tablets' meta and make it crash-safe.
-    Status persist_tablet_related_txns(const std::vector<TabletSharedPtr>& tablets);
+    [[nodiscard]] Status persist_tablet_related_txns(const std::vector<TabletSharedPtr>& tablets);
 
     // persist metadata of affected_dirs and make it crash-safe
     void flush_dirs(std::unordered_set<DataDir*>& affected_dirs);
 
     // delete the txn from manager if it is not committed(not have a valid rowset)
-    Status rollback_txn(TPartitionId partition_id, const TabletSharedPtr& tablet, TTransactionId transaction_id,
-                        bool with_log = true);
+    [[nodiscard]] Status rollback_txn(TPartitionId partition_id, const TabletSharedPtr& tablet,
+                                      TTransactionId transaction_id, bool with_log = true);
 
-    Status delete_txn(TPartitionId partition_id, const TabletSharedPtr& tablet, TTransactionId transaction_id);
+    [[nodiscard]] Status delete_txn(TPartitionId partition_id, const TabletSharedPtr& tablet,
+                                    TTransactionId transaction_id);
 
     // add a txn to manager
     // partition id is useful in publish version stage because version is associated with partition
-    Status prepare_txn(TPartitionId partition_id, TTransactionId transaction_id, TTabletId tablet_id,
-                       SchemaHash schema_hash, const TabletUid& tablet_uid, const PUniqueId& load_id);
+    [[nodiscard]] Status prepare_txn(TPartitionId partition_id, TTransactionId transaction_id, TTabletId tablet_id,
+                                     SchemaHash schema_hash, const TabletUid& tablet_uid, const PUniqueId& load_id);
 
-    Status commit_txn(KVStore* meta, TPartitionId partition_id, TTransactionId transaction_id, TTabletId tablet_id,
-                      SchemaHash schema_hash, const TabletUid& tablet_uid, const PUniqueId& load_id,
-                      const RowsetSharedPtr& rowset_ptr, bool is_recovery);
+    [[nodiscard]] Status commit_txn(KVStore* meta, TPartitionId partition_id, TTransactionId transaction_id,
+                                    TTabletId tablet_id, SchemaHash schema_hash, const TabletUid& tablet_uid,
+                                    const PUniqueId& load_id, const RowsetSharedPtr& rowset_ptr, bool is_recovery);
 
     // delete the txn from manager if it is not committed(not have a valid rowset)
-    Status rollback_txn(TPartitionId partition_id, TTransactionId transaction_id, TTabletId tablet_id,
-                        SchemaHash schema_hash, const TabletUid& tablet_uid, bool with_log = true);
+    [[nodiscard]] Status rollback_txn(TPartitionId partition_id, TTransactionId transaction_id, TTabletId tablet_id,
+                                      SchemaHash schema_hash, const TabletUid& tablet_uid, bool with_log = true);
 
     // remove the txn from txn manager
     // delete the related rowset if it is not null
     // delete rowset related data if it is not null
-    Status delete_txn(KVStore* meta, TPartitionId partition_id, TTransactionId transaction_id, TTabletId tablet_id,
-                      SchemaHash schema_hash, const TabletUid& tablet_uid);
+    [[nodiscard]] Status delete_txn(KVStore* meta, TPartitionId partition_id, TTransactionId transaction_id,
+                                    TTabletId tablet_id, SchemaHash schema_hash, const TabletUid& tablet_uid);
 
     void get_tablet_related_txns(TTabletId tablet_id, SchemaHash schema_hash, const TabletUid& tablet_uid,
                                  int64_t* partition_id, std::set<int64_t>* transaction_ids);
@@ -145,8 +154,11 @@ public:
 
     void get_partition_ids(const TTransactionId transaction_id, std::vector<TPartitionId>* partition_ids);
 
+    void get_txn_infos(int64_t txn_id, int64_t tablet_id, std::vector<TxnInfo>& txn_infos);
+
 private:
     using TxnKey = std::pair<int64_t, int64_t>; // partition_id, transaction_id;
+    using BThreadCountDownLatch = GenericCountDownLatch<bthread::Mutex, bthread::ConditionVariable>;
 
     // implement TxnKey hash function to support TxnKey as a key for unordered_map
     struct TxnKeyHash {

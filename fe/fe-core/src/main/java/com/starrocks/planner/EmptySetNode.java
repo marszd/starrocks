@@ -59,7 +59,6 @@ public class EmptySetNode extends PlanNode {
     public void computeStats(Analyzer analyzer) {
         avgRowSize = 0;
         cardinality = 0;
-        numNodes = 1;
     }
 
     @Override
@@ -72,8 +71,8 @@ public class EmptySetNode extends PlanNode {
     }
 
     @Override
-    public boolean canUsePipeLine() {
-        return true;
+    public boolean canUseRuntimeAdaptiveDop() {
+        return getChildren().stream().allMatch(PlanNode::canUseRuntimeAdaptiveDop);
     }
 
     @Override

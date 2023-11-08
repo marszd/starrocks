@@ -39,7 +39,8 @@ Usage: $0 <options>
      --with-aws                     enable to test aws
      --with-bench                   enable to build with benchmark
      --module                       module to run uts
-     --use-staros                   enable to build with staros
+     --enable-shared-data           enable to build with shared-data feature support
+     --use-staros                   DEPRECATED. an alias of --enable-shared-data option
      -j                             build parallel
 
   Eg.
@@ -83,7 +84,6 @@ TEST_MODULE=".*"
 HELP=0
 WITH_AWS=OFF
 USE_STAROS=OFF
-WITH_BLOCK_CACHE=OFF
 WITH_GCOV=OFF
 while true; do
     case "$1" in
@@ -96,7 +96,7 @@ while true; do
         --help) HELP=1 ; shift ;;
         --with-aws) WITH_AWS=ON; shift ;;
         --with-gcov) WITH_GCOV=ON; shift ;;
-        --use-staros) USE_STAROS=ON; shift ;;
+        --enable-shared-data|--use-staros) USE_STAROS=ON; shift ;;
         -j) PARALLEL=$2; shift 2 ;;
         --) shift ;  break ;;
         *) echo "Internal error" ; exit 1 ;;
@@ -132,38 +132,45 @@ if [ ! -d ${CMAKE_BUILD_DIR} ]; then
     mkdir -p ${CMAKE_BUILD_DIR}
 fi
 
-cd ${CMAKE_BUILD_DIR}
+# The `WITH_CACHELIB` just controls whether cachelib is compiled in, while starcache is controlled by "USE_STAROS".
+# This option will soon be deprecated.
+if [[ "${MACHINE_TYPE}" == "aarch64" ]]; then
+    # force turn off cachelib on arm platform
+    WITH_CACHELIB=OFF
+elif [[ -z ${WITH_CACHELIB} ]]; then
+    WITH_CACHELIB=OFF
+fi
 
+source ${STARROCKS_HOME}/bin/common.sh
+
+cd ${CMAKE_BUILD_DIR}
 if [ "${USE_STAROS}" == "ON"  ]; then
   if [ -z "$STARLET_INSTALL_DIR" ] ; then
     # assume starlet_thirdparty is installed to ${STARROCKS_THIRDPARTY}/installed/starlet/
     STARLET_INSTALL_DIR=${STARROCKS_THIRDPARTY}/installed/starlet
   fi
-  ${CMAKE_CMD}  -G "${CMAKE_GENERATOR}" \
-              -DSTARROCKS_THIRDPARTY=${STARROCKS_THIRDPARTY}\
-              -DSTARROCKS_HOME=${STARROCKS_HOME} \
-              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-              -DMAKE_TEST=ON -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
-              -DUSE_AVX2=$USE_AVX2 -DUSE_AVX512=$USE_AVX512 -DUSE_SSE4_2=$USE_SSE4_2 \
-              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-              -DUSE_STAROS=${USE_STAROS} -DWITH_GCOV=${WITH_GCOV} \
-              -DWITH_BLOCK_CACHE=${WITH_BLOCK_CACHE} \
-              -Dprotobuf_DIR=${STARLET_INSTALL_DIR}/third_party/lib/cmake/protobuf \
-              -Dabsl_DIR=${STARLET_INSTALL_DIR}/third_party/lib/cmake/absl \
-              -DgRPC_DIR=${STARLET_INSTALL_DIR}/third_party/lib/cmake/grpc \
-              -Dprometheus-cpp_DIR=${STARLET_INSTALL_DIR}/third_party/lib/cmake/prometheus-cpp \
-              -Dstarlet_DIR=${STARLET_INSTALL_DIR}/starlet_install/lib64/cmake ..
-else
-  ${CMAKE_CMD}  -G "${CMAKE_GENERATOR}" \
-              -DSTARROCKS_THIRDPARTY=${STARROCKS_THIRDPARTY}\
-              -DSTARROCKS_HOME=${STARROCKS_HOME} \
-              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-              -DMAKE_TEST=ON -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
-              -DUSE_AVX2=$USE_AVX2 -DUSE_AVX512=$USE_AVX512 -DUSE_SSE4_2=$USE_SSE4_2 \
-              -DWITH_GCOV=${WITH_GCOV} \
-              -DWITH_BLOCK_CACHE=${WITH_BLOCK_CACHE} \
-              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ../
+  export STARLET_INSTALL_DIR
 fi
+
+# Temporarily keep the default behavior same as before to avoid frequent thirdparty update.
+# Once the starcache version is stable, we will turn on it by default.
+if [[ -z ${WITH_STARCACHE} ]]; then
+  WITH_STARCACHE=${USE_STAROS}
+fi
+
+${CMAKE_CMD}  -G "${CMAKE_GENERATOR}" \
+            -DSTARROCKS_THIRDPARTY=${STARROCKS_THIRDPARTY}\
+            -DSTARROCKS_HOME=${STARROCKS_HOME} \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DMAKE_TEST=ON -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+            -DUSE_AVX2=$USE_AVX2 -DUSE_AVX512=$USE_AVX512 -DUSE_SSE4_2=$USE_SSE4_2 \
+            -DUSE_STAROS=${USE_STAROS} \
+            -DSTARLET_INSTALL_DIR=${STARLET_INSTALL_DIR}          \
+            -DWITH_GCOV=${WITH_GCOV} \
+            -DWITH_CACHELIB=${WITH_CACHELIB} \
+            -DWITH_STARCACHE=${WITH_STARCACHE} \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ../
+
 ${BUILD_SYSTEM} -j${PARALLEL}
 
 echo "*********************************"
@@ -183,8 +190,6 @@ done
 mkdir -p $LOG_DIR
 mkdir -p ${UDF_RUNTIME_DIR}
 rm -f ${UDF_RUNTIME_DIR}/*
-
-. ${STARROCKS_HOME}/bin/common.sh
 
 # ====================== configure JAVA/JVM ====================
 # NOTE: JAVA_HOME must be configed if using hdfs scan, like hive external table
@@ -210,7 +215,7 @@ else
 fi
 
 export LD_LIBRARY_PATH=$STARROCKS_HOME/lib/hadoop/native:$LD_LIBRARY_PATH
-if [ "${WITH_BLOCK_CACHE}" == "ON"  ]; then
+if [ "${WITH_CACHELIB}" == "ON"  ]; then
     CACHELIB_DIR=${STARROCKS_THIRDPARTY}/installed/cachelib
     export LD_LIBRARY_PATH=$CACHELIB_DIR/lib:$CACHELIB_DIR/lib64:$CACHELIB_DIR/deps/lib:$CACHELIB_DIR/deps/lib64:$LD_LIBRARY_PATH
 fi
@@ -243,7 +248,7 @@ test_files=`find ${STARROCKS_TEST_BINARY_DIR} -type f -perm -111 -name "*test" \
 if [[ $TEST_MODULE == '.*'  || $TEST_MODULE == 'starrocks_test' ]]; then
   echo "Run test: ${STARROCKS_TEST_BINARY_DIR}/starrocks_test"
   if [ ${DRY_RUN} -eq 0 ]; then
-    if [ -x ${GTEST_PARALLEL} ]; then
+    if [ -x "${GTEST_PARALLEL}" ]; then
         ${GTEST_PARALLEL} ${STARROCKS_TEST_BINARY_DIR}/starrocks_test \
             --gtest_filter=${TEST_NAME} \
             --serialize_test_cases ${GTEST_PARALLEL_OPTIONS}
@@ -253,13 +258,13 @@ if [[ $TEST_MODULE == '.*'  || $TEST_MODULE == 'starrocks_test' ]]; then
   fi
 fi
 
-for test in ${test_files[@]}
+for test_bin in $test_files
 do
-    echo "Run test: $test"
+    echo "Run test: $test_bin"
     if [ ${DRY_RUN} -eq 0 ]; then
-        file_name=${test##*/}
+        file_name=${test_bin##*/}
         if [ -z $RUN_FILE ] || [ $file_name == $RUN_FILE ]; then
-            $test $GTEST_OPTIONS --gtest_filter=${TEST_NAME}
+            $test_bin $GTEST_OPTIONS --gtest_filter=${TEST_NAME}
         fi
     fi
 done

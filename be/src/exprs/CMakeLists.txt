@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+if (CLANG_TIDY_PATH)
+    set(CMAKE_CXX_CLANG_TIDY "${CLANG_TIDY_PATH}")
+endif()
+
 set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/exprs")
 
 # where to put generated binaries
@@ -30,11 +34,13 @@ set(EXPR_FILES
   agg/factory/aggregate_resolver_window.cpp
   anyval_util.cpp
   base64.cpp
+  binary_functions.cpp
   expr_context.cpp
   expr.cpp
   function_context.cpp
   table_function/table_function_factory.cpp
   table_function/json_each.cpp
+  table_function/list_rowsets.cpp
   arithmetic_expr.cpp
   array_element_expr.cpp
   array_expr.cpp
@@ -44,6 +50,7 @@ set(EXPR_FILES
   case_expr.cpp
   cast_expr.cpp
   cast_expr_array.cpp
+  cast_expr_json.cpp
   cast_nested.cpp
   column_ref.cpp
   placeholder_ref.cpp
@@ -76,6 +83,7 @@ set(EXPR_FILES
   runtime_filter.cpp
   split.cpp
   split_part.cpp
+  str_to_map.cpp
   string_functions.cpp
   time_functions.cpp
   utility_functions.cpp
@@ -86,6 +94,11 @@ set(EXPR_FILES
   lambda_function.cpp
   array_map_expr.cpp
   subfield_expr.cpp
+  map_apply_expr.cpp
+  map_expr.cpp
+  substring_index.cpp
+  dict_query_expr.cpp
+  runtime_filter_layout.cpp
 )
 
 add_library(Exprs ${EXPR_FILES})
